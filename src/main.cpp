@@ -14,6 +14,31 @@
 #include <unordered_map>
 #include <raymath.h>
 
+/*
+These luminous phenomena still manifest themselves
+from time to time, as when a new idea opening up possibilities
+strikes me, but they are no longer exciting, being of relatively
+small intensity. When I close my eyes I invariably observe first,
+a background of very dark and uniform blue, not unlike the
+sky on a clear but starless night. In a few seconds this field
+becomes animated with innumerable scintillating flakes of
+green, arranged in several layers and advancing towards me.
+Then there appears, to the right, a beautiful pattern of two
+systems of parallel and closely spaced lines, at right angles to
+one another, in all sorts of colors with yellow-green and gold
+predominating. Immediately thereafter the lines grow brighter and the whole is thickly sprinkled with dots of twinkling
+light. This picture moves slowly across the field of vision and
+in about ten seconds vanishes to the left, leaving behind a
+ground of rather unpleasant and inert grey which quickly
+gives way to a billowy sea of clouds, seemingly trying to mould
+themselves in living shapes. It is curious that I cannot project a
+form into this grey until the second phase is reached. Every
+time, before falling asleep, images of persons or objects flit
+before my view. When I see them I know that I am about to lose
+consciousness. If they are absent and refuse to come it means a
+sleepless night.
+*/
+
 // ECS Components
 
 // struct Position {
@@ -42,6 +67,19 @@ struct UIElementBounds {
 struct RenderStatus {
     bool visible;
 };
+
+struct HorizontalLayoutBox
+{
+  float x_progress;
+  float padding = 0.0f;
+};
+
+struct VerticalLayoutBox 
+{
+  float y_progress;
+  float padding;
+};
+
 
 struct RectRenderable {
     float width, height;
@@ -91,6 +129,9 @@ struct CursorState
     double x, y;
 };
 
+struct AddTagOnLeftClick{};
+struct ShowEditorPanels {};
+
 struct LeftClickEvent {};
 struct Dragging {};
 struct DynamicPartition {};
@@ -105,6 +146,8 @@ struct Graphics {
 
 enum class EditorType
 {
+    Bookshelf,
+    MelSpectrogram,
     VNCStream,
     CameraVideoFeed,
     RobotActuators,
@@ -112,7 +155,6 @@ enum class EditorType
     EpisodicMemoryTimeline,
     Reification,
     ReadingRepresentation,
-    Library,
     ProgramSynthesis,
     Servers,
     Healthbar,
@@ -177,8 +219,13 @@ struct SelfAlign
 // with some padding
 struct Expand
 {
-    float x_padding;
-    float y_padding;
+    bool x_enabled;
+    float pad_left, pad_right;
+    float x_percent; // 0.0 to 1.0
+
+    bool y_enabled;
+    float pad_top, pad_bottom;
+    float y_percent;
 };
 
 struct EditorLeafData
@@ -223,7 +270,7 @@ void create_editor(flecs::entity leaf, EditorNodeArea& node_area, flecs::world w
     auto editor_visual = world.entity()
         .is_a(UIElement)
         .set<Position, Local>({1.0f, 1.0f})
-        .set<RoundedRectRenderable>({node_area.width-2, node_area.height-2, 4.0f, false, 0x353535FF})
+        .set<RoundedRectRenderable>({node_area.width-2, node_area.height-2, 4.0f, false, 0x010222})
         .child_of(leaf);
 
     leaf.add<EditorVisual>(editor_visual);
@@ -231,7 +278,7 @@ void create_editor(flecs::entity leaf, EditorNodeArea& node_area, flecs::world w
     auto editor_outline = world.entity()
         .is_a(UIElement)
         .child_of(editor_visual)
-        .set<RoundedRectRenderable>({node_area.width-2, node_area.height-2, 4.0f, true, 0x5f5f5fFF})
+        .set<RoundedRectRenderable>({node_area.width-2, node_area.height-2, 4.0f, true, 0x111222})
         .set<ZIndex>({5});
 
     leaf.add<EditorOutline>(editor_outline);
@@ -241,8 +288,8 @@ void create_editor(flecs::entity leaf, EditorNodeArea& node_area, flecs::world w
         .is_a(UIElement)
         .child_of(editor_visual)
         .set<Position, Local>({4.0f, 23.0f})
-        .set<RectRenderable>({node_area.width-2-8.0f, node_area.height-2-23.0f, false, 0x282828FF})
-        .set<Expand>({8.0f, 27.0f})
+        .set<RectRenderable>({node_area.width-2-8.0f, node_area.height-2-23.0f, false, 0x010212})
+        .set<Expand>({true, 8.0f, 8.0f, 1.0f, true, 27.0f, 4.0f, 1.0f})
         .set<ZIndex>({8});
 
     auto editor_icon_bkg = world.entity()
@@ -250,27 +297,72 @@ void create_editor(flecs::entity leaf, EditorNodeArea& node_area, flecs::world w
         .child_of(editor_visual)
         .set<Position, Local>({8.0f, 2.0f})
         .set<RoundedRectRenderable>({32.0f, 20.0f, 4.0f, false, 0x282828FF})
+        .add<AddTagOnLeftClick, ShowEditorPanels>()
         .set<ZIndex>({4});
 
     auto editor_icon = world.entity()
         .is_a(UIElement)
         .child_of(editor_icon_bkg)
         .set<Position, Local>({2.0f, 0.0f})
-        .set<ImageCreator>({"../assets/vnc_icon.png", 1.0f, 1.0f})
-        .set<ZIndex>({5});
+        .set<ImageCreator>({"../assets/graphstar_icon.png", 1.0f, 1.0f})
+        .set<ZIndex>({12});
 
     auto editor_dropdown = world.entity()
         .is_a(UIElement)
         .child_of(editor_icon_bkg)
         .set<Position, Local>({22.0f, 8.0f})
         .set<ImageCreator>({"../assets/arrow_down.png", 1.0f, 1.0f})
-        .set<ZIndex>({5});
+        .set<ZIndex>({12});
         
     world.entity()
         .is_a(UIElement)
         .child_of(editor_icon_bkg)
         .set<RoundedRectRenderable>({32.0f, 20.0f, 4.0f, true, 0x5f5f5fFF})
         .set<ZIndex>({6});
+
+    // TODO: Editor type entities...
+
+    if (leaf.has<EditorLeafData>() && leaf.get<EditorLeafData>().editor_type == EditorType::Bookshelf)
+    {
+    // For bookshelf, we should create the horizontal layout with all the books
+    auto bookshelf_layer = world.entity()
+        .is_a(UIElement)
+        .child_of(editor_visual)
+        .set<HorizontalLayoutBox>({0.0f, 8.0f});
+        
+    world.entity()
+    .is_a(UIElement)
+    .child_of(bookshelf_layer)
+    .set<Position, Local>({4.0f, 23.0f})
+    .set<ImageCreator>({"../assets/cover_james.jpg", 1.0f, 1.0f})
+    .set<Expand>({false, 4.0f, 4.0f, 1.0f, true, 27.0f, 0.0f, 1.0f})
+    .set<ZIndex>({10});
+
+    world.entity()
+    .is_a(UIElement)
+    .child_of(bookshelf_layer)
+    .set<Position, Local>({4.0f, 23.0f})
+    .set<ImageCreator>({"../assets/cover_cognitive_theory.jpg", 1.0f, 1.0f})
+    .set<Expand>({false, 4.0f, 4.0f, 1.0f, true, 27.0f, 0.0f, 1.0f})
+    .set<ZIndex>({10});
+
+    world.entity()
+    .is_a(UIElement)
+    .child_of(bookshelf_layer)
+    .set<Position, Local>({4.0f, 23.0f})
+    .set<ImageCreator>({"../assets/cover_soar.jpg", 1.0f, 1.0f})
+    .set<Expand>({false, 4.0f, 4.0f, 1.0f, true, 27.0f, 0.0f, 1.0f})
+    .set<ZIndex>({10});
+
+    world.entity()
+    .is_a(UIElement)
+    .child_of(bookshelf_layer)
+    .set<Position, Local>({4.0f, 23.0f})
+    .set<ImageCreator>({"../assets/cover_readings_in_kr.jpg", 1.0f, 1.0f})
+    .set<Expand>({false, 4.0f, 4.0f, 1.0f, true, 27.0f, 0.0f, 1.0f})
+    .set<ZIndex>({10});
+    }
+    
 }
 
 void merge_editor(flecs::entity non_leaf, flecs::world world, flecs::entity UIElement)
@@ -413,6 +505,11 @@ static void cursor_position_callback(GLFWwindow* window, double xpos, double ypo
     cursor_state.y = ypos;
 }
 
+bool point_in_bounds(float x, float y, UIElementBounds bounds)
+{
+    return (x >= bounds.xmin && x <= bounds.xmax && y >= bounds.ymin && y <= bounds.ymax);
+}
+
 void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
 {
     flecs::entity glfw_state = world.lookup("GLFWState");
@@ -420,6 +517,20 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
     {
         if (action == GLFW_PRESS)
         {
+            flecs::query interactive_elements = world.query_builder<AddTagOnLeftClick, UIElementBounds>()
+            .term_at(0).second(flecs::Wildcard)
+            .build();
+            // TODO: Eventually this should use a more efficient partition bound check as the first layer
+            const CursorState* cursor_state = world.lookup("GLFWState").try_get<CursorState>();
+            interactive_elements.each([&](flecs::entity ui_element, AddTagOnLeftClick, UIElementBounds& bounds) {
+                if (point_in_bounds(cursor_state->x, cursor_state->y, bounds))
+                {
+                    world.event<LeftClickEvent>()
+                    .id<UIElementBounds>()
+                    .entity(ui_element)
+                    .emit();
+                } 
+            });
             world.event<LeftClickEvent>()
             .id<CursorState>()
             .entity(glfw_state)
@@ -432,11 +543,6 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
             .emit();
         }
     }
-}
-
-bool point_in_bounds(float x, float y, UIElementBounds bounds)
-{
-    return (x >= bounds.xmin && x <= bounds.xmax && y >= bounds.ymin && y <= bounds.ymax);
 }
 
 float point_distance_to_edge(Position p, Position a, Position b)
@@ -469,7 +575,7 @@ int main(int, char *[]) {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_COMPAT_PROFILE);
     
-    GLFWwindow* window = glfwCreateWindow(800, 600, "Binary Space Partitioning ECS", NULL, NULL);
+    GLFWwindow* window = glfwCreateWindow(800, 600, "ECS Graphstar", NULL, NULL);
     if (window == NULL) {
         std::cerr << "Failed to create GLFW window" << std::endl;
         glfwTerminate();
@@ -517,6 +623,9 @@ int main(int, char *[]) {
     world.component<SelfAlign>();
     world.component<Expand>();
 
+    world.component<HorizontalLayoutBox>();
+    world.component<VerticalLayoutBox>();
+
     world.component<DragContext>().add(flecs::Singleton);
     world.set<DragContext>({false, flecs::entity::null(), PanelSplitType::Horizontal, 0.0f});
 
@@ -529,7 +638,6 @@ int main(int, char *[]) {
         if (imgHandle == -1) {
             std::cerr << "Failed to load " << img.path << std::endl;
         }
-
         e.set<ImageRenderable>({imgHandle, img.scaleX, img.scaleY, 0.0f, 0.0f});
     });
 
@@ -563,12 +671,110 @@ int main(int, char *[]) {
         .set<RenderStatus>({true})
         .set<ZIndex>({0});
 
+    // TODO: Possibly load this from string
+    std::vector<std::string> editor_types = 
+    {
+        "Empty",
+        "Bookshelf",
+        "VNCStream",
+        "AudioStream"
+    };
+
+    world.observer<UIElementBounds, AddTagOnLeftClick>()
+    .term_at(1).second<ShowEditorPanels>()
+    .event<LeftClickEvent>()
+    .each([&](flecs::entity e, UIElementBounds& bounds, AddTagOnLeftClick)
+    {
+        std::cout << "Left mouse click event on " << e.id() << std::endl;
+        // Popup a menu to selector editor type
+
+        auto editor_icon_bkg_square = world.entity()
+        .is_a(UIElement)
+        .child_of(e)
+        .set<Position, Local>({0.0f, 10.0f})
+        .set<RectRenderable>({32.0f, 12.0f, false, 0x282828FF})
+        .set<ZIndex>({7});
+
+        auto editor_type_selector_square_corner = world.entity()
+        .is_a(UIElement)
+        .child_of(e)
+        .set<Position, Local>({0.0f, 19.0f})
+        .set<RectRenderable>({16.0f, 16.0f, false, 0x282828FF})
+        .set<ZIndex>({10});
+
+        auto editor_type_selector = world.entity()
+        .is_a(UIElement)
+        .child_of(e)
+        .set<Position, Local>({0.0f, 19.0f});
+
+        // TODO: Height of this should be based on the height of a vertical layout box...
+        auto editor_type_selector_bkg = world.entity()
+        .is_a(UIElement)
+        .child_of(editor_type_selector)
+        .set<RoundedRectRenderable>({256.0f, 96.0f, 4.0f, false, 0x282828FF})
+        .set<Expand>({false, 0, 0, 0, true, 4.0f, 4.0f, 1.0f})
+        .set<ZIndex>({10});
+
+        auto editor_type_list = world.entity()
+        .is_a(UIElement)
+        .child_of(editor_type_selector)
+        .set<VerticalLayoutBox>({2.0f, 0.0f})
+        .set<Position, Local>({4.0f, 2.0f});
+
+        for (std::string editor_type_name : editor_types)
+        {
+            // When you click on these elements,
+            // change the EditorType
+            // Remove any existing type scene content
+            // and load the new default scene...
+            world.entity()
+            .is_a(UIElement)
+            .child_of(editor_type_list)
+            .set<TextRenderable>({editor_type_name.c_str(), "ATARISTOCRAT", 16.0f, 0xFFFFFFFF, NVG_ALIGN_TOP | NVG_ALIGN_LEFT})
+            .set<ZIndex>({20});
+        }
+
+    });
+
+
     // Create text entities with different z-indices
     // auto text1 = world.entity("Text1")
     //     .is_a(UIElement)
     //     .set<Position, Local>({400.0f, 100.0f})
     //     .set<TextRenderable>({"Behind boxes", "ATARISTOCRAT", 24.0f, 0xFFFFFFFF, NVG_ALIGN_CENTER})
     //     .set<ZIndex>({0});
+
+	world.system<HorizontalLayoutBox>("ResetHProgress")
+        .kind(flecs::PreFrame)
+	    .each([](flecs::entity e, HorizontalLayoutBox& box)
+	    {
+	      box.x_progress = 0.0f;
+	      e.children([&](flecs::entity child)
+	      {
+	        Position& pos = child.ensure<Position, Local>();
+	        pos.x = box.x_progress;
+	        const UIElementBounds* bounds = child.try_get<UIElementBounds>();
+	        if (bounds) {
+	          box.x_progress += bounds->xmax - bounds->xmin + box.padding;
+	        }
+	      });
+	    });
+
+	world.system<VerticalLayoutBox>("ResetVProgress")
+        .kind(flecs::PreFrame)
+	    .each([](flecs::entity e, VerticalLayoutBox& box)
+	    {
+	      box.y_progress = 0.0f;
+	      e.children([&](flecs::entity child)
+	      {
+	        Position& pos = child.ensure<Position, Local>();
+	        pos.y = box.y_progress;
+	        const UIElementBounds* bounds = child.try_get<UIElementBounds>();
+	        if (bounds) {
+	          box.y_progress += bounds->ymax - bounds->ymin + box.padding;
+	        }
+	      });
+	    });
 
     auto movementSystem = world.system<Position, Velocity>()
     .term_at(0).second<Local>()
@@ -605,11 +811,16 @@ int main(int, char *[]) {
     int editor_edge_hover_dist = 8.0f;
 
     auto editor_root = world.entity("editor_root")
-        .set<Position, Local>({0.0f, 0.0f})
+        .set<Position, Local>({0.0f, 28.0f})
         .set<Position, World>({0.0f, 0.0f})
-        .set<EditorNodeArea>({800.0f, 600.0f}) // TOOD: Observer to update root to window width/height updates
+        .set<EditorNodeArea>({800.0f, 600.0f - 28.0f}) // TOOD: Observer to update root to window width/height updates
         .add<EditorRoot>()
         .add(flecs::OrderedChildren);
+
+    auto editor_header = world.entity()
+        .is_a(UIElement)
+        .set<ImageCreator>({"../assets/ecs_header.png", 1.0f, 1.0f})
+        .set<ZIndex>({5});
 
     // create_editor(editor_root, world, UIElement);
     split_editor({0.5, PanelSplitType::Horizontal}, editor_root, world, UIElement);
@@ -628,7 +839,7 @@ int main(int, char *[]) {
             auto node_area = it.field<EditorNodeArea>(1);
             for (auto i : it) {
                 node_area[i].width = window[i].width;
-                node_area[i].height = window[i].height;
+                node_area[i].height = window[i].height-28.0f; // minus the header...
             }
             flecs::entity editor_root = world.lookup("editor_root");
 
@@ -647,7 +858,7 @@ int main(int, char *[]) {
                 {
                     flecs::entity visual = editor.target<EditorVisual>();
                     // TODO: Only modify first two params...
-                    visual.set<RoundedRectRenderable>({node_area.width-2, node_area.height-2, 4.0f, false, 0x353535FF});
+                    visual.set<RoundedRectRenderable>({node_area.width-2, node_area.height-2, 4.0f, false, 0x010222});
                     flecs::entity outline = editor.target<EditorOutline>();
                     outline.set<RoundedRectRenderable>({node_area.width-2, node_area.height-2, 4.0f, true, 0x5f5f5fFF});
                 }
@@ -876,20 +1087,61 @@ int main(int, char *[]) {
         bounds.ymax = world_pos.y + rect.height;
     });
 
-    auto bubbleUpBoundsQuery = world.query_builder<const UIElementBounds, UIElementBounds*, RenderStatus*>()
+    world.system<UIElementBounds, Position, ImageRenderable>()
+    .term_at(1).second<World>()
+    .kind(flecs::OnUpdate)
+    .each([&](flecs::entity e, UIElementBounds& bounds, Position& world_pos, ImageRenderable& sprite) 
+    {
+        bounds.xmin = world_pos.x;
+        bounds.ymin = world_pos.y;
+        bounds.xmax = world_pos.x + sprite.width;
+        bounds.ymax = world_pos.y + sprite.height;
+    });
+
+    world.system<UIElementBounds, Position, TextRenderable, Graphics>()
+    .term_at(1).second<World>()
+    .kind(flecs::OnUpdate)
+    .each([&](flecs::entity e, UIElementBounds& bounds, Position& world_pos, TextRenderable& text, Graphics& graphics) 
+    {
+        nvgTextBounds(graphics.vg, world_pos.x, world_pos.y, text.text.c_str(), NULL, &bounds.xmin);
+    });
+
+    auto bubbleUpBoundsQuery = world.query_builder<UIElementBounds, UIElementBounds*, RenderStatus*>()
         .term_at(1).parent().up()  // Parent UIElementBounds
         .term_at(2).optional()          // Optional RenderStatus
         .build();
 
     auto bubbleUpBoundsSystem = world.system()
-        .kind(flecs::OnLoad)  // Run after bounds calculation but before debug rendering
+        .kind(flecs::OnLoad) 
         .each([&]() {
-            bubbleUpBoundsQuery.each([](flecs::entity e, const UIElementBounds& bounds, UIElementBounds* parent_bounds, RenderStatus* render) {
+            bubbleUpBoundsQuery.each([](flecs::entity e, UIElementBounds& bounds, UIElementBounds* parent_bounds, RenderStatus* render) {
                 if (parent_bounds && (!render || render->visible)) {
-                    parent_bounds->xmin = std::min(parent_bounds->xmin, bounds.xmin);
-                    parent_bounds->ymin = std::min(parent_bounds->ymin, bounds.ymin);
-                    parent_bounds->xmax = std::max(parent_bounds->xmax, bounds.xmax);
-                    parent_bounds->ymax = std::max(parent_bounds->ymax, bounds.ymax);
+                    
+                    // RETRIEVE THE EXPAND COMPONENT
+                    const Expand* expand = e.try_get<Expand>();
+
+                    if (bounds.xmax == 0)
+                    {
+                        // Inherit bounds if non renderable
+                        bounds.xmin = parent_bounds->xmin;
+                        bounds.xmax = parent_bounds->xmax;
+                        bounds.ymin = parent_bounds->ymin;
+                        bounds.ymax = parent_bounds->ymax;
+                    }
+
+                    // Handle Horizontal Bubble Up
+                    // Only let the child push the parent's width if the child IS NOT expanding in X
+                    if (!expand || !expand->x_enabled) {
+                        parent_bounds->xmin = std::min(parent_bounds->xmin, bounds.xmin);
+                        parent_bounds->xmax = std::max(parent_bounds->xmax, bounds.xmax);
+                    }
+
+                    // Handle Vertical Bubble Up
+                    // Only let the child push the parent's height if the child IS NOT expanding in Y
+                    if (!expand || !expand->y_enabled) {
+                        parent_bounds->ymin = std::min(parent_bounds->ymin, bounds.ymin);
+                        parent_bounds->ymax = std::max(parent_bounds->ymax, bounds.ymax);
+                    }
                 }
             });
         });
@@ -898,15 +1150,51 @@ int main(int, char *[]) {
     .term_at(0).parent()
     .kind(flecs::OnValidate)
     .each([&](flecs::entity e, UIElementBounds* bounds, RectRenderable& rect, Expand& expand) {
-        std::cout << bounds->xmin << std::endl;
-        std::cout << bounds->xmax << std::endl;
-        rect.width = bounds->xmax - bounds->xmin - expand.x_padding;
-        rect.height = bounds->ymax - bounds->ymin - expand.y_padding;
+        // std::cout << bounds->xmin << std::endl;
+        // std::cout << bounds->xmax << std::endl;
+        
+        if (expand.x_enabled)
+        {
+            rect.width = (bounds->xmax - bounds->xmin - (expand.pad_left + expand.pad_right))*expand.x_percent;
+        }
+        if (expand.y_enabled)
+        {
+            rect.height = (bounds->ymax - bounds->ymin - (expand.pad_top + expand.pad_bottom))*expand.y_percent;
+        }
+    });
+
+    world.system<UIElementBounds*, ImageRenderable, Expand, Graphics>()
+    .term_at(0).parent()
+    .kind(flecs::OnLoad)
+    .each([&](flecs::entity e, UIElementBounds* bounds, ImageRenderable& sprite, Expand& expand, Graphics& graphics) {        
+        if (bounds)
+        {
+            int img_width, img_height;
+            nvgImageSize(graphics.vg, sprite.imageHandle, &img_width, &img_height);
+            if (expand.x_enabled)
+            {
+                sprite.width = (bounds->xmax - bounds->xmin - (expand.pad_left + expand.pad_right))*expand.x_percent;
+                if (!expand.y_enabled)
+                {
+                    // TODO: Keep the ratio the same!
+                    sprite.height = sprite.width/img_width * img_height;
+                }
+            }
+            if (expand.y_enabled)
+            {
+                sprite.height = (bounds->ymax - bounds->ymin - (expand.pad_top + expand.pad_bottom))*expand.y_percent;
+                if (!expand.x_enabled)
+                {
+                    // TODO: Keep the ratio the same!
+                    sprite.width = sprite.height/img_height * img_width;
+                }
+            }
+        }
     });
 
     world.system<const UIElementBounds, UIElementBounds*>("ResetBounds")
       .term_at(1).parent().up()
-      .kind(flecs::PostFrame)
+      .kind(flecs::OnStart)
       .each([](flecs::entity e,
         const UIElementBounds& bounds, UIElementBounds* parent_bounds) 
     {
@@ -924,7 +1212,7 @@ int main(int, char *[]) {
     .each([](flecs::entity e, RenderQueue& render_queue, UIElementBounds& bounds) 
     {
         RectRenderable debug_bound {bounds.xmax - bounds.xmin, bounds.ymax - bounds.ymin, true, 0xFFFF00FF};
-        //render_queue.addRectCommand({bounds.xmin, bounds.ymin}, debug_bound, 100);
+        render_queue.addRectCommand({bounds.xmin, bounds.ymin}, debug_bound, 100);
     });
 
     auto roundedRectQueueSystem = world.system<Position, RoundedRectRenderable, ZIndex>()
@@ -1151,7 +1439,8 @@ int main(int, char *[]) {
         float pxRatio = (float)winWidth / (float)800;
 
         glViewport(0, 0, winWidth, winHeight);
-        glClearColor(22.0f/255.0f, 22.0f/255.0f, 22.0f/255.0f, 0.0f);
+        // glClearColor(22.0f/255.0f, 22.0f/255.0f, 22.0f/255.0f, 0.0f);
+        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
 
         glfwStateEntity.set<Window>({window, winWidth, winHeight});
