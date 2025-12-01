@@ -60,6 +60,11 @@ struct Velocity {
     float dx, dy;
 };
 
+struct UIElementSize
+{
+    float width, height;
+};
+
 struct UIElementBounds {
     float xmin, ymin, xmax, ymax;
 };
@@ -139,6 +144,16 @@ struct DynamicMerge {};
 struct LeftReleaseEvent {};
 struct RightClick {};
 struct RightRelease {};
+
+struct AddTagOnHoverEnter {};
+struct HoverEnterEvent {};
+
+struct AddTagOnHoverExit {};
+struct HoverExitEvent {};
+
+struct CloseEditorSelector {};
+struct SetMenuHighlightColor {};
+struct SetMenuStandardColor {};
 
 struct Graphics {
     NVGcontext* vg;
@@ -278,7 +293,7 @@ void create_editor(flecs::entity leaf, EditorNodeArea& node_area, flecs::world w
     auto editor_outline = world.entity()
         .is_a(UIElement)
         .child_of(editor_visual)
-        .set<RoundedRectRenderable>({node_area.width-2, node_area.height-2, 4.0f, true, 0x111222})
+        .set<RoundedRectRenderable>({node_area.width-2, node_area.height-2, 4.0f, true, 0x111222FF})
         .set<ZIndex>({5});
 
     leaf.add<EditorOutline>(editor_outline);
@@ -287,8 +302,8 @@ void create_editor(flecs::entity leaf, EditorNodeArea& node_area, flecs::world w
     auto editor_canvas = world.entity()
         .is_a(UIElement)
         .child_of(editor_visual)
-        .set<Position, Local>({4.0f, 23.0f})
-        .set<RectRenderable>({node_area.width-2-8.0f, node_area.height-2-23.0f, false, 0x010212})
+        .set<Position, Local>({8.0f, 23.0f})
+        .set<RectRenderable>({node_area.width-2-8.0f, node_area.height-2-23.0f, false, 0x121212FF})
         .set<Expand>({true, 8.0f, 8.0f, 1.0f, true, 27.0f, 4.0f, 1.0f})
         .set<ZIndex>({8});
 
@@ -497,17 +512,43 @@ void processInput(GLFWwindow *window) {
         glfwSetWindowShouldClose(window, true);
 }
 
+bool point_in_bounds(float x, float y, UIElementBounds bounds)
+{
+    return (x >= bounds.xmin && x <= bounds.xmax && y >= bounds.ymin && y <= bounds.ymax);
+}
+
 static void cursor_position_callback(GLFWwindow* window, double xpos, double ypos)
 {
     // TODO: Move to Observer?
     CursorState& cursor_state = world.lookup("GLFWState").ensure<CursorState>();
+    // TODO: Query for hoverable UIElement 
+    flecs::query hoverable_elements = world.query_builder<AddTagOnHoverEnter, AddTagOnHoverExit, UIElementBounds>()
+    .term_at(0).second(flecs::Wildcard).optional()
+    .term_at(1).second(flecs::Wildcard).optional()
+    .build();
+
+    hoverable_elements.each([&](flecs::entity ui_element, AddTagOnHoverEnter, AddTagOnHoverExit, UIElementBounds& bounds) {
+        bool in_bounds_prior = point_in_bounds(cursor_state.x, cursor_state.y, bounds);
+        bool in_bounds_post = point_in_bounds(xpos, ypos, bounds);
+        
+        if (!in_bounds_prior && in_bounds_post && ui_element.has<AddTagOnHoverEnter>(flecs::Wildcard))
+        {   
+            world.event<HoverEnterEvent>()
+            .id<UIElementBounds>()
+            .entity(ui_element)
+            .enqueue();
+        } else if (in_bounds_prior && !in_bounds_post && ui_element.has<AddTagOnHoverExit>(flecs::Wildcard))
+        {
+            // TODO: Store hover state...
+            world.event<HoverExitEvent>()
+            .id<UIElementBounds>()
+            .entity(ui_element)
+            .enqueue();  
+        }
+    });
+
     cursor_state.x = xpos;
     cursor_state.y = ypos;
-}
-
-bool point_in_bounds(float x, float y, UIElementBounds bounds)
-{
-    return (x >= bounds.xmin && x <= bounds.xmax && y >= bounds.ymin && y <= bounds.ymax);
 }
 
 void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
@@ -614,6 +655,7 @@ int main(int, char *[]) {
     world.component<Graphics>().add(flecs::Singleton);
     world.component<RenderQueue>();
     world.component<UIElementBounds>();
+    world.component<UIElementSize>();
 
     world.component<EditorNodeArea>();
     world.component<PanelSplit>();
@@ -667,18 +709,52 @@ int main(int, char *[]) {
     auto UIElement = world.prefab("UIElement")
         .set<Position, Local>({0.0f, 0.0f})
         .set<Position, World>({0.0f, 0.0f})
-        .set<UIElementBounds>({10000.0f, 10000.0f, 0.0f, 0.0f})
+        .set<UIElementBounds>({FLT_MAX, FLT_MAX, -FLT_MAX, -FLT_MAX})
+        .set<UIElementSize>({0.0f, 0.0f})
         .set<RenderStatus>({true})
         .set<ZIndex>({0});
 
     // TODO: Possibly load this from string
     std::vector<std::string> editor_types = 
     {
-        "Empty",
+        "Void",
+        // "ECS Graph", // Entity component relationship
+        "Peach Core",
+        // "Gynoid",
+        "Embodiment",
+        "Language Game", // Queue or Stream
+        "Vision",
+        "Hearing",
+        "Memory",
         "Bookshelf",
-        "VNCStream",
-        "AudioStream"
     };
+
+    world.observer<UIElementBounds, AddTagOnHoverExit>()
+    .term_at(1).second<CloseEditorSelector>()
+    .event<HoverExitEvent>()
+    .each([&](flecs::entity e, UIElementBounds& bounds, AddTagOnHoverExit)
+    {
+        std::cout << "Hover exit editor selector region" << std::endl;
+        e.destruct();
+    });
+
+    world.observer<UIElementBounds, AddTagOnHoverEnter>()
+    .term_at(1).second<SetMenuHighlightColor>()
+    .event<HoverEnterEvent>()
+    .each([&](flecs::entity e, UIElementBounds& bounds, AddTagOnHoverEnter)
+    {
+        RoundedRectRenderable& bkg = e.ensure<RoundedRectRenderable>();
+        bkg.color = 0x585858FF;
+    });
+
+    world.observer<UIElementBounds, AddTagOnHoverExit>()
+    .term_at(1).second<SetMenuStandardColor>()
+    .event<HoverExitEvent>()
+    .each([&](flecs::entity e, UIElementBounds& bounds, AddTagOnHoverExit)
+    {
+        RoundedRectRenderable& bkg = e.ensure<RoundedRectRenderable>();
+        bkg.color = 0x383838FF;
+    });
 
     world.observer<UIElementBounds, AddTagOnLeftClick>()
     .term_at(1).second<ShowEditorPanels>()
@@ -686,40 +762,53 @@ int main(int, char *[]) {
     .each([&](flecs::entity e, UIElementBounds& bounds, AddTagOnLeftClick)
     {
         std::cout << "Left mouse click event on " << e.id() << std::endl;
-        // Popup a menu to selector editor type
+        // Popup a menu to selector editor type (or close it)
+        bool has_close_child = false;
+        e.children([&](flecs::entity child) 
+        {
+            if (child.has<AddTagOnHoverExit, CloseEditorSelector>())
+            {
+                child.destruct();
+                has_close_child = true;
+            }
+        });
+        if (has_close_child) return;
+
+        auto editor_hover_region = world.entity()
+        .is_a(UIElement)
+        .child_of(e)
+        .add<AddTagOnHoverExit, CloseEditorSelector>();
 
         auto editor_icon_bkg_square = world.entity()
         .is_a(UIElement)
-        .child_of(e)
-        .set<Position, Local>({0.0f, 10.0f})
+        .child_of(editor_hover_region)
+        .set<Position, Local>({-1.0f, 10.0f})
         .set<RectRenderable>({32.0f, 12.0f, false, 0x282828FF})
         .set<ZIndex>({7});
 
-        auto editor_type_selector_square_corner = world.entity()
-        .is_a(UIElement)
-        .child_of(e)
-        .set<Position, Local>({0.0f, 19.0f})
-        .set<RectRenderable>({16.0f, 16.0f, false, 0x282828FF})
-        .set<ZIndex>({10});
-
         auto editor_type_selector = world.entity()
         .is_a(UIElement)
-        .child_of(e)
-        .set<Position, Local>({0.0f, 19.0f});
+        .child_of(editor_hover_region)
+        .set<Position, Local>({-1.0f, 19.0f});
 
-        // TODO: Height of this should be based on the height of a vertical layout box...
+        auto editor_type_selector_square_corner = world.entity()
+        .is_a(UIElement)
+        .child_of(editor_type_selector)
+        .set<RectRenderable>({16.0f, 16.0f, false, 0x282828FF})
+        .set<ZIndex>({30});
+
         auto editor_type_selector_bkg = world.entity()
         .is_a(UIElement)
         .child_of(editor_type_selector)
-        .set<RoundedRectRenderable>({256.0f, 96.0f, 4.0f, false, 0x282828FF})
-        .set<Expand>({false, 0, 0, 0, true, 4.0f, 4.0f, 1.0f})
-        .set<ZIndex>({10});
+        .set<RoundedRectRenderable>({196.0f, 256.0f, 4.0f, false, 0x282828FF})
+        .set<Expand>({false, 0, 0, 1.0f, true, 0.0f, -4.0f, 1.0f})
+        .set<ZIndex>({30});
 
         auto editor_type_list = world.entity()
         .is_a(UIElement)
         .child_of(editor_type_selector)
-        .set<VerticalLayoutBox>({2.0f, 0.0f})
-        .set<Position, Local>({4.0f, 2.0f});
+        .set<VerticalLayoutBox>({0.0f, 2.0f})
+        .set<Position, Local>({4.0f, 4.0f});
 
         for (std::string editor_type_name : editor_types)
         {
@@ -727,15 +816,25 @@ int main(int, char *[]) {
             // change the EditorType
             // Remove any existing type scene content
             // and load the new default scene...
-            world.entity()
+            auto edtior_type_btn = world.entity()
             .is_a(UIElement)
             .child_of(editor_type_list)
+            .set<RoundedRectRenderable>({196.0f-12.0f, 20.0f, 2.0f, false, 0x383838FF})
+            .set<Position, Local>({2.0f, 0.0f})
+            .add<AddTagOnHoverEnter, SetMenuHighlightColor>()
+            .add<AddTagOnHoverExit, SetMenuStandardColor>()
+            .set<ZIndex>({38});
+
+
+            world.entity()
+            .is_a(UIElement)
+            .child_of(edtior_type_btn)
             .set<TextRenderable>({editor_type_name.c_str(), "ATARISTOCRAT", 16.0f, 0xFFFFFFFF, NVG_ALIGN_TOP | NVG_ALIGN_LEFT})
-            .set<ZIndex>({20});
+            .set<Position, Local>({4.0f, 2.0f})
+            .set<ZIndex>({40});
         }
 
     });
-
 
     // Create text entities with different z-indices
     // auto text1 = world.entity("Text1")
@@ -743,38 +842,6 @@ int main(int, char *[]) {
     //     .set<Position, Local>({400.0f, 100.0f})
     //     .set<TextRenderable>({"Behind boxes", "ATARISTOCRAT", 24.0f, 0xFFFFFFFF, NVG_ALIGN_CENTER})
     //     .set<ZIndex>({0});
-
-	world.system<HorizontalLayoutBox>("ResetHProgress")
-        .kind(flecs::PreFrame)
-	    .each([](flecs::entity e, HorizontalLayoutBox& box)
-	    {
-	      box.x_progress = 0.0f;
-	      e.children([&](flecs::entity child)
-	      {
-	        Position& pos = child.ensure<Position, Local>();
-	        pos.x = box.x_progress;
-	        const UIElementBounds* bounds = child.try_get<UIElementBounds>();
-	        if (bounds) {
-	          box.x_progress += bounds->xmax - bounds->xmin + box.padding;
-	        }
-	      });
-	    });
-
-	world.system<VerticalLayoutBox>("ResetVProgress")
-        .kind(flecs::PreFrame)
-	    .each([](flecs::entity e, VerticalLayoutBox& box)
-	    {
-	      box.y_progress = 0.0f;
-	      e.children([&](flecs::entity child)
-	      {
-	        Position& pos = child.ensure<Position, Local>();
-	        pos.y = box.y_progress;
-	        const UIElementBounds* bounds = child.try_get<UIElementBounds>();
-	        if (bounds) {
-	          box.y_progress += bounds->ymax - bounds->ymin + box.padding;
-	        }
-	      });
-	    });
 
     auto movementSystem = world.system<Position, Velocity>()
     .term_at(0).second<Local>()
@@ -794,7 +861,7 @@ int main(int, char *[]) {
         .build();
 
     auto hierarchicalSystem = world.system()
-        .kind(flecs::PreUpdate)  // Run after layout systems to compute world positions
+        .kind(flecs::OnLoad)  // Run after layout systems to compute world positions
         .each([&]() {
             // std::cout << "Update hierarchy" << std::endl;
             hierarchicalQuery.each([](const Position& local, const Position* parentWorld, Position& world) {
@@ -829,7 +896,7 @@ int main(int, char *[]) {
     auto left_node = editor_root.target<LeftNode>();
     split_editor({0.25, PanelSplitType::Vertical}, left_node, world, UIElement);
 
-    auto propagateEditorRoot = world.system<Window, EditorNodeArea, EditorRoot>()
+    auto propagateEditorRoot = world.system<Window, EditorNodeArea, EditorRoot>("EditorPropagate")
     .term_at(0).src(glfwStateEntity)
     .kind(flecs::PreFrame)
     .run([](flecs::iter& it)
@@ -891,39 +958,95 @@ int main(int, char *[]) {
         }
     });
 
-    auto boundsCalculationSystem = world.system<Position, UIElementBounds>()
-        .term_at(0).second<World>()
-        .kind(flecs::OnUpdate)  // Run after hierarchical positioning
-        .each([&](flecs::entity e, Position& worldPos, UIElementBounds& bounds) {
-            // Reset bounds to invalid state at start of each frame
-            bounds.xmin = FLT_MAX;
-            bounds.ymin = FLT_MAX;
-            bounds.xmax = -FLT_MAX;
-            bounds.ymax = -FLT_MAX;
+    auto sizeCalculationSystem = world.system<UIElementSize>()
+        .kind(flecs::PreFrame)
+        .each([&](flecs::entity e, UIElementSize& size) {
 
-            // Calculate bounds based on renderable components
             if (e.has<RectRenderable>()) {
                 auto rect = e.get<RectRenderable>();
-                bounds.xmin = worldPos.x;
-                bounds.ymin = worldPos.y;
-                bounds.xmax = worldPos.x + rect.width;
-                bounds.ymax = worldPos.y + rect.height;
+                size.width = rect.width;
+                size.height = rect.height;
+            }
+            else if (e.has<RoundedRectRenderable>()) {
+                auto rect = e.get<RoundedRectRenderable>();
+                size.width = rect.width;
+                size.height = rect.height;
+                //std::cout << "Setting size to" << size.width << std::endl;
             } else if (e.has<ImageRenderable>()) {
                 auto img = e.get<ImageRenderable>();
-                // Images are rendered with top-left corner at worldPos, not centered
-                bounds.xmin = worldPos.x;
-                bounds.ymin = worldPos.y;
-                bounds.xmax = worldPos.x + img.width;
-                bounds.ymax = worldPos.y + img.height;
+                size.width = img.width;
+                size.height = img.height;
             } else if (e.has<TextRenderable>()) {
                 auto text = e.get<TextRenderable>();
                 // Approximate text bounds
                 float approxWidth = text.text.length() * text.fontSize * 0.6f;
                 float approxHeight = text.fontSize;
-                bounds.xmin = worldPos.x;
-                bounds.ymin = worldPos.y;
-                bounds.xmax = worldPos.x + approxWidth;
-                bounds.ymax = worldPos.y + approxHeight;
+                size.width = approxWidth;
+                size.height = approxHeight;
+            }
+        });
+
+	world.system<HorizontalLayoutBox>("ResetHProgress")
+        .kind(flecs::PreFrame)
+	    .each([](flecs::entity e, HorizontalLayoutBox& box)
+	    {
+	      box.x_progress = 0.0f;
+	      e.children([&](flecs::entity child)
+	      {
+	        Position& pos = child.ensure<Position, Local>();
+	        pos.x = box.x_progress;
+	        const UIElementSize* size = child.try_get<UIElementSize>();
+	        if (size) {
+	          box.x_progress += size->width + box.padding;
+	        }
+	      });
+	    });
+
+
+    world.system<VerticalLayoutBox, UIElementSize>("ResetVProgress")
+    .kind(flecs::PreFrame)
+    .each([](flecs::entity e, VerticalLayoutBox& box, UIElementSize& container_size)
+    {
+        box.y_progress = 0.0f;
+        float max_width = 0.0f; // Track the widest child
+
+        e.children([&](flecs::entity child)
+        {
+            Position& pos = child.ensure<Position, Local>();
+            pos.y = box.y_progress;
+            
+            // Renamed variable to avoid shadowing 'container_size'
+            const UIElementSize* child_size = child.try_get<UIElementSize>();
+            
+            if (child_size) {
+                // std::cout << box.y_progress << std::endl;
+                box.y_progress += child_size->height + box.padding;
+                
+                // Update max width
+                if (child_size->width > max_width) {
+                    max_width = child_size->width;
+                }
+            }
+        });
+
+        container_size.height = box.y_progress;
+        container_size.width = max_width; // Apply the calculated width
+    });
+
+    auto boundsCalculationSystem = world.system<Position, UIElementBounds, UIElementSize>()
+        .term_at(0).second<World>()
+        .kind(flecs::PostLoad) 
+        .each([&](flecs::entity e, Position& worldPos, UIElementBounds& bounds, UIElementSize& size) {
+            // Reset bounds to invalid state at start of each frame
+            bounds.xmin = worldPos.x;
+            bounds.ymin = worldPos.y;
+            bounds.xmax = worldPos.x;
+            bounds.ymax = worldPos.y;
+
+            if (size.width > 0 && size.height > 0)
+            {
+                bounds.xmax += size.width;
+                bounds.ymax += size.height;
             }
         });
 
@@ -1066,89 +1189,82 @@ int main(int, char *[]) {
             });
         });
 
-    // Leaf renderables update UIElementBounds size
-    world.system<UIElementBounds&, Position, RectRenderable>()
-    .term_at(1).second<World>()
-    .kind(flecs::OnUpdate)
-    .each([&](flecs::entity e, UIElementBounds& bounds, Position& world_pos, RectRenderable& rect) {
-        bounds.xmin = world_pos.x;
-        bounds.ymin = world_pos.y;
-        bounds.xmax = world_pos.x + rect.width;
-        bounds.ymax = world_pos.y + rect.height;
-    });
-
-    world.system<UIElementBounds, Position, RoundedRectRenderable>()
-    .term_at(1).second<World>()
-    .kind(flecs::OnUpdate)
-    .each([&](flecs::entity e, UIElementBounds& bounds, Position& world_pos, RoundedRectRenderable& rect) {
-        bounds.xmin = world_pos.x;
-        bounds.ymin = world_pos.y;
-        bounds.xmax = world_pos.x + rect.width;
-        bounds.ymax = world_pos.y + rect.height;
-    });
-
-    world.system<UIElementBounds, Position, ImageRenderable>()
-    .term_at(1).second<World>()
-    .kind(flecs::OnUpdate)
-    .each([&](flecs::entity e, UIElementBounds& bounds, Position& world_pos, ImageRenderable& sprite) 
-    {
-        bounds.xmin = world_pos.x;
-        bounds.ymin = world_pos.y;
-        bounds.xmax = world_pos.x + sprite.width;
-        bounds.ymax = world_pos.y + sprite.height;
-    });
-
-    world.system<UIElementBounds, Position, TextRenderable, Graphics>()
-    .term_at(1).second<World>()
-    .kind(flecs::OnUpdate)
-    .each([&](flecs::entity e, UIElementBounds& bounds, Position& world_pos, TextRenderable& text, Graphics& graphics) 
-    {
-        nvgTextBounds(graphics.vg, world_pos.x, world_pos.y, text.text.c_str(), NULL, &bounds.xmin);
-    });
-
     auto bubbleUpBoundsQuery = world.query_builder<UIElementBounds, UIElementBounds*, RenderStatus*>()
         .term_at(1).parent().up()  // Parent UIElementBounds
         .term_at(2).optional()          // Optional RenderStatus
         .build();
 
-    auto bubbleUpBoundsSystem = world.system()
-        .kind(flecs::OnLoad) 
-        .each([&]() {
-            bubbleUpBoundsQuery.each([](flecs::entity e, UIElementBounds& bounds, UIElementBounds* parent_bounds, RenderStatus* render) {
-                if (parent_bounds && (!render || render->visible)) {
-                    
-                    // RETRIEVE THE EXPAND COMPONENT
-                    const Expand* expand = e.try_get<Expand>();
+    auto bubbleUpBoundsSystem = world.system<UIElementBounds, UIElementBounds*, RenderStatus*>()
+        .kind(flecs::PostLoad) 
+        .term_at(1).parent().up()
+        .term_at(2).optional()
+        .each([&](flecs::entity e, UIElementBounds& bounds, UIElementBounds* parent_bounds, RenderStatus* render) {
+            if (parent_bounds && (!render || render->visible)) {
+                
+                const Expand* expand = e.try_get<Expand>();
 
-                    if (bounds.xmax == 0)
-                    {
-                        // Inherit bounds if non renderable
-                        bounds.xmin = parent_bounds->xmin;
-                        bounds.xmax = parent_bounds->xmax;
-                        bounds.ymin = parent_bounds->ymin;
-                        bounds.ymax = parent_bounds->ymax;
-                    }
-
-                    // Handle Horizontal Bubble Up
-                    // Only let the child push the parent's width if the child IS NOT expanding in X
-                    if (!expand || !expand->x_enabled) {
-                        parent_bounds->xmin = std::min(parent_bounds->xmin, bounds.xmin);
-                        parent_bounds->xmax = std::max(parent_bounds->xmax, bounds.xmax);
-                    }
-
-                    // Handle Vertical Bubble Up
-                    // Only let the child push the parent's height if the child IS NOT expanding in Y
-                    if (!expand || !expand->y_enabled) {
-                        parent_bounds->ymin = std::min(parent_bounds->ymin, bounds.ymin);
-                        parent_bounds->ymax = std::max(parent_bounds->ymax, bounds.ymax);
-                    }
+                if (bounds.xmax == 0)
+                {
+                    // Inherit bounds if non renderable
+                    bounds.xmin = parent_bounds->xmin;
+                    bounds.xmax = parent_bounds->xmax;
+                    bounds.ymin = parent_bounds->ymin;
+                    bounds.ymax = parent_bounds->ymax;
                 }
-            });
+
+                // Handle Horizontal Bubble Up
+                // Only let the child set the parent's width if the child IS NOT expanding in X
+                if (!expand || !expand->x_enabled) {
+                    parent_bounds->xmin = std::min(parent_bounds->xmin, bounds.xmin);
+                    parent_bounds->xmax = std::max(parent_bounds->xmax, bounds.xmax);
+                }
+
+                // Handle Vertical Bubble Up
+                // Only let the child set the parent's height if the child IS NOT expanding in Y
+                if (!expand || !expand->y_enabled) {
+                    parent_bounds->ymin = std::min(parent_bounds->ymin, bounds.ymin);
+                    parent_bounds->ymax = std::max(parent_bounds->ymax, bounds.ymax);
+                }
+                }
+        });
+
+    auto bubbleUpBoundsSecondarySystem = world.system<UIElementBounds, UIElementBounds*, RenderStatus*>()
+        .kind(flecs::PostLoad) 
+        .term_at(1).parent().up()
+        .term_at(2).optional()
+        .each([&](flecs::entity e, UIElementBounds& bounds, UIElementBounds* parent_bounds, RenderStatus* render) {
+            if (parent_bounds && (!render || render->visible)) {
+                
+                const Expand* expand = e.try_get<Expand>();
+
+                if (bounds.xmax == 0)
+                {
+                    // Inherit bounds if non renderable
+                    bounds.xmin = parent_bounds->xmin;
+                    bounds.xmax = parent_bounds->xmax;
+                    bounds.ymin = parent_bounds->ymin;
+                    bounds.ymax = parent_bounds->ymax;
+                }
+
+                // Handle Horizontal Bubble Up
+                // Only let the child set the parent's width if the child IS NOT expanding in X
+                if (!expand || !expand->x_enabled) {
+                    parent_bounds->xmin = std::min(parent_bounds->xmin, bounds.xmin);
+                    parent_bounds->xmax = std::max(parent_bounds->xmax, bounds.xmax);
+                }
+
+                // Handle Vertical Bubble Up
+                // Only let the child set the parent's height if the child IS NOT expanding in Y
+                if (!expand || !expand->y_enabled) {
+                    parent_bounds->ymin = std::min(parent_bounds->ymin, bounds.ymin);
+                    parent_bounds->ymax = std::max(parent_bounds->ymax, bounds.ymax);
+                }
+                }
         });
 
     world.system<UIElementBounds*, RectRenderable, Expand>()
     .term_at(0).parent()
-    .kind(flecs::OnValidate)
+    .kind(flecs::PreUpdate)
     .each([&](flecs::entity e, UIElementBounds* bounds, RectRenderable& rect, Expand& expand) {
         // std::cout << bounds->xmin << std::endl;
         // std::cout << bounds->xmax << std::endl;
@@ -1163,9 +1279,23 @@ int main(int, char *[]) {
         }
     });
 
+    world.system<UIElementBounds*, RoundedRectRenderable, Expand>()
+    .term_at(0).parent()
+    .kind(flecs::PreUpdate)
+    .each([&](flecs::entity e, UIElementBounds* bounds, RoundedRectRenderable& rect, Expand& expand) {
+        if (expand.x_enabled)
+        {
+            rect.width = (bounds->xmax - bounds->xmin - (expand.pad_left + expand.pad_right))*expand.x_percent;
+        }
+        if (expand.y_enabled)
+        {
+            rect.height = (bounds->ymax - bounds->ymin - (expand.pad_top + expand.pad_bottom))*expand.y_percent;
+        }
+    });
+
     world.system<UIElementBounds*, ImageRenderable, Expand, Graphics>()
     .term_at(0).parent()
-    .kind(flecs::OnLoad)
+    .kind(flecs::PreUpdate)
     .each([&](flecs::entity e, UIElementBounds* bounds, ImageRenderable& sprite, Expand& expand, Graphics& graphics) {        
         if (bounds)
         {
@@ -1192,27 +1322,12 @@ int main(int, char *[]) {
         }
     });
 
-    world.system<const UIElementBounds, UIElementBounds*>("ResetBounds")
-      .term_at(1).parent().up()
-      .kind(flecs::OnStart)
-      .each([](flecs::entity e,
-        const UIElementBounds& bounds, UIElementBounds* parent_bounds) 
-    {
-        if (parent_bounds)
-        {
-          parent_bounds->xmin = 10000.0f;
-          parent_bounds->ymin = 10000.0f;
-          parent_bounds->xmax = 0;
-          parent_bounds->ymax = 0;
-        }
-    });
-
     auto debugRenderBounds = world.system<RenderQueue, UIElementBounds>()
     .term_at(0).src(renderQueueEntity)
     .each([](flecs::entity e, RenderQueue& render_queue, UIElementBounds& bounds) 
     {
         RectRenderable debug_bound {bounds.xmax - bounds.xmin, bounds.ymax - bounds.ymin, true, 0xFFFF00FF};
-        render_queue.addRectCommand({bounds.xmin, bounds.ymin}, debug_bound, 100);
+        //render_queue.addRectCommand({bounds.xmin, bounds.ymin}, debug_bound, 100);
     });
 
     auto roundedRectQueueSystem = world.system<Position, RoundedRectRenderable, ZIndex>()
@@ -1435,22 +1550,26 @@ int main(int, char *[]) {
         processInput(window);
 
         int winWidth, winHeight;
-        glfwGetFramebufferSize(window, &winWidth, &winHeight);
-        float pxRatio = (float)winWidth / (float)800;
+        glfwGetWindowSize(window, &winWidth, &winHeight);
+        int fbWidth, fbHeight;
+        glfwGetFramebufferSize(window, &fbWidth, &fbHeight);
+        float devicePixelRatio = (float)fbWidth / (float)winWidth;
 
-        glViewport(0, 0, winWidth, winHeight);
+        glViewport(0, 0, fbWidth, fbHeight);
         // glClearColor(22.0f/255.0f, 22.0f/255.0f, 22.0f/255.0f, 0.0f);
         glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
 
         glfwStateEntity.set<Window>({window, winWidth, winHeight});
 
-        nvgBeginFrame(vg, winWidth, winHeight, pxRatio);
-
+        nvgBeginFrame(vg, winWidth, winHeight, devicePixelRatio);
+        
+        world.defer_begin();
+        glfwPollEvents();
+        world.defer_end();
         world.progress();
 
         nvgEndFrame(vg);
-        glfwPollEvents();
 
         glfwSwapBuffers(window);
     }
