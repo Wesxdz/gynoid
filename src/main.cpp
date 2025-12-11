@@ -14,6 +14,9 @@
 #include <unordered_map>
 #include <raymath.h>
 
+#include <ctime>
+#include <chrono>
+
 /*
 These luminous phenomena still manifest themselves
 from time to time, as when a new idea opening up possibilities
@@ -65,6 +68,7 @@ struct UIElementSize
     float width, height;
 };
 
+struct DebugRenderBounds {};
 struct UIElementBounds {
     float xmin, ymin, xmax, ymax;
 };
@@ -96,6 +100,111 @@ struct RoundedRectRenderable {
     float width, height, radius;
     bool stroke;
     uint32_t color;
+};
+
+struct LineRenderable {
+    float x1, y1;
+    float x2, y2;
+    
+    float thickness;
+    uint32_t color;
+};
+
+struct QuadraticBezierRenderable {
+    float x1, y1;
+    float cx, cy;
+    float x2, y2;
+    
+    float thickness;
+    uint32_t color;
+};
+
+float get_time_of_day_normalized() {
+    using namespace std::chrono;
+
+    // 1. Get current time point
+    auto now = system_clock::now();
+
+    // 2. Convert to time_t to break down into local time (hours, min, sec)
+    std::time_t t = system_clock::to_time_t(now);
+    std::tm local_tm = *std::localtime(&t); // Note: Not thread-safe (see below)
+
+    // 3. Calculate total seconds elapsed today (Hours + Minutes + Seconds)
+    long seconds_since_midnight = 
+        (local_tm.tm_hour * 3600) + 
+        (local_tm.tm_min * 60) + 
+        local_tm.tm_sec;
+
+    // 4. Retrieve milliseconds for higher precision
+    //    Get duration since epoch, extract seconds, and find the remainder
+    auto duration = now.time_since_epoch();
+    auto sec_duration = duration_cast<std::chrono::seconds>(duration);
+    auto ms_duration = duration_cast<std::chrono::milliseconds>(duration) - 
+                       duration_cast<std::chrono::milliseconds>(sec_duration);
+    
+    float ms_fraction = ms_duration.count() / 1000.0f;
+
+    // 5. Combine and normalize
+    //    Total seconds in a day = 86400 (24 * 60 * 60)
+    float total_seconds_today = static_cast<float>(seconds_since_midnight) + ms_fraction;
+    
+    return total_seconds_today / 86400.0f;
+    // spin counterclockwise
+    // return local_tm.tm_sec/60.0f;f
+}
+
+QuadraticBezierRenderable get_hour_segment(size_t i, float start_angle = 0.0f)
+{
+    float radius = 80.0f;
+
+    float centerX = 100.0f;
+    float centerY = 100.0f;
+    int segments = 24;
+    float thickness = 2.0f;
+
+    uint32_t dayA   = 0x5f9c00FF; // Green
+    uint32_t dayB   = 0xfc9800FF; // Orange
+    uint32_t nightA = 0x6868fbFF; // Light Blue
+    uint32_t nightB = 0x002df4FF; // Dark Blue
+
+    float angleStep = (2.0f * M_PI) / segments;
+
+    // Start at PI (Left/West) and go around
+    float thetaStart = start_angle + (i * angleStep) + M_PI;
+    float thetaEnd   = start_angle + ((i + 1) * angleStep) + M_PI;
+
+    // Standard Bezier Arc Math
+    float x1 = centerX + radius * cos(thetaStart);
+    float y1 = centerY + radius * sin(thetaStart);
+    float x2 = centerX + radius * cos(thetaEnd);
+    float y2 = centerY + radius * sin(thetaEnd);
+
+    float midTheta = (thetaStart + thetaEnd) / 2.0f;
+    // Calculate mid-point slightly further out for the control point
+    float ctrlDist = radius / cos(angleStep / 2.0f);
+    float cx = centerX + ctrlDist * cos(midTheta);
+    float cy = centerY + ctrlDist * sin(midTheta);
+
+    uint32_t segColor;
+    
+    // TODO: Get location dependent
+    bool isDaytime = i > 7 && i < 17; 
+    // bool isDaytime = i < 12; 
+
+    if (isDaytime) {
+        // DAY: Switch between Green and Orange
+        // Use modulus on the index 'i' to alternate colors
+        segColor = (i % 2 == 0) ? dayA : dayB;
+    } else {
+        // NIGHT: Switch between Light Blue and Dark Blue
+        segColor = (i % 2 == 0) ? nightA : nightB;
+    }
+    return {x1, y1, cx, cy, x2, y2, thickness, segColor};
+}
+
+struct DiurnalHour
+{
+    size_t segment;
 };
 
 struct TextRenderable {
@@ -136,6 +245,7 @@ struct CursorState
 
 struct AddTagOnLeftClick{};
 struct ShowEditorPanels {};
+struct SetPanelEditorType {};
 
 struct LeftClickEvent {};
 struct Dragging {};
@@ -161,23 +271,32 @@ struct Graphics {
 
 enum class EditorType
 {
-    Bookshelf,
-    MelSpectrogram,
-    VNCStream,
-    CameraVideoFeed,
-    RobotActuators,
-    VirtualHumanoid,
-    EpisodicMemoryTimeline,
-    Reification,
-    ReadingRepresentation,
-    ProgramSynthesis,
-    Servers,
+    Void,
+    PeachCore,
     Healthbar,
-    Inventory,
-    Scheduling,
-    Chat,
-    ComputeProvisioning,
-    Backup
+    Embodiment,
+    LanguageGame,
+    Vision,
+    Hearing,
+    Memory,
+    Bookshelf,
+    // Bookshelf,
+    // MelSpectrogram,
+    // VNCStream,
+    // CameraVideoFeed,
+    // RobotActuators,
+    // VirtualHumanoid,
+    // EpisodicMemoryTimeline,
+    // Reification,
+    // ReadingRepresentation,
+    // ProgramSynthesis,
+    // Servers,
+    // Healthbar,
+    // Inventory,
+    // Scheduling,
+    // Chat,
+    // ComputeProvisioning,
+    // Backup
 };
 
 // Node representing the editor area...
@@ -206,7 +325,10 @@ struct EditorRoot
 };
 
 struct EditorVisual {};
+struct EditorHeader {};
 struct EditorOutline {};
+struct EditorCanvas {};
+struct EditorLeaf {};
 
 struct UpperNode {};
 struct LowerNode {};
@@ -214,18 +336,10 @@ struct LowerNode {};
 struct LeftNode {};
 struct RightNode {};
 
-struct VerticalAlign
+struct Align
 {
-    float percent;
-};
-
-struct HorizontalAlign
-{
-    float percent;
-};
-
-struct SelfAlign
-{
+    float self_horizontal;
+    float self_vertical;
     float horizontal;
     float vertical;
 };
@@ -235,12 +349,20 @@ struct SelfAlign
 struct Expand
 {
     bool x_enabled;
+    // TODO: Use a padding primitive rather than placing these on expand...
     float pad_left, pad_right;
     float x_percent; // 0.0 to 1.0
 
     bool y_enabled;
     float pad_top, pad_bottom;
     float y_percent;
+};
+
+// Post expand layer to 'fit within editor panel bounds'
+struct Constrain
+{
+    bool fit_x; // Scale x to fit within bounds (maintain ratio)
+    bool fit_y; // Scale y to fit within bounds (maintain ratio)
 };
 
 struct EditorLeafData
@@ -273,14 +395,16 @@ enum class RenderType {
     Rectangle,
     RoundedRectangle,
     Text,
-    Image
+    Image,
+    Line,
+    QuadraticBezier,
 };
 
 flecs::world world;
 
 void create_editor(flecs::entity leaf, EditorNodeArea& node_area, flecs::world world, flecs::entity UIElement)
 {
-    leaf.set<EditorLeafData>({EditorType::VNCStream});
+    leaf.set<EditorLeafData>({EditorType::Void});
 
     auto editor_visual = world.entity()
         .is_a(UIElement)
@@ -298,20 +422,42 @@ void create_editor(flecs::entity leaf, EditorNodeArea& node_area, flecs::world w
 
     leaf.add<EditorOutline>(editor_outline);
 
+    auto editor_header = world.entity()
+        .is_a(UIElement)
+        .child_of(editor_visual)
+        // .set<RectRenderable>({node_area.width-2-8.0f, 27.0f, true, 0x00000000})
+        .set<Expand>({true, 4.0f, 4.0f, 1.0f, false, 0.0f, 0.0f, 1.0f})
+        .set<ZIndex>({8});
+
+    leaf.add<EditorHeader>(editor_header);
+
     // Add 'expand to parent UIElement bounds with padding'
     auto editor_canvas = world.entity()
         .is_a(UIElement)
         .child_of(editor_visual)
-        .set<Position, Local>({8.0f, 23.0f})
+        .set<Position, Local>({4.0f, 23.0f})
+        // .add<DebugRenderBounds>()
         .set<RectRenderable>({node_area.width-2-8.0f, node_area.height-2-23.0f, false, 0x121212FF})
-        .set<Expand>({true, 8.0f, 8.0f, 1.0f, true, 27.0f, 4.0f, 1.0f})
+        .set<Expand>({true, 4.0f, 4.0f, 1.0f, true, 27.0f, 0.0f, 1.0f})
         .set<ZIndex>({8});
+
+    leaf.add<EditorCanvas>(editor_canvas);
+
+    auto editor_header_bkg = world.entity()
+        .is_a(UIElement)
+        .child_of(editor_visual)
+        .set<Position, Local>({0.0f, 0.0f})
+        .set<RoundedRectRenderable>({0.0f, 22.0f, 4.0f, false, 0x282828FF})
+        .set<Expand>({true, 0.0f, 0.0f, 1.0f, false, 0, 0, 0})
+        .set<ZIndex>({2});
 
     auto editor_icon_bkg = world.entity()
         .is_a(UIElement)
         .child_of(editor_visual)
         .set<Position, Local>({8.0f, 2.0f})
         .set<RoundedRectRenderable>({32.0f, 20.0f, 4.0f, false, 0x282828FF})
+        .add<EditorCanvas>(editor_canvas)
+        .add<EditorLeaf>(leaf)
         .add<AddTagOnLeftClick, ShowEditorPanels>()
         .set<ZIndex>({4});
 
@@ -319,7 +465,7 @@ void create_editor(flecs::entity leaf, EditorNodeArea& node_area, flecs::world w
         .is_a(UIElement)
         .child_of(editor_icon_bkg)
         .set<Position, Local>({2.0f, 0.0f})
-        .set<ImageCreator>({"../assets/graphstar_icon.png", 1.0f, 1.0f})
+        .set<ImageCreator>({"../assets/embodiment.png", 1.0f, 1.0f})
         .set<ZIndex>({12});
 
     auto editor_dropdown = world.entity()
@@ -337,47 +483,216 @@ void create_editor(flecs::entity leaf, EditorNodeArea& node_area, flecs::world w
 
     // TODO: Editor type entities...
 
-    if (leaf.has<EditorLeafData>() && leaf.get<EditorLeafData>().editor_type == EditorType::Bookshelf)
-    {
+    // if (leaf.has<EditorLeafData>() && leaf.get<EditorLeafData>().editor_type == EditorType::Bookshelf)
+    // {
     // For bookshelf, we should create the horizontal layout with all the books
-    auto bookshelf_layer = world.entity()
+
+}
+
+// TODO: load this from config file
+std::vector<std::string> editor_types = 
+{
+    "Void",
+    // "ECS Graph", // Entity component relationship
+    "Peach Core",
+    "Healthbar",
+    // "Gynoid",
+    "Embodiment",
+    "Language Game", // Queue or Stream
+    "Vision",
+    "Hearing",
+    "Memory",
+    "Bookshelf",
+};
+
+
+// Factory function to populate editor content, whether the panel is initialized or changed
+void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::entity UIElement)
+{
+    std::cout << "Change panel type to " << editor_types[(int)editor_type] << std::endl;
+    if (editor_type == EditorType::PeachCore)
+    {
+
+        auto server_hud = world.entity("ServerHUD")
         .is_a(UIElement)
-        .child_of(editor_visual)
-        .set<HorizontalLayoutBox>({0.0f, 8.0f});
+        .set<HorizontalLayoutBox>({0.0f, 2.0f})
+        .add(flecs::OrderedChildren)
+        .child_of(leaf.target<EditorCanvas>());
+
+        std::vector<std::string> server_icons = {"peach_core", "parakeet", "chatterbox", "flecs", "x11", "doctr", "huggingface", "dino2"};
+        // std::vector<std::string> server_icons = {"peach_core"};
+
+        for (const auto& icon : server_icons)
+        {
+            world.entity()
+            .is_a(UIElement)
+            .child_of(server_hud)
+            .set<ImageCreator>({"../assets/server_hud/" + icon + ".png", 1.0f, 1.0f})
+            .set<ZIndex>({10});
+        }
         
-    world.entity()
-    .is_a(UIElement)
-    .child_of(bookshelf_layer)
-    .set<Position, Local>({4.0f, 23.0f})
-    .set<ImageCreator>({"../assets/cover_james.jpg", 1.0f, 1.0f})
-    .set<Expand>({false, 4.0f, 4.0f, 1.0f, true, 27.0f, 0.0f, 1.0f})
-    .set<ZIndex>({10});
-
-    world.entity()
-    .is_a(UIElement)
-    .child_of(bookshelf_layer)
-    .set<Position, Local>({4.0f, 23.0f})
-    .set<ImageCreator>({"../assets/cover_cognitive_theory.jpg", 1.0f, 1.0f})
-    .set<Expand>({false, 4.0f, 4.0f, 1.0f, true, 27.0f, 0.0f, 1.0f})
-    .set<ZIndex>({10});
-
-    world.entity()
-    .is_a(UIElement)
-    .child_of(bookshelf_layer)
-    .set<Position, Local>({4.0f, 23.0f})
-    .set<ImageCreator>({"../assets/cover_soar.jpg", 1.0f, 1.0f})
-    .set<Expand>({false, 4.0f, 4.0f, 1.0f, true, 27.0f, 0.0f, 1.0f})
-    .set<ZIndex>({10});
-
-    world.entity()
-    .is_a(UIElement)
-    .child_of(bookshelf_layer)
-    .set<Position, Local>({4.0f, 23.0f})
-    .set<ImageCreator>({"../assets/cover_readings_in_kr.jpg", 1.0f, 1.0f})
-    .set<Expand>({false, 4.0f, 4.0f, 1.0f, true, 27.0f, 0.0f, 1.0f})
-    .set<ZIndex>({10});
     }
+    else if (editor_type == EditorType::Memory)
+    {
+        float diurnal_pos = get_time_of_day_normalized();
+        std::cout << diurnal_pos << std::endl;
+        int segments = 24;
+        for (int i = 0; i < segments; ++i) {
+            world.entity()
+                .is_a(UIElement)
+                .child_of(leaf.target<EditorCanvas>())
+                .set<DiurnalHour>({i})
+                .set<QuadraticBezierRenderable>(get_hour_segment(i, (0.5f * M_PI) - (diurnal_pos) * (2.0f * M_PI)))
+                .set<ZIndex>({10});
+        }
+    } else if (editor_type == EditorType::Healthbar)
+    {
+        // Healthbar base level
+        // Threshold at 0.5
+        world.entity()
+        .is_a(UIElement)
+        .child_of(leaf.target<EditorCanvas>())
+        .set<LineRenderable>({0.0f, 0.0f, 100.0f, 0.0f, 2.0f, 0x00FF00FF})
+        .set<Align>({0.0f, 0.0f, 0.0f, 0.5f})
+        .set<Expand>({true, 0, 0, 1.0, false, 0, 0, 0})
+        .set<ZIndex>({10});
+
+        auto threshold_line = world.entity()
+        .is_a(UIElement)
+        .child_of(leaf.target<EditorCanvas>())
+        .set<RectRenderable>({0.0f, 0.0f, false, 0x00FF0055})
+        .set<RenderStatus>({})
+        .set<Align>({0.0f, 0.0f, 0.0f, 0.5f})
+        .set<Expand>({true, 0, 0, 1.0, true, 0, 0, 0.5})
+        .set<ZIndex>({10});
+
+        auto endowment_monthly_income = world.entity()
+        .is_a(UIElement)
+        .child_of(threshold_line)
+        .set<Position, Local>({4.0f, -4.0f})
+        .set<TextRenderable>({"0.5%", "ATARISTOCRAT", 16.0f, 0xFFFFFFFF})
+        .set<ZIndex>({30});
+        
+        auto threshold_amount = world.entity()
+        .is_a(UIElement)
+        .child_of(threshold_line)
+        .set<Position, Local>({4.0f, 12.0f})
+        .set<TextRenderable>({"$1200", "ATARISTOCRAT", 16.0f, 0x00FF00FF})
+        .set<ZIndex>({30});
+
+        auto badges = world.entity()
+        .is_a(UIElement)
+        .set<HorizontalLayoutBox>({0.0f, 2.0f})
+        .set<Position, Local>({48.0f, 0.0f})
+        .child_of(leaf.target<EditorHeader>());
+        
+        world.entity()
+        .is_a(UIElement)
+        .child_of(badges)
+        .set<ImageCreator>({"../assets/healthbar_badge.png", 1.0f, 1.0f})
+        .set<ZIndex>({20});
+    }
+    else if (editor_type == EditorType::Embodiment)
+    {
+        world.entity()
+        .is_a(UIElement)
+        .child_of(leaf.target<EditorCanvas>())
+        .set<ImageCreator>({"../assets/heonae_work.png", 1.0f, 1.0f})
+        .set<Expand>({true, 0.0f, 0.0f, 1.0f, false, 0.0f, 0.0f, 1.0f})
+        .set<Align>({-0.5f, -0.5f, 0.5f, 0.5f})
+        .set<Constrain>({true, true})
+        .set<ZIndex>({10});
+
+        auto badges = world.entity()
+        .is_a(UIElement)
+        .set<HorizontalLayoutBox>({0.0f, 2.0f})
+        .set<Position, Local>({48.0f, 0.0f})
+        .child_of(leaf.target<EditorHeader>());
+        
+        world.entity()
+        .is_a(UIElement)
+        .child_of(badges)
+        .set<ImageCreator>({"../assets/heonae_badge.png", 1.0f, 1.0f})
+        .set<ZIndex>({20});
+
+        world.entity()
+        .is_a(UIElement)
+        .child_of(badges)
+        .set<ImageCreator>({"../assets/virtual_badge.png", 1.0f, 1.0f})
+        .set<ZIndex>({20});
+
+        world.entity()
+        .is_a(UIElement)
+        .child_of(badges)
+        .set<ImageCreator>({"../assets/physical_badge.png", 1.0f, 1.0f})
+        .set<ZIndex>({20});
+        
+    }
+    else if (editor_type == EditorType::Bookshelf)
+    {
+        auto bookshelf_layer = world.entity()
+        .is_a(UIElement)
+        .child_of(leaf.target<EditorCanvas>())
+        .set<HorizontalLayoutBox>({0.0f, 8.0f})
+        .set<Expand>({true, 0.0f, 0.0f, 1.0f, true, 0.0f, 0.0f, 1.0f});
+        
+        // TODO: Load from folder target
+        world.entity()
+        .is_a(UIElement)
+        .child_of(bookshelf_layer)
+        .set<ImageCreator>({"../assets/cover_james.jpg", 1.0f, 1.0f})
+        .set<Expand>({false, 4.0f, 4.0f, 1.0f, true, 0.0f, 0.0f, 1.0f})
+        .set<ZIndex>({10});
     
+        world.entity()
+        .is_a(UIElement)
+        .child_of(bookshelf_layer)
+        .set<ImageCreator>({"../assets/cover_cognitive_theory.jpg", 1.0f, 1.0f})
+        .set<Expand>({false, 4.0f, 4.0f, 1.0f, true, 0.0f, 0.0f, 1.0f})
+        .set<ZIndex>({10});
+    
+        world.entity()
+        .is_a(UIElement)
+        .child_of(bookshelf_layer)
+        .set<ImageCreator>({"../assets/cover_soar.jpg", 1.0f, 1.0f})
+        .set<Expand>({false, 4.0f, 4.0f, 1.0f, true, 0.0f, 0.0f, 1.0f})
+        .set<ZIndex>({10});
+    
+        world.entity()
+        .is_a(UIElement)
+        .child_of(bookshelf_layer)
+        .set<ImageCreator>({"../assets/cover_readings_in_kr.jpg", 1.0f, 1.0f})
+        .set<Expand>({false, 4.0f, 4.0f, 1.0f, true, 0.0f, 0.0f, 1.0f})
+        .set<ZIndex>({10});
+
+        world.entity()
+        .is_a(UIElement)
+        .child_of(bookshelf_layer)
+        .set<ImageCreator>({"../assets/cuct.png", 1.0f, 1.0f})
+        .set<Expand>({false, 4.0f, 4.0f, 1.0f, true, 0.0f, 0.0f, 1.0f})
+        .set<ZIndex>({10});
+    } else
+    {
+        auto editor_icon_bkg_square = world.entity()
+        .is_a(UIElement)
+        .child_of(leaf.target<EditorCanvas>())
+        .set<Position, Local>({4.0f, 12.0f})
+        .set<TextRenderable>({editor_types[(int)editor_type].c_str(), "ATARISTOCRAT", 16.0f, 0xFFFFFFFF})
+        .set<ZIndex>({30});
+    }
+}
+
+void replace_editor_content(flecs::entity leaf, EditorType editor_type, flecs::entity UIElement)
+{
+    leaf.target<EditorHeader>().children([&](flecs::entity child)
+    {
+        child.destruct();
+    });
+    leaf.target<EditorCanvas>().children([&](flecs::entity child)
+    {
+        child.destruct();
+    });
+    create_editor_content(leaf, editor_type, UIElement);
 }
 
 void merge_editor(flecs::entity non_leaf, flecs::world world, flecs::entity UIElement)
@@ -455,7 +770,7 @@ void split_editor(PanelSplit split, flecs::entity leaf, flecs::world world, flec
 
 struct RenderCommand {
     Position pos;
-    std::variant<RoundedRectRenderable, RectRenderable, TextRenderable, ImageRenderable> renderData;
+    std::variant<RoundedRectRenderable, RectRenderable, TextRenderable, ImageRenderable, LineRenderable, QuadraticBezierRenderable> renderData;
     RenderType type;
     int zIndex;
 
@@ -485,6 +800,14 @@ struct RenderQueue {
 
     void addImageCommand(const Position& pos, const ImageRenderable& renderable, int zIndex) {
         commands.push_back({pos, renderable, RenderType::Image, zIndex});
+    }
+
+    void addLineCommand(const Position& pos, const LineRenderable& renderable, int zIndex) {
+        commands.push_back({pos, renderable, RenderType::Line, zIndex});
+    }
+
+    void addQuadraticBezierCommand(const Position& pos, const QuadraticBezierRenderable& renderable, int zIndex) {
+        commands.push_back({pos, renderable, RenderType::QuadraticBezier, zIndex});
     }
 
     void sort() {
@@ -660,13 +983,14 @@ int main(int, char *[]) {
     world.component<EditorNodeArea>();
     world.component<PanelSplit>();
 
-    world.component<HorizontalAlign>();
-    world.component<VerticalAlign>();
-    world.component<SelfAlign>();
+    world.component<Align>();
     world.component<Expand>();
+    world.component<Constrain>();
 
     world.component<HorizontalLayoutBox>();
     world.component<VerticalLayoutBox>();
+    
+    world.component<DiurnalHour>();
 
     world.component<DragContext>().add(flecs::Singleton);
     world.set<DragContext>({false, flecs::entity::null(), PanelSplitType::Horizontal, 0.0f});
@@ -709,25 +1033,14 @@ int main(int, char *[]) {
     auto UIElement = world.prefab("UIElement")
         .set<Position, Local>({0.0f, 0.0f})
         .set<Position, World>({0.0f, 0.0f})
-        .set<UIElementBounds>({FLT_MAX, FLT_MAX, -FLT_MAX, -FLT_MAX})
+        .set<UIElementBounds>({0, 0, 0, 0})
         .set<UIElementSize>({0.0f, 0.0f})
         .set<RenderStatus>({true})
         .set<ZIndex>({0});
 
-    // TODO: Possibly load this from string
-    std::vector<std::string> editor_types = 
-    {
-        "Void",
-        // "ECS Graph", // Entity component relationship
-        "Peach Core",
-        // "Gynoid",
-        "Embodiment",
-        "Language Game", // Queue or Stream
-        "Vision",
-        "Hearing",
-        "Memory",
-        "Bookshelf",
-    };
+    // TODO: Text search field
+    // auto FieldEntry = world.prefab("FieldEntry")
+
 
     world.observer<UIElementBounds, AddTagOnHoverExit>()
     .term_at(1).second<CloseEditorSelector>()
@@ -735,6 +1048,15 @@ int main(int, char *[]) {
     .each([&](flecs::entity e, UIElementBounds& bounds, AddTagOnHoverExit)
     {
         std::cout << "Hover exit editor selector region" << std::endl;
+        e.destruct();
+    });
+
+    world.observer<UIElementBounds, AddTagOnLeftClick>()
+    .term_at(1).second<CloseEditorSelector>()
+    .event<LeftClickEvent>()
+    .each([&](flecs::entity e, UIElementBounds& bounds, AddTagOnLeftClick)
+    {
+        std::cout << "Select a particular panel..." << std::endl;
         e.destruct();
     });
 
@@ -754,6 +1076,14 @@ int main(int, char *[]) {
     {
         RoundedRectRenderable& bkg = e.ensure<RoundedRectRenderable>();
         bkg.color = 0x383838FF;
+    });
+
+    world.observer<UIElementBounds, AddTagOnLeftClick>()
+    .term_at(1).second<SetPanelEditorType>()
+    .event<LeftClickEvent>()
+    .each([&](flecs::entity e, UIElementBounds& bounds, AddTagOnLeftClick)
+    {
+        replace_editor_content(e.target<EditorLeaf>(), e.get_constant<EditorType>(), UIElement);
     });
 
     world.observer<UIElementBounds, AddTagOnLeftClick>()
@@ -777,7 +1107,9 @@ int main(int, char *[]) {
         auto editor_hover_region = world.entity()
         .is_a(UIElement)
         .child_of(e)
-        .add<AddTagOnHoverExit, CloseEditorSelector>();
+        // .add<DebugRenderBounds>()
+        .add<AddTagOnHoverExit, CloseEditorSelector>()
+        .add<AddTagOnLeftClick, CloseEditorSelector>();
 
         auto editor_icon_bkg_square = world.entity()
         .is_a(UIElement)
@@ -789,6 +1121,7 @@ int main(int, char *[]) {
         auto editor_type_selector = world.entity()
         .is_a(UIElement)
         .child_of(editor_hover_region)
+        // .add<DebugRenderBounds>()
         .set<Position, Local>({-1.0f, 19.0f});
 
         auto editor_type_selector_square_corner = world.entity()
@@ -801,15 +1134,17 @@ int main(int, char *[]) {
         .is_a(UIElement)
         .child_of(editor_type_selector)
         .set<RoundedRectRenderable>({196.0f, 256.0f, 4.0f, false, 0x282828FF})
-        .set<Expand>({false, 0, 0, 1.0f, true, 0.0f, -4.0f, 1.0f})
+        .set<Expand>({false, 0, 0, 1.0f, true, 0.0f, 0.0f, 1.0f})
         .set<ZIndex>({30});
 
         auto editor_type_list = world.entity()
         .is_a(UIElement)
         .child_of(editor_type_selector)
         .set<VerticalLayoutBox>({0.0f, 2.0f})
+        // .add<DebugRenderBounds>()
         .set<Position, Local>({4.0f, 4.0f});
 
+        size_t editor_type_index = 0;
         for (std::string editor_type_name : editor_types)
         {
             // When you click on these elements,
@@ -823,6 +1158,10 @@ int main(int, char *[]) {
             .set<Position, Local>({2.0f, 0.0f})
             .add<AddTagOnHoverEnter, SetMenuHighlightColor>()
             .add<AddTagOnHoverExit, SetMenuStandardColor>()
+            .add<AddTagOnLeftClick, SetPanelEditorType>()
+            .add<EditorLeaf>(e.target<EditorLeaf>())
+            .add((EditorType)editor_type_index)
+            .add<EditorCanvas>(e.target<EditorCanvas>())
             .set<ZIndex>({38});
 
 
@@ -832,6 +1171,8 @@ int main(int, char *[]) {
             .set<TextRenderable>({editor_type_name.c_str(), "ATARISTOCRAT", 16.0f, 0xFFFFFFFF, NVG_ALIGN_TOP | NVG_ALIGN_LEFT})
             .set<Position, Local>({4.0f, 2.0f})
             .set<ZIndex>({40});
+            
+            editor_type_index++;
         }
 
     });
@@ -874,6 +1215,23 @@ int main(int, char *[]) {
             });
         });
 
+    auto boundsCalculationSystem = world.system<Position, UIElementBounds, UIElementSize>()
+        .term_at(0).second<World>()
+        .kind(flecs::OnLoad) 
+        .each([&](flecs::entity e, Position& worldPos, UIElementBounds& bounds, UIElementSize& size) {
+            // Reset bounds to invalid state at start of each frame
+            bounds.xmin = worldPos.x;
+            bounds.ymin = worldPos.y;
+            bounds.xmax = worldPos.x;
+            bounds.ymax = worldPos.y;
+
+            if (size.width > 0 && size.height > 0)
+            {
+                bounds.xmax += size.width;
+                bounds.ymax += size.height;
+            }
+        });
+
     int editor_padding = 3.0f;
     int editor_edge_hover_dist = 8.0f;
 
@@ -895,6 +1253,38 @@ int main(int, char *[]) {
     split_editor({0.35, PanelSplitType::Vertical}, right_node, world, UIElement);
     auto left_node = editor_root.target<LeftNode>();
     split_editor({0.25, PanelSplitType::Vertical}, left_node, world, UIElement);
+
+    float diurnal_pos = 0.0f;
+    world.system<DiurnalHour, QuadraticBezierRenderable>()
+    .interval(1)
+    .run([&diurnal_pos](flecs::iter& it)
+    {
+        diurnal_pos = get_time_of_day_normalized();
+        while (it.next()) {
+            it.each();
+        }
+    }, [&diurnal_pos](flecs::entity e, DiurnalHour& hour, QuadraticBezierRenderable& renderable) {
+        e.set<QuadraticBezierRenderable>(get_hour_segment(hour.segment, (0.5f * M_PI) - (diurnal_pos) * (2.0f * M_PI)));
+    });
+
+    world.system<Position, EditorNodeArea, PanelSplit, CursorState>()
+        .kind(flecs::PreFrame)
+        .term_at(0).second<World>()
+        .term_at(3).src(glfwStateEntity)
+        .with<Dragging>()
+        .each([](flecs::entity e, Position& world_pos, EditorNodeArea& node_area, PanelSplit& panel_split, CursorState& cursor_state)
+        {
+            // TODO: Propagate percent update to children to keep them 'in place'
+            if (panel_split.dim == PanelSplitType::Horizontal)
+            {
+                panel_split.percent = std::clamp(((float)cursor_state.x-world_pos.x)/node_area.width, 0.05f, 0.95f);
+            } 
+            else if (panel_split.dim == PanelSplitType::Vertical)
+            {
+                panel_split.percent = std::clamp(((float)cursor_state.y-world_pos.y)/node_area.height, 0.05f, 0.95f);
+            }
+            // std::cout << "Evaluate drag update" << std::endl;
+        });
 
     auto propagateEditorRoot = world.system<Window, EditorNodeArea, EditorRoot>("EditorPropagate")
     .term_at(0).src(glfwStateEntity)
@@ -986,69 +1376,77 @@ int main(int, char *[]) {
             }
         });
 
-	world.system<HorizontalLayoutBox>("ResetHProgress")
-        .kind(flecs::PreFrame)
-	    .each([](flecs::entity e, HorizontalLayoutBox& box)
-	    {
-	      box.x_progress = 0.0f;
-	      e.children([&](flecs::entity child)
-	      {
-	        Position& pos = child.ensure<Position, Local>();
-	        pos.x = box.x_progress;
-	        const UIElementSize* size = child.try_get<UIElementSize>();
-	        if (size) {
-	          box.x_progress += size->width + box.padding;
-	        }
-	      });
-	    });
+    world.system<HorizontalLayoutBox, UIElementSize>("ResetHProgress")
+        .kind(flecs::PostLoad)
+        .each([](flecs::entity e, HorizontalLayoutBox& box, UIElementSize& container_size)
+        {
+            box.x_progress = 0.0f;
+            float max_height = 0.0f; 
 
+            e.children([&](flecs::entity child)
+            {
+                Position& pos = child.ensure<Position, Local>();
+                pos.x = box.x_progress;
+                
+                const UIElementSize* child_size = child.try_get<UIElementSize>();
+                
+                if (child_size) {
+                    box.x_progress += child_size->width + box.padding;
+                    if (child_size->height > max_height) {
+                        max_height = child_size->height;
+                    }
+                }
+            });
+
+            // FIX: Check if we have an Expand component
+            const Expand* expand = e.try_get<Expand>();
+
+            // Only auto-resize WIDTH if not expanding in X
+            if (!expand || !expand->x_enabled) {
+                container_size.width = box.x_progress; 
+            }
+            
+            // Only auto-resize HEIGHT if not expanding in Y
+            // This allows the bookshelf to keep its parent's height
+            if (!expand || !expand->y_enabled) {
+                container_size.height = max_height;
+            }
+        });
 
     world.system<VerticalLayoutBox, UIElementSize>("ResetVProgress")
-    .kind(flecs::PreFrame)
+    .kind(flecs::PostLoad)
     .each([](flecs::entity e, VerticalLayoutBox& box, UIElementSize& container_size)
     {
         box.y_progress = 0.0f;
-        float max_width = 0.0f; // Track the widest child
+        float max_width = 0.0f;
 
         e.children([&](flecs::entity child)
         {
             Position& pos = child.ensure<Position, Local>();
             pos.y = box.y_progress;
             
-            // Renamed variable to avoid shadowing 'container_size'
             const UIElementSize* child_size = child.try_get<UIElementSize>();
             
             if (child_size) {
-                // std::cout << box.y_progress << std::endl;
                 box.y_progress += child_size->height + box.padding;
-                
-                // Update max width
                 if (child_size->width > max_width) {
                     max_width = child_size->width;
                 }
             }
         });
 
-        container_size.height = box.y_progress;
-        container_size.width = max_width; // Apply the calculated width
+        const Expand* expand = e.try_get<Expand>();
+
+        // Only auto-resize HEIGHT if not expanding in Y
+        if (!expand || !expand->y_enabled) {
+            container_size.height = box.y_progress;
+        }
+
+        // Only auto-resize WIDTH if not expanding in X
+        if (!expand || !expand->x_enabled) {
+            container_size.width = max_width;
+        }
     });
-
-    auto boundsCalculationSystem = world.system<Position, UIElementBounds, UIElementSize>()
-        .term_at(0).second<World>()
-        .kind(flecs::PostLoad) 
-        .each([&](flecs::entity e, Position& worldPos, UIElementBounds& bounds, UIElementSize& size) {
-            // Reset bounds to invalid state at start of each frame
-            bounds.xmin = worldPos.x;
-            bounds.ymin = worldPos.y;
-            bounds.xmax = worldPos.x;
-            bounds.ymax = worldPos.y;
-
-            if (size.width > 0 && size.height > 0)
-            {
-                bounds.xmax += size.width;
-                bounds.ymax += size.height;
-            }
-        });
 
     auto cursorEvents = world.observer<CursorState, EditorRoot>()
         .event<LeftClickEvent>()
@@ -1077,24 +1475,6 @@ int main(int, char *[]) {
                     }
                 }
             }
-        });
-
-    world.system<Position, EditorNodeArea, PanelSplit, CursorState>()
-        .term_at(0).second<World>()
-        .term_at(3).src(glfwStateEntity)
-        .with<Dragging>()
-        .each([](flecs::entity e, Position& world_pos, EditorNodeArea& node_area, PanelSplit& panel_split, CursorState& cursor_state)
-        {
-            // TODO: Propagate percent update to children to keep them 'in place'
-            if (panel_split.dim == PanelSplitType::Horizontal)
-            {
-                panel_split.percent = std::clamp(((float)cursor_state.x-world_pos.x)/node_area.width, 0.05f, 0.95f);
-            } 
-            else if (panel_split.dim == PanelSplitType::Vertical)
-            {
-                panel_split.percent = std::clamp(((float)cursor_state.y-world_pos.y)/node_area.height, 0.05f, 0.95f);
-            }
-            // std::cout << "Evaluate drag update" << std::endl;
         });
 
     world.system<Position, EditorNodeArea, PanelSplit*, CursorState>()
@@ -1194,34 +1574,33 @@ int main(int, char *[]) {
         .term_at(2).optional()          // Optional RenderStatus
         .build();
 
-    auto bubbleUpBoundsSystem = world.system<UIElementBounds, UIElementBounds*, RenderStatus*>()
+    auto bubbleUpBoundsSystem = world.system<UIElementBounds, UIElementBounds*, UIElementSize, RenderStatus*>()
         .kind(flecs::PostLoad) 
         .term_at(1).parent().up()
         .term_at(2).optional()
-        .each([&](flecs::entity e, UIElementBounds& bounds, UIElementBounds* parent_bounds, RenderStatus* render) {
+        .each([&](flecs::entity e, UIElementBounds& bounds, UIElementBounds* parent_bounds, UIElementSize& size, RenderStatus* render) {
             if (parent_bounds && (!render || render->visible)) {
                 
                 const Expand* expand = e.try_get<Expand>();
 
-                if (bounds.xmax == 0)
+                if (size.height == 0 || size.width == 0)
                 {
-                    // Inherit bounds if non renderable
-                    bounds.xmin = parent_bounds->xmin;
-                    bounds.xmax = parent_bounds->xmax;
-                    bounds.ymin = parent_bounds->ymin;
-                    bounds.ymax = parent_bounds->ymax;
+                // Inherit bounds if the entity is 'non renderable'
+                bounds.xmin = parent_bounds->xmin;
+                bounds.xmax = parent_bounds->xmax;
+                bounds.ymin = parent_bounds->ymin;
+                bounds.ymax = parent_bounds->ymax;
                 }
 
-                // Handle Horizontal Bubble Up
-                // Only let the child set the parent's width if the child IS NOT expanding in X
-                if (!expand || !expand->x_enabled) {
+                flecs::entity parent = e.target(flecs::ChildOf);
+                const Expand* parent_expand = parent.try_get<Expand>();
+                
+                bool parent_locked_x = parent_expand && parent_expand->x_enabled;
+                bool parent_locked_y = parent_expand && parent_expand->y_enabled;
+
+                if (!expand) {
                     parent_bounds->xmin = std::min(parent_bounds->xmin, bounds.xmin);
                     parent_bounds->xmax = std::max(parent_bounds->xmax, bounds.xmax);
-                }
-
-                // Handle Vertical Bubble Up
-                // Only let the child set the parent's height if the child IS NOT expanding in Y
-                if (!expand || !expand->y_enabled) {
                     parent_bounds->ymin = std::min(parent_bounds->ymin, bounds.ymin);
                     parent_bounds->ymax = std::max(parent_bounds->ymax, bounds.ymax);
                 }
@@ -1246,21 +1625,24 @@ int main(int, char *[]) {
                     bounds.ymax = parent_bounds->ymax;
                 }
 
-                // Handle Horizontal Bubble Up
-                // Only let the child set the parent's width if the child IS NOT expanding in X
-                if (!expand || !expand->x_enabled) {
+                if (!expand) {
                     parent_bounds->xmin = std::min(parent_bounds->xmin, bounds.xmin);
                     parent_bounds->xmax = std::max(parent_bounds->xmax, bounds.xmax);
-                }
-
-                // Handle Vertical Bubble Up
-                // Only let the child set the parent's height if the child IS NOT expanding in Y
-                if (!expand || !expand->y_enabled) {
                     parent_bounds->ymin = std::min(parent_bounds->ymin, bounds.ymin);
                     parent_bounds->ymax = std::max(parent_bounds->ymax, bounds.ymax);
                 }
                 }
         });
+
+    world.system<Position, UIElementBounds*, UIElementSize, UIElementBounds, Align>()
+    .term_at(0).second<Local>()
+    .term_at(1).parent()
+    .kind(flecs::PreFrame)
+    .each([&](flecs::entity e, Position& pos, UIElementBounds* parent_bounds, UIElementSize& ui_size, UIElementBounds& bounds, Align& align) 
+    {
+        pos.x = align.horizontal * (parent_bounds->xmax - parent_bounds->xmin) + ui_size.width * align.self_horizontal;
+        pos.y = align.vertical * (parent_bounds->ymax - parent_bounds->ymin) + ui_size.height * align.self_vertical;
+    });
 
     world.system<UIElementBounds*, RectRenderable, Expand>()
     .term_at(0).parent()
@@ -1293,41 +1675,115 @@ int main(int, char *[]) {
         }
     });
 
-    world.system<UIElementBounds*, ImageRenderable, Expand, Graphics>()
+    world.system<UIElementBounds*, LineRenderable, Expand>()
     .term_at(0).parent()
     .kind(flecs::PreUpdate)
-    .each([&](flecs::entity e, UIElementBounds* bounds, ImageRenderable& sprite, Expand& expand, Graphics& graphics) {        
+    .each([&](flecs::entity e, UIElementBounds* bounds, LineRenderable& line, Expand& expand) {
+        if (expand.x_enabled)
+        {
+            line.x2 = (bounds->xmax - bounds->xmin - (expand.pad_left + expand.pad_right))*expand.x_percent;
+        }
+        if (expand.y_enabled)
+        {
+            line.y2 = (bounds->ymax - bounds->ymin - (expand.pad_top + expand.pad_bottom))*expand.y_percent;
+        }
+    });
+
+    world.system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
+    .term_at(0).parent()
+    .term_at(3).optional()
+    .kind(flecs::PreUpdate)
+    .each([&](flecs::entity e, UIElementBounds* bounds, ImageRenderable& sprite, Expand& expand, Constrain* constrain, Graphics& graphics) {        
         if (bounds)
         {
             int img_width, img_height;
             nvgImageSize(graphics.vg, sprite.imageHandle, &img_width, &img_height);
+            
+            if (img_width == 0 || img_height == 0) return;
+
+            float aspect = (float)img_width / (float)img_height;
+            float bounds_w = bounds->xmax - bounds->xmin;
+            float bounds_h = bounds->ymax - bounds->ymin;
+            
+            // Calculate available space after padding
+            float avail_w = bounds_w - (expand.pad_left + expand.pad_right);
+            float avail_h = bounds_h - (expand.pad_top + expand.pad_bottom);
+
             if (expand.x_enabled)
             {
-                sprite.width = (bounds->xmax - bounds->xmin - (expand.pad_left + expand.pad_right))*expand.x_percent;
+                // Start by trying to fill the width
+                float target_w = avail_w;
+
+                // If we also need to fit Y, check if our target width causes a height overflow
+                if (constrain && constrain->fit_y)
+                {
+                    float height_from_width = target_w / aspect;
+                    
+                    // If the resulting height is too big, constrain by height instead
+                    if (height_from_width > avail_h)
+                    {
+
+                        target_w = avail_h * aspect;
+                    }
+                }
+                
+                sprite.width = target_w * expand.x_percent;
+                
+                // If Y is not enabled, calculate height based on the aspect ratio of the final width
                 if (!expand.y_enabled)
                 {
-                    // TODO: Keep the ratio the same!
-                    sprite.height = sprite.width/img_width * img_height;
+                    sprite.height = sprite.width / aspect;
                 }
             }
+            
             if (expand.y_enabled)
             {
-                sprite.height = (bounds->ymax - bounds->ymin - (expand.pad_top + expand.pad_bottom))*expand.y_percent;
-                if (!expand.x_enabled)
+                // Logic for Y-driven expansion (e.g. for vertical lists or sidebars)
+                float target_h = avail_h;
+
+                if (!expand.x_enabled) 
                 {
-                    // TODO: Keep the ratio the same!
-                    sprite.width = sprite.height/img_height * img_width;
+                    if (constrain && constrain->fit_x)
+                    {
+                         float width_from_height = target_h * aspect;
+                         if (width_from_height > avail_w)
+                         {
+                             target_h = avail_w / aspect;
+                         }
+                    }
+                    sprite.height = target_h * expand.y_percent;
+                    sprite.width = sprite.height * aspect;
+                }
+                else 
+                {
+                    // If BOTH X and Y are enabled (and we have constraints), 
+                    // we perform a centered "Aspect Fit" inside the box.
+                    if (constrain && (constrain->fit_x || constrain->fit_y))
+                    {
+                        float scale_x = avail_w / img_width;
+                        float scale_y = avail_h / img_height;
+                        float scale = std::min(scale_x, scale_y);
+
+                        sprite.width = img_width * scale * expand.x_percent;
+                        sprite.height = img_height * scale * expand.y_percent;
+                    }
+                    else
+                    {
+                        // No constraints = stretch to fill
+                        sprite.height = avail_h * expand.y_percent;
+                        // sprite.width was already set in the x_enabled block
+                    }
                 }
             }
         }
     });
 
-    auto debugRenderBounds = world.system<RenderQueue, UIElementBounds>()
+    auto debugRenderBounds = world.system<RenderQueue, UIElementBounds, DebugRenderBounds>()
     .term_at(0).src(renderQueueEntity)
-    .each([](flecs::entity e, RenderQueue& render_queue, UIElementBounds& bounds) 
+    .each([](flecs::entity e, RenderQueue& render_queue, UIElementBounds& bounds, DebugRenderBounds) 
     {
         RectRenderable debug_bound {bounds.xmax - bounds.xmin, bounds.ymax - bounds.ymin, true, 0xFFFF00FF};
-        //render_queue.addRectCommand({bounds.xmin, bounds.ymin}, debug_bound, 100);
+        render_queue.addRectCommand({bounds.xmin, bounds.ymin}, debug_bound, 100);
     });
 
     auto roundedRectQueueSystem = world.system<Position, RoundedRectRenderable, ZIndex>()
@@ -1363,6 +1819,21 @@ int main(int, char *[]) {
         queue.addImageCommand(pos, renderable, zIndex.layer);
     });
 
+    auto lineQueueSystem = world.system<Position, LineRenderable, ZIndex>()
+    .kind(flecs::PostUpdate)
+    .term_at(0).second<World>()
+    .each([&](flecs::entity e, Position& pos, LineRenderable& renderable, ZIndex& zIndex) {
+        RenderQueue& queue = world.ensure<RenderQueue>();
+        queue.addLineCommand(pos, renderable, zIndex.layer);
+    });
+
+    auto quadraticBezierQueueSystem = world.system<Position, QuadraticBezierRenderable, ZIndex>()
+    .kind(flecs::PostUpdate)
+    .term_at(0).second<World>()
+    .each([&](flecs::entity e, Position& pos, QuadraticBezierRenderable& renderable, ZIndex& zIndex) {
+        RenderQueue& queue = world.ensure<RenderQueue>();
+        queue.addQuadraticBezierCommand(pos, renderable, zIndex.layer);
+    });
 
     world.system<Position, EditorNodeArea, EditorLeafData, EditorRoot>()
     .term_at(0).second<World>()
@@ -1482,6 +1953,7 @@ int main(int, char *[]) {
 
                         if (rect.stroke)
                         {
+                            nvgStrokeWidth(graphics.vg, 1.0f);
                             nvgStrokeColor(graphics.vg, nvgRGB(r, g, b));
                             nvgStroke(graphics.vg);
                         } else
@@ -1499,14 +1971,15 @@ int main(int, char *[]) {
                         uint8_t r = (rect.color >> 24) & 0xFF;
                         uint8_t g = (rect.color >> 16) & 0xFF;
                         uint8_t b = (rect.color >> 8) & 0xFF;
+                        uint8_t a = (rect.color >> 0) & 0xFF;
 
                         if (rect.stroke)
                         {
-                            nvgStrokeColor(graphics.vg, nvgRGB(r, g, b));
+                            nvgStrokeColor(graphics.vg, nvgRGBA(r, g, b, a));
                             nvgStroke(graphics.vg);
                         } else
                         {
-                            nvgFillColor(graphics.vg, nvgRGB(r, g, b));
+                            nvgFillColor(graphics.vg, nvgRGBA(r, g, b, a));
                             nvgFill(graphics.vg);
                         }
                         break;
@@ -1538,6 +2011,35 @@ int main(int, char *[]) {
                         }
                         break;
                     }
+                    case RenderType::Line: {
+                        const auto& line = std::get<LineRenderable>(cmd.renderData);    
+                        nvgBeginPath(graphics.vg);
+                        nvgMoveTo(graphics.vg, cmd.pos.x + line.x1, cmd.pos.y + line.y1);
+                        // The parameters are: ctrl_x, ctrl_y, end_x, end_y
+                        nvgLineTo(graphics.vg, cmd.pos.x + line.x2, cmd.pos.y + line.y2);
+                        uint8_t r = (line.color >> 24) & 0xFF;
+                        uint8_t g = (line.color >> 16) & 0xFF;
+                        uint8_t b = (line.color >> 8) & 0xFF;
+
+                        nvgStrokeColor(graphics.vg, nvgRGB(r, g, b));
+                        nvgStrokeWidth(graphics.vg, line.thickness);
+                        nvgStroke(graphics.vg);
+                        break;
+                    }
+                    case RenderType::QuadraticBezier:
+                        const auto& curve = std::get<QuadraticBezierRenderable>(cmd.renderData);    
+                        nvgBeginPath(graphics.vg);
+                        nvgMoveTo(graphics.vg, cmd.pos.x + curve.x1, cmd.pos.y + curve.y1);
+                        // The parameters are: ctrl_x, ctrl_y, end_x, end_y
+                        nvgQuadTo(graphics.vg, cmd.pos.x + curve.cx, cmd.pos.y + curve.cy, cmd.pos.x + curve.x2, cmd.pos.y + curve.y2);
+                        uint8_t r = (curve.color >> 24) & 0xFF;
+                        uint8_t g = (curve.color >> 16) & 0xFF;
+                        uint8_t b = (curve.color >> 8) & 0xFF;
+
+                        nvgStrokeColor(graphics.vg, nvgRGB(r, g, b));
+                        nvgStrokeWidth(graphics.vg, curve.thickness);
+                        nvgStroke(graphics.vg);
+                        break;
                 }
             }
 
