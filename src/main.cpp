@@ -17,6 +17,8 @@
 #include <ctime>
 #include <chrono>
 
+#include "mel_spec_render.h"
+
 /*
 These luminous phenomena still manifest themselves
 from time to time, as when a new idea opening up possibilities
@@ -265,6 +267,32 @@ struct CloseEditorSelector {};
 struct SetMenuHighlightColor {};
 struct SetMenuStandardColor {};
 
+// Language Game chat components
+struct ChatMessage {
+    std::string author;
+    std::string text;
+};
+
+struct ChatState {
+    std::vector<ChatMessage> messages;
+    std::string draft;
+    bool input_focused;
+};
+
+struct ChatMessageView {
+    int index;
+};
+
+struct FocusChatInput {};
+struct SendChatMessage {};
+
+struct ChatPanel {
+    flecs::entity messages_panel;
+    flecs::entity input_panel;
+    flecs::entity input_text;
+    flecs::entity send_button;
+};
+
 struct Graphics {
     NVGcontext* vg;
 };
@@ -356,6 +384,10 @@ struct Expand
     bool y_enabled;
     float pad_top, pad_bottom;
     float y_percent;
+
+    // If true (ImageRenderable only), do not upscale beyond native image size
+    // (after applying ImageRenderable.scaleX/scaleY).
+    bool cap_to_intrinsic = false;
 };
 
 // Post expand layer to 'fit within editor panel bounds'
@@ -628,6 +660,63 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         .set<ZIndex>({20});
         
     }
+    else if (editor_type == EditorType::LanguageGame)
+    {
+        auto canvas = leaf.target<EditorCanvas>();
+
+        auto chat_root = world.entity()
+            .is_a(UIElement)
+            .child_of(canvas)
+            .set<ZIndex>({5});
+
+        auto messages_panel = world.entity()
+            .is_a(UIElement)
+            .child_of(chat_root)
+            .set<RoundedRectRenderable>({100.0f, 100.0f, 4.0f, false, 0x101020FF})
+            .set<ZIndex>({6});
+
+        auto input_panel = world.entity()
+            .is_a(UIElement)
+            .child_of(chat_root)
+            .set<RoundedRectRenderable>({100.0f, 36.0f, 4.0f, true, 0x383838FF})
+            .add<AddTagOnLeftClick, FocusChatInput>()
+            .set<ZIndex>({7});
+
+        auto input_text = world.entity()
+            .is_a(UIElement)
+            .child_of(input_panel)
+            .set<Position, Local>({8.0f, 8.0f})
+            .set<TextRenderable>({"", "ATARISTOCRAT", 16.0f, 0xFFFFFFFF, NVG_ALIGN_TOP | NVG_ALIGN_LEFT})
+            .set<ZIndex>({8});
+
+        auto send_button = world.entity()
+            .is_a(UIElement)
+            .child_of(input_panel)
+            .set<RoundedRectRenderable>({60.0f, 28.0f, 4.0f, false, 0x585858FF})
+            .add<AddTagOnLeftClick, SendChatMessage>()
+            .set<ZIndex>({8});
+
+        world.entity()
+            .is_a(UIElement)
+            .child_of(send_button)
+            .set<Position, Local>({12.0f, 6.0f})
+            .set<TextRenderable>({"Send", "ATARISTOCRAT", 14.0f, 0xFFFFFFFF, NVG_ALIGN_TOP | NVG_ALIGN_LEFT})
+            .set<ZIndex>({9});
+
+        const int kMaxMessages = 30;
+        for (int i = 0; i < kMaxMessages; ++i)
+        {
+            world.entity()
+                .is_a(UIElement)
+                .child_of(messages_panel)
+                .set<ChatMessageView>({i})
+                .set<Position, Local>({6.0f, 6.0f + i * 18.0f})
+                .set<TextRenderable>({"", "ATARISTOCRAT", 14.0f, 0xDDDDDDFF, NVG_ALIGN_TOP | NVG_ALIGN_LEFT})
+                .set<ZIndex>({7});
+        }
+
+        leaf.set<ChatPanel>({messages_panel, input_panel, input_text, send_button});
+    }
     else if (editor_type == EditorType::Bookshelf)
     {
         auto bookshelf_layer = world.entity()
@@ -671,6 +760,88 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         .set<ImageCreator>({"../assets/cuct.png", 1.0f, 1.0f})
         .set<Expand>({false, 4.0f, 4.0f, 1.0f, true, 0.0f, 0.0f, 1.0f})
         .set<ZIndex>({10});
+    } else if (editor_type == EditorType::Hearing)
+    {
+        std::cout << "Creating Hearing editor..." << std::endl;
+
+        auto badges = world.entity()
+        .is_a(UIElement)
+        .set<HorizontalLayoutBox>({0.0f, 2.0f})
+        .set<Position, Local>({48.0f, 0.0f})
+        .child_of(leaf.target<EditorHeader>());
+        
+        world.entity()
+        .is_a(UIElement)
+        .child_of(badges)
+        .set<ImageCreator>({"../assets/system_badge.png", 1.0f, 1.0f})
+        .set<ZIndex>({20});
+
+        world.entity()
+        .is_a(UIElement)
+        .child_of(badges)
+        .set<ImageCreator>({"../assets/microphone_badge.png", 1.0f, 1.0f})
+        .set<ZIndex>({20});
+
+        // Create vertical layout for mel spectrograms
+        auto hearing_layer = world.entity()
+            .is_a(UIElement)
+            .child_of(leaf.target<EditorCanvas>())
+            .set<VerticalLayoutBox>({0.0f, 4.0f})
+            .set<Align>({-0.5f, -0.5f, 0.5f, 0.5f});
+        // Look up the mel spec renderer entities
+        auto micRenderer = world.lookup("MelSpecRenderer");
+        auto sysAudioRenderer = world.lookup("SystemAudioRenderer");
+
+        std::cout << "MicRenderer exists: " << (micRenderer ? "yes" : "no") << std::endl;
+        std::cout << "SysAudioRenderer exists: " << (sysAudioRenderer ? "yes" : "no") << std::endl;
+
+        if (micRenderer && micRenderer.has<MelSpecRender>())
+        {
+            auto melSpec = micRenderer.get<MelSpecRender>();
+            std::cout << "Mic texture handle: " << melSpec.nvgTextureHandle
+                      << " size: " << melSpec.width << "x" << melSpec.height << std::endl;
+
+            // Create microphone mel spec display
+            world.entity()
+                .is_a(UIElement)
+                .child_of(hearing_layer)
+                .set<ImageRenderable>({melSpec.nvgTextureHandle, 1.0f, 1.0f, (float)melSpec.width, (float)melSpec.height})
+                // .set<Expand>({true, 0.0f, 0.0f, 1.0f, false, 0.0f, 0.0f, 0.5f, false})
+                // .set<Constrain>({true, true})
+                .set<ZIndex>({10});
+
+            // Add label for microphone
+            // world.entity()
+            //     .is_a(UIElement)
+            //     .child_of(hearing_layer)
+            //     .set<Position, Local>({8.0f, 0.0f})
+            //     .set<TextRenderable>({"Microphone", "ATARISTOCRAT", 12.0f, 0xAAAAAAFF})
+            //     .set<ZIndex>({20});
+        }
+
+        if (sysAudioRenderer && sysAudioRenderer.has<MelSpecRender>())
+        {
+            auto melSpec = sysAudioRenderer.get<MelSpecRender>();
+            std::cout << "Sys texture handle: " << melSpec.nvgTextureHandle
+                      << " size: " << melSpec.width << "x" << melSpec.height << std::endl;
+
+            // Create system audio mel spec display
+            world.entity()
+                .is_a(UIElement)
+                .child_of(hearing_layer)
+                .set<ImageRenderable>({melSpec.nvgTextureHandle, 1.0f, 1.0f, (float)melSpec.width, (float)melSpec.height})
+                // .set<Expand>({true, 0.0f, 0.0f, 1.0f, false, 0.0f, 0.0f, 0.5f, false})
+                // .set<Constrain>({true, true})
+                .set<ZIndex>({10});
+
+            // Add label for system audio
+            // world.entity()
+            //     .is_a(UIElement)
+            //     .child_of(hearing_layer)
+            //     .set<Position, Local>({8.0f, 0.0f})
+            //     .set<TextRenderable>({"System Audio", "ATARISTOCRAT", 12.0f, 0xAAAAAAFF})
+            //     .set<ZIndex>({20});
+        }
     } else
     {
         auto editor_icon_bkg_square = world.entity()
@@ -684,6 +855,10 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
 
 void replace_editor_content(flecs::entity leaf, EditorType editor_type, flecs::entity UIElement)
 {
+    // Remove per-panel state so systems don't access destroyed entities.
+    if (leaf.has<ChatPanel>()) {
+        leaf.remove<ChatPanel>();
+    }
     leaf.target<EditorHeader>().children([&](flecs::entity child)
     {
         child.destruct();
@@ -909,6 +1084,36 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
     }
 }
 
+static void char_callback(GLFWwindow* window, unsigned int codepoint)
+{
+    ChatState* chat = world.try_get_mut<ChatState>();
+    if (!chat || !chat->input_focused) return;
+    if (codepoint >= 32 && codepoint < 127)
+    {
+        chat->draft.push_back(static_cast<char>(codepoint));
+    }
+}
+
+static void key_callback(GLFWwindow* window, int key, int scancode, int action, int mods)
+{
+    if (action != GLFW_PRESS && action != GLFW_REPEAT) return;
+    ChatState* chat = world.try_get_mut<ChatState>();
+    if (!chat || !chat->input_focused) return;
+
+    if (key == GLFW_KEY_BACKSPACE)
+    {
+        if (!chat->draft.empty()) chat->draft.pop_back();
+    }
+    else if (key == GLFW_KEY_ENTER || key == GLFW_KEY_KP_ENTER)
+    {
+        if (!chat->draft.empty())
+        {
+            chat->messages.push_back({"You", chat->draft});
+            chat->draft.clear();
+        }
+    }
+}
+
 float point_distance_to_edge(Position p, Position a, Position b)
 {
     // 1. Get vector from line start (a) to point (p)
@@ -952,6 +1157,8 @@ int main(int, char *[]) {
     glfwSetCursorPosCallback(window, cursor_position_callback);
     glfwSetMouseButtonCallback(window, mouse_button_callback);
     glfwSetWindowSizeCallback(window, window_size_callback);
+    glfwSetCharCallback(window, char_callback);
+    glfwSetKeyCallback(window, key_callback);
 
     if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
         std::cerr << "Failed to initialize GLAD" << std::endl;
@@ -992,6 +1199,14 @@ int main(int, char *[]) {
     
     world.component<DiurnalHour>();
 
+    world.component<ChatMessage>();
+    world.component<ChatMessageView>();
+    world.component<ChatState>().add(flecs::Singleton);
+    world.component<ChatPanel>();
+    world.component<FocusChatInput>();
+    world.component<SendChatMessage>();
+    world.set<ChatState>({std::vector<ChatMessage>{}, "", false});
+
     world.component<DragContext>().add(flecs::Singleton);
     world.set<DragContext>({false, flecs::entity::null(), PanelSplitType::Horizontal, 0.0f});
 
@@ -1029,6 +1244,9 @@ int main(int, char *[]) {
 
     auto renderQueueEntity = world.entity("RenderQueue")
         .set<RenderQueue>({});
+
+    // Initialize mel spectrogram rendering module (must be after Graphics entity is created)
+    MelSpecRenderModule(world);
 
     auto UIElement = world.prefab("UIElement")
         .set<Position, Local>({0.0f, 0.0f})
@@ -1084,6 +1302,28 @@ int main(int, char *[]) {
     .each([&](flecs::entity e, UIElementBounds& bounds, AddTagOnLeftClick)
     {
         replace_editor_content(e.target<EditorLeaf>(), e.get_constant<EditorType>(), UIElement);
+    });
+
+    world.observer<UIElementBounds, AddTagOnLeftClick>()
+    .term_at(1).second<FocusChatInput>()
+    .event<LeftClickEvent>()
+    .each([&](flecs::entity e, UIElementBounds&, AddTagOnLeftClick)
+    {
+        ChatState& chat = world.ensure<ChatState>();
+        chat.input_focused = true;
+    });
+
+    world.observer<UIElementBounds, AddTagOnLeftClick>()
+    .term_at(1).second<SendChatMessage>()
+    .event<LeftClickEvent>()
+    .each([&](flecs::entity e, UIElementBounds&, AddTagOnLeftClick)
+    {
+        ChatState& chat = world.ensure<ChatState>();
+        if (!chat.draft.empty())
+        {
+            chat.messages.push_back({"You", chat.draft});
+            chat.draft.clear();
+        }
     });
 
     world.observer<UIElementBounds, AddTagOnLeftClick>()
@@ -1374,6 +1614,72 @@ int main(int, char *[]) {
                 size.width = approxWidth;
                 size.height = approxHeight;
             }
+        });
+
+    // Update Language Game chat UI each frame
+    world.system<ChatPanel, EditorNodeArea>()
+        .kind(flecs::PreFrame)
+        .each([&](flecs::entity leaf, ChatPanel& panel, EditorNodeArea&)
+        {
+            if (!panel.messages_panel.is_alive() || !panel.input_panel.is_alive() ||
+                !panel.input_text.is_alive() || !panel.send_button.is_alive())
+            {
+                leaf.remove<ChatPanel>();
+                return;
+            }
+            auto canvas = leaf.target<EditorCanvas>();
+            const RectRenderable* canvas_rect = canvas.try_get<RectRenderable>();
+            if (!canvas_rect) return;
+
+            float canvas_w = canvas_rect->width;
+            float canvas_h = canvas_rect->height;
+            const float pad = 8.0f;
+            const float input_h = 36.0f;
+
+            auto& messages_rect = panel.messages_panel.ensure<RoundedRectRenderable>();
+            messages_rect.width = canvas_w - pad * 2.0f;
+            messages_rect.height = canvas_h - input_h - pad * 3.0f;
+            panel.messages_panel.ensure<Position, Local>() = {pad, pad};
+
+            auto& input_rect = panel.input_panel.ensure<RoundedRectRenderable>();
+            input_rect.width = canvas_w - pad * 2.0f;
+            input_rect.height = input_h;
+            panel.input_panel.ensure<Position, Local>() = {pad, canvas_h - input_h - pad};
+
+            auto& send_rect = panel.send_button.ensure<RoundedRectRenderable>();
+            float send_w = send_rect.width;
+            panel.send_button.ensure<Position, Local>() = {input_rect.width - send_w - 6.0f, 4.0f};
+
+            ChatState& chat = world.ensure<ChatState>();
+            std::string caret = chat.input_focused ? "|" : "";
+            if (auto* input_tr = panel.input_text.try_get_mut<TextRenderable>())
+            {
+                input_tr->text = chat.draft + caret;
+            }
+
+            const int kMaxMessages = 30;
+            int total = (int)chat.messages.size();
+            int start = std::max(0, total - kMaxMessages);
+
+            flecs::query msg_views = world.query_builder<ChatMessageView, TextRenderable, Position>()
+                .term_at(0).src(panel.messages_panel)
+                .build();
+
+            msg_views.each([&](flecs::entity, ChatMessageView& view, TextRenderable& tr, Position& pos)
+            {
+                int msg_index = start + view.index;
+                if (msg_index < total)
+                {
+                    const auto& msg = chat.messages[msg_index];
+                    tr.text = msg.author + ": " + msg.text;
+                    pos.x = 6.0f;
+                    pos.y = 6.0f + view.index * 18.0f;
+                }
+                else
+                {
+                    tr.text.clear();
+                }
+            });
         });
 
     world.system<HorizontalLayoutBox, UIElementSize>("ResetHProgress")
@@ -1709,6 +2015,9 @@ int main(int, char *[]) {
             float avail_w = bounds_w - (expand.pad_left + expand.pad_right);
             float avail_h = bounds_h - (expand.pad_top + expand.pad_bottom);
 
+            float desired_w = sprite.width;
+            float desired_h = sprite.height;
+
             if (expand.x_enabled)
             {
                 // Start by trying to fill the width
@@ -1727,12 +2036,12 @@ int main(int, char *[]) {
                     }
                 }
                 
-                sprite.width = target_w * expand.x_percent;
+                desired_w = target_w * expand.x_percent;
                 
                 // If Y is not enabled, calculate height based on the aspect ratio of the final width
                 if (!expand.y_enabled)
                 {
-                    sprite.height = sprite.width / aspect;
+                    desired_h = desired_w / aspect;
                 }
             }
             
@@ -1751,8 +2060,8 @@ int main(int, char *[]) {
                              target_h = avail_w / aspect;
                          }
                     }
-                    sprite.height = target_h * expand.y_percent;
-                    sprite.width = sprite.height * aspect;
+                    desired_h = target_h * expand.y_percent;
+                    desired_w = desired_h * aspect;
                 }
                 else 
                 {
@@ -1764,17 +2073,34 @@ int main(int, char *[]) {
                         float scale_y = avail_h / img_height;
                         float scale = std::min(scale_x, scale_y);
 
-                        sprite.width = img_width * scale * expand.x_percent;
-                        sprite.height = img_height * scale * expand.y_percent;
+                        desired_w = img_width * scale * expand.x_percent;
+                        desired_h = img_height * scale * expand.y_percent;
                     }
                     else
                     {
                         // No constraints = stretch to fill
-                        sprite.height = avail_h * expand.y_percent;
+                        desired_h = avail_h * expand.y_percent;
                         // sprite.width was already set in the x_enabled block
                     }
                 }
             }
+
+            if (expand.cap_to_intrinsic) {
+                float max_w = img_width * sprite.scaleX;
+                float max_h = img_height * sprite.scaleY;
+                if (max_w > 0.0f && max_h > 0.0f) {
+                    float cap_scale = 1.0f;
+                    if (desired_w > max_w) cap_scale = std::min(cap_scale, max_w / desired_w);
+                    if (desired_h > max_h) cap_scale = std::min(cap_scale, max_h / desired_h);
+                    if (cap_scale < 1.0f) {
+                        desired_w *= cap_scale;
+                        desired_h *= cap_scale;
+                    }
+                }
+            }
+
+            sprite.width = desired_w;
+            sprite.height = desired_h;
         }
     });
 

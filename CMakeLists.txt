@@ -9,8 +9,11 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # add_definitions(AOTInductor_CUDA)
-add_executable(${PROJECT_NAME} src/main.cpp)
+add_executable(${PROJECT_NAME} src/main.cpp src/mel_spec_render.cpp src/glad.c)
 include_directories("src")
+include_directories("deps/mel_spec/src")
+include_directories("deps/mel_spec/deps/glad/include")
+include_directories("deps/spdlog/include")
 
 # Flecs
 include_directories("deps/flecs-4.1.1/include")
@@ -38,6 +41,28 @@ add_library(nanovg STATIC
 target_include_directories(nanovg PUBLIC deps/nanovg/src)
 target_compile_definitions(nanovg PUBLIC NANOVG_GL2_IMPLEMENTATION)
 
-target_link_libraries(${PROJECT_NAME} flecs glfw glad nanovg)
+find_package(SDL2 REQUIRED)
+find_package(SDL2_image REQUIRED)
+find_package(OpenCV REQUIRED)
+
+target_link_libraries(${PROJECT_NAME} flecs glfw glad nanovg X11 Xi Xtst SDL2 SDL2_image ${OpenCV_LIBS})
+
+# Add audio stream client executable
+add_executable(audio_stream_client src/audio_stream_client.c)
+target_link_libraries(audio_stream_client
+    "${CMAKE_SOURCE_DIR}/deps/mel_spec/build/libaudio_stream.so"
+    "${CMAKE_SOURCE_DIR}/deps/mel_spec/build/libmelspec.so"
+)
+
+# Link mel_spec .so libraries
+link_directories("${CMAKE_SOURCE_DIR}/deps/mel_spec/build")
+link_directories("${CMAKE_SOURCE_DIR}/deps/mel_spec/build/deps/libsoundio")
+
+# Add mel_spec dependencies
+target_link_libraries(${PROJECT_NAME}
+    "${CMAKE_SOURCE_DIR}/deps/mel_spec/build/libaudio_stream.so"
+    "${CMAKE_SOURCE_DIR}/deps/mel_spec/build/libmelspec.so"
+)
+
 
 set_property(TARGET ${PROJECT_NAME} PROPERTY CXX_STANDARD 17)
