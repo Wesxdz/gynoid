@@ -5,11 +5,19 @@
 #include <algorithm>
 #include <variant>
 #include <string>
+
+#define GLAD_GL_IMPLEMENTATION
 #include <glad/glad.h>
+#define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
+#include <GLFW/glfw3native.h>
 #include <flecs.h>
+
+
 #include <nanovg.h>
+#define NANOVG_GL3_IMPLEMENTATION
 #include <nanovg_gl.h>
+
 #include <float.h>
 #include <unordered_map>
 #include <raymath.h>
@@ -17,7 +25,171 @@
 #include <ctime>
 #include <chrono>
 
+
+// LibVNC
+#include <rfb/rfbclient.h>
+
+// SDL for texture creation from VNC framebuffer
+#include <SDL2/SDL.h>
+#include <SDL2/SDL_image.h>
+
+// For multithreaded screenshot saving
+#include <thread>
+#include <queue>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
+#include <memory>
+
 #include "mel_spec_render.h"
+#include "vision_processor.h"
+#include "debug_log.h"
+
+static const char* VNC_SURFACE_TAG = "vnc_surface";
+static struct timeval g_last_screenshot_time;
+
+// Vision processing job queue
+struct VisionProcessingJob {
+    SDL_Surface* surface;
+    int quadrant;
+    std::string paletteFile;
+    std::string outputPath;
+    int width;
+    int height;
+    int pitch;
+    std::vector<uint8_t> pixelData;  // Copy of pixel data to avoid race conditions
+};
+
+class VisionJobQueue {
+private:
+    std::deque<VisionProcessingJob> jobs;  // Changed from queue to deque for frame dropping
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::atomic<bool> shouldStop{false};
+    std::atomic<bool> isStopped{false};  // Track if stop() has been called
+    std::vector<std::thread> workers;
+    std::atomic<size_t> droppedFrames{0};
+
+public:
+    void start(int numThreads = 2) {
+        shouldStop = false;
+        isStopped = false;
+        for (int i = 0; i < numThreads; ++i) {
+            workers.emplace_back([this]() {
+                while (true) {
+                    VisionProcessingJob job;
+                    {
+                        std::unique_lock<std::mutex> lock(mutex);
+                        cv.wait(lock, [this]() { return !jobs.empty() || shouldStop; });
+
+                        if (shouldStop && jobs.empty()) {
+                            return;
+                        }
+
+                        if (jobs.empty()) continue;
+
+                        job = std::move(jobs.front());
+                        jobs.pop_front();
+                    }
+
+                    // Process the job outside the lock
+                    std::cout << "[VISION WORKER] Processing quadrant " << job.quadrant << std::endl;
+                    process_vnc_vision(job.pixelData.data(), job.width, job.height,
+                                      job.pitch, job.quadrant,
+                                      job.paletteFile.c_str(), job.outputPath.c_str());
+                }
+            });
+        }
+        std::cout << "[VISION QUEUE] Started " << numThreads << " worker threads" << std::endl;
+    }
+
+    void submit(const VisionProcessingJob& job) {
+        size_t dropped = 0;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+
+            // Remove any existing jobs for this quadrant to keep only the latest frame
+            auto it = jobs.begin();
+            while (it != jobs.end()) {
+                if (it->quadrant == job.quadrant) {
+                    it = jobs.erase(it);
+                    dropped++;
+                } else {
+                    ++it;
+                }
+            }
+
+            jobs.push_back(job);
+        }
+
+        if (dropped > 0) {
+            droppedFrames += dropped;
+            std::cout << "[VISION QUEUE] Dropped " << dropped << " old frame(s) for quadrant "
+                      << job.quadrant << " (total dropped: " << droppedFrames << ")" << std::endl;
+        }
+
+        cv.notify_one();
+    }
+
+    void stop() {
+        // Prevent double-stop (e.g., explicit call + destructor call)
+        bool expected = false;
+        if (!isStopped.compare_exchange_strong(expected, true)) {
+            // Already stopped, nothing to do
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            shouldStop = true;
+        }
+        cv.notify_all();
+
+        for (auto& worker : workers) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+        workers.clear();
+        std::cout << "[VISION QUEUE] All worker threads stopped" << std::endl;
+    }
+
+    size_t pendingJobs() {
+        std::lock_guard<std::mutex> lock(mutex);
+        return jobs.size();
+    }
+
+    ~VisionJobQueue() {
+        stop();
+    }
+};
+
+// Global vision processing job queue
+static VisionJobQueue g_visionQueue;
+
+struct VNCClient {
+    rfbClient* client = nullptr;
+    SDL_Surface* surface = nullptr;
+    bool connected = false;
+    std::string host;
+    int port;
+    int width = 0;
+    int height = 0;
+    int quadrant = 0;  // Which quadrant this client belongs to (0-3)
+};
+
+struct VNCUpdateRect {
+    int x, y, w, h;
+};
+
+struct VNCTexture {
+    GLuint texture = 0;
+    int nvgHandle = -1;
+    int width = 0;
+    int height = 0;
+    bool needsUpdate = false;
+    std::vector<VNCUpdateRect> dirtyRects;  // Track which regions need updating
+};
 
 /*
 These luminous phenomena still manifest themselves
@@ -54,7 +226,8 @@ typedef Vector2 Position;
 
 struct Edge
 {
-    Position p0;
+    Position p0;// LibVNC
+#include <rfb/rfbclient.h>
     Position p1;
 };
 
@@ -73,6 +246,20 @@ struct UIElementSize
 struct DebugRenderBounds {};
 struct UIElementBounds {
     float xmin, ymin, xmax, ymax;
+};
+
+enum class ServerStatus
+{
+    Offline,
+    Loading,
+    Ready,
+};
+
+struct ServerScript
+{
+    std::string name;
+    std::string conda_env;
+    std::string launcher_path;
 };
 
 struct RenderStatus {
@@ -248,6 +435,7 @@ struct CursorState
 struct AddTagOnLeftClick{};
 struct ShowEditorPanels {};
 struct SetPanelEditorType {};
+struct SelectServer {};
 
 struct LeftClickEvent {};
 struct Dragging {};
@@ -290,7 +478,6 @@ struct ChatPanel {
     flecs::entity messages_panel;
     flecs::entity input_panel;
     flecs::entity input_text;
-    flecs::entity send_button;
 };
 
 struct Graphics {
@@ -301,6 +488,7 @@ enum class EditorType
 {
     Void,
     PeachCore,
+    VNCStream,
     Healthbar,
     Embodiment,
     LanguageGame,
@@ -434,6 +622,114 @@ enum class RenderType {
 
 flecs::world world;
 
+// VNC Stream
+
+// VNC callback: Resize framebuffer
+static rfbBool vnc_resize_callback(rfbClient* client) {
+    std::cout << "[VNC] Resize callback - width: " << client->width
+              << ", height: " << client->height
+              << ", depth: " << client->format.bitsPerPixel << std::endl;
+
+    int width = client->width;
+    int height = client->height;
+    int depth = client->format.bitsPerPixel;
+
+    // Free old surface
+    SDL_Surface* oldSurface = (SDL_Surface*)rfbClientGetClientData(client, (void*)VNC_SURFACE_TAG);
+    if (oldSurface) {
+        std::cout << "[VNC] Freeing old surface" << std::endl;
+        SDL_FreeSurface(oldSurface);
+    }
+
+    // Create new surface for framebuffer
+    SDL_Surface* surface = SDL_CreateRGBSurface(0, width, height, depth, 0, 0, 0, 0);
+    if (!surface) {
+        std::cerr << "[VNC ERROR] Failed to create surface: " << SDL_GetError() << std::endl;
+        return FALSE;
+    }
+
+    std::cout << "[VNC] Created new surface: " << width << "x" << height
+              << " @ " << depth << "bpp" << std::endl;
+
+    // Store surface in client data
+    rfbClientSetClientData(client, (void*)VNC_SURFACE_TAG, surface);
+
+    // Configure framebuffer
+    // Note: Don't modify client->width based on pitch - keep actual width
+    // The pitch may be larger due to alignment, but width should be display width
+    client->frameBuffer = (uint8_t*)surface->pixels;
+
+    // Set pixel format
+    client->format.bitsPerPixel = depth;
+    client->format.redShift = surface->format->Rshift;
+    client->format.greenShift = surface->format->Gshift;
+    client->format.blueShift = surface->format->Bshift;
+    client->format.redMax = surface->format->Rmask >> client->format.redShift;
+    client->format.greenMax = surface->format->Gmask >> client->format.greenShift;
+    client->format.blueMax = surface->format->Bmask >> client->format.blueShift;
+
+    std::cout << "[VNC] Pixel format - R shift: " << client->format.redShift
+              << ", G shift: " << client->format.greenShift
+              << ", B shift: " << client->format.blueShift << std::endl;
+
+    SetFormatAndEncodings(client);
+    std::cout << "[VNC] Resize complete" << std::endl;
+
+    return TRUE;
+}
+
+static void vnc_update_callback(rfbClient* client, int x, int y, int w, int h) {
+    // Mark texture region for update in ECS - find the texture for this specific client
+    auto query = world.query<VNCClient, VNCTexture>();
+    int updateCount = 0;
+    query.each([&](flecs::entity e, VNCClient& vnc, VNCTexture& tex) {
+        if (vnc.client == client) {
+            // Add the dirty rectangle to the update queue
+            tex.dirtyRects.push_back({x, y, w, h});
+            tex.needsUpdate = true;
+            updateCount++;
+            LOG_TRACE(LogCategory::VNC_CLIENT, "Added dirty rect total rects: {}", tex.dirtyRects.size());
+        }
+    });
+}
+
+
+rfbClient* connectToTurboVNC(const char* host, int port) {
+    std::cout << "[VNC] Connecting to " << host << ":" << port << std::endl;
+
+    rfbClient* client = rfbGetClient(8, 3, 4);
+
+    // Set callbacks
+    client->MallocFrameBuffer = vnc_resize_callback;
+    client->canHandleNewFBSize = TRUE;
+    client->GotFrameBufferUpdate = vnc_update_callback;
+
+    // Enable TurboVNC/TurboJPEG compression
+    // client->appData.encodingsString = "tight copyrect";
+    client->appData.encodingsString = "tight copyrect";
+    client->appData.compressLevel = 0;
+    client->appData.qualityLevel = 10;
+    client->appData.enableJPEG = FALSE;
+
+    client->serverHost = strdup(host);
+    client->serverPort = port;
+
+    std::cout << "[VNC] Initializing client..." << std::endl;
+    if (!rfbInitClient(client, NULL, NULL)) {
+        std::cerr << "[VNC ERROR] Failed to initialize client" << std::endl;
+        return NULL;
+    }
+
+    std::cout << "[VNC] Connected successfully!" << std::endl;
+    std::cout << "[VNC] Desktop: " << client->desktopName << std::endl;
+    std::cout << "[VNC] Size: " << client->width << "x" << client->height << std::endl;
+
+    return client;
+}
+
+// End VNC Stream
+
+
 void create_editor(flecs::entity leaf, EditorNodeArea& node_area, flecs::world world, flecs::entity UIElement)
 {
     leaf.set<EditorLeafData>({EditorType::Void});
@@ -527,6 +823,7 @@ std::vector<std::string> editor_types =
     "Void",
     // "ECS Graph", // Entity component relationship
     "Peach Core",
+    "VNC Stream",
     "Healthbar",
     // "Gynoid",
     "Embodiment",
@@ -551,16 +848,38 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         .add(flecs::OrderedChildren)
         .child_of(leaf.target<EditorCanvas>());
 
-        std::vector<std::string> server_icons = {"peach_core", "parakeet", "chatterbox", "flecs", "x11", "doctr", "huggingface", "dino2"};
+        std::vector<std::string> server_icons = {"peach_core", "aeri_memory", "flecs", "x11", "parakeet", "chatterbox", "doctr", "huggingface", "dino2", "alpaca", "modal"};
         // std::vector<std::string> server_icons = {"peach_core"};
 
         for (const auto& icon : server_icons)
         {
+            flecs::entity server_icon;
+
+            if (icon == "chatterbox")
+            { 
+                server_icon = world.entity()
+                .is_a(UIElement)
+                .child_of(server_hud)
+                .set<ImageCreator>({"../assets/server_hud/" + icon + ".png", 1.0f, 1.0f})
+                .set<ZIndex>({10})
+                server_icon.set<ServerScript>({"chatterbox", "chatterbox", "../chatter_server"})
+                .add(ServerStatus::Offline)
+                .add<AddTagOnLeftClick, SelectServer>(); 
+            } else
+            {
+                server_icon = world.entity()
+                .is_a(UIElement)
+                .child_of(server_hud)
+                .set<ImageCreator>({"../assets/server_hud/" + icon + ".png", 1.0f, 1.0f})
+                .set<ZIndex>({10});
+            }
+            // TODO: Server dot should only exist if the server is active...
             world.entity()
             .is_a(UIElement)
-            .child_of(server_hud)
-            .set<ImageCreator>({"../assets/server_hud/" + icon + ".png", 1.0f, 1.0f})
-            .set<ZIndex>({10});
+            .child_of(server_icon)
+            .set<ImageCreator>({"../assets/server_dot.png", 1.0f, 1.0f})
+            .set<Align>({-0.5f, -0.5f, 0.5f, 0.9f})
+            .set<ZIndex>({12});
         }
         
     }
@@ -569,7 +888,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         float diurnal_pos = get_time_of_day_normalized();
         std::cout << diurnal_pos << std::endl;
         int segments = 24;
-        for (int i = 0; i < segments; ++i) {
+        for (size_t i = 0; i < segments; ++i) {
             world.entity()
                 .is_a(UIElement)
                 .child_of(leaf.target<EditorCanvas>())
@@ -669,39 +988,41 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
             .child_of(canvas)
             .set<ZIndex>({5});
 
+        // auto input_text_bar = world.entity()
+        //     .is_a(UIElement)
+        //     .child_of(chat_root)
+        //     .set<RoundedRectRenderable>({100.0f, 32.0f, 2.0f, false, 0x444444FF})
+        //     .set<Expand>({true, 0.0f, 4.0f, 1.0f, false, 0, 0, 0})
+        //     .set<ZIndex>({10});
+
         auto messages_panel = world.entity()
             .is_a(UIElement)
             .child_of(chat_root)
-            .set<RoundedRectRenderable>({100.0f, 100.0f, 4.0f, false, 0x101020FF})
-            .set<ZIndex>({6});
+            .set<RoundedRectRenderable>({100.0f, 100.0f, 4.0f, false, 0x121212FF})
+            // TODO: Expand to fill remaining space in VerticalLayout...
+            // .set<Expand>({true, 8.0f, 8.0f, 1.0f, true, 8.0f, 36.0f, })
+            .set<ZIndex>({10});
 
         auto input_panel = world.entity()
             .is_a(UIElement)
             .child_of(chat_root)
-            .set<RoundedRectRenderable>({100.0f, 36.0f, 4.0f, true, 0x383838FF})
+            .set<RoundedRectRenderable>({100.0f, 36.0f, 2.0f, true, 0x555555FF})
             .add<AddTagOnLeftClick, FocusChatInput>()
-            .set<ZIndex>({7});
+            .set<ZIndex>({10});
+
+        auto input_bkg = world.entity()
+            .is_a(UIElement)
+            .child_of(input_panel)
+            .set<RoundedRectRenderable>({10.0f, 10.0f, 2.0f, false, 0x222327FF})
+            .set<Expand>({true, 0, 0, 1, true, 0, 0, 1})
+            .set<ZIndex>({9});
 
         auto input_text = world.entity()
             .is_a(UIElement)
             .child_of(input_panel)
             .set<Position, Local>({8.0f, 8.0f})
-            .set<TextRenderable>({"", "ATARISTOCRAT", 16.0f, 0xFFFFFFFF, NVG_ALIGN_TOP | NVG_ALIGN_LEFT})
-            .set<ZIndex>({8});
-
-        auto send_button = world.entity()
-            .is_a(UIElement)
-            .child_of(input_panel)
-            .set<RoundedRectRenderable>({60.0f, 28.0f, 4.0f, false, 0x585858FF})
-            .add<AddTagOnLeftClick, SendChatMessage>()
-            .set<ZIndex>({8});
-
-        world.entity()
-            .is_a(UIElement)
-            .child_of(send_button)
-            .set<Position, Local>({12.0f, 6.0f})
-            .set<TextRenderable>({"Send", "ATARISTOCRAT", 14.0f, 0xFFFFFFFF, NVG_ALIGN_TOP | NVG_ALIGN_LEFT})
-            .set<ZIndex>({9});
+            .set<TextRenderable>({"", "Inter", 14.0f, 0xFFFFFFFF, NVG_ALIGN_TOP | NVG_ALIGN_LEFT})
+            .set<ZIndex>({12});
 
         const int kMaxMessages = 30;
         for (int i = 0; i < kMaxMessages; ++i)
@@ -711,11 +1032,11 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
                 .child_of(messages_panel)
                 .set<ChatMessageView>({i})
                 .set<Position, Local>({6.0f, 6.0f + i * 18.0f})
-                .set<TextRenderable>({"", "ATARISTOCRAT", 14.0f, 0xDDDDDDFF, NVG_ALIGN_TOP | NVG_ALIGN_LEFT})
+                .set<TextRenderable>({"", "Inter", 14.0f, 0xDDDDDDFF, NVG_ALIGN_TOP | NVG_ALIGN_LEFT})
                 .set<ZIndex>({7});
         }
 
-        leaf.set<ChatPanel>({messages_panel, input_panel, input_text, send_button});
+        leaf.set<ChatPanel>({messages_panel, input_panel, input_text});
     }
     else if (editor_type == EditorType::Bookshelf)
     {
@@ -760,7 +1081,8 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         .set<ImageCreator>({"../assets/cuct.png", 1.0f, 1.0f})
         .set<Expand>({false, 4.0f, 4.0f, 1.0f, true, 0.0f, 0.0f, 1.0f})
         .set<ZIndex>({10});
-    } else if (editor_type == EditorType::Hearing)
+    } 
+    else if (editor_type == EditorType::Hearing)
     {
         std::cout << "Creating Hearing editor..." << std::endl;
 
@@ -842,6 +1164,88 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
             //     .set<TextRenderable>({"System Audio", "ATARISTOCRAT", 12.0f, 0xAAAAAAFF})
             //     .set<ZIndex>({20});
         }
+    }
+    else if (editor_type == EditorType::VNCStream)
+    {
+        auto badges = world.entity()
+        .is_a(UIElement)
+        .set<HorizontalLayoutBox>({0.0f, 2.0f})
+        .set<Position, Local>({48.0f, 0.0f})
+        .child_of(leaf.target<EditorHeader>());
+        
+        world.entity()
+        .is_a(UIElement)
+        .child_of(badges)
+        .set<ImageCreator>({"../assets/docker_badge.png", 1.0f, 1.0f})
+        .set<ZIndex>({20});
+
+        world.entity()
+        .is_a(UIElement)
+        .child_of(badges)
+        .set<ImageCreator>({"../assets/kubuntu_badge.png", 1.0f, 1.0f})
+        .set<ZIndex>({20});
+
+        world.entity()
+        .is_a(UIElement)
+        .child_of(badges)
+        .set<ImageCreator>({"../assets/192.168.1.104_badge.png", 1.0f, 1.0f})
+        .set<ZIndex>({20});
+
+        world.entity()
+        .is_a(UIElement)
+        .child_of(badges)
+        .set<ImageCreator>({"../assets/5901_badge.png", 1.0f, 1.0f})
+        .set<ZIndex>({20});
+
+        const char* vnc_host = getenv("VNC_SERVER_HOST");
+        if (!vnc_host) {
+            vnc_host = "localhost";
+            vnc_host = "192.168.1.104";
+        }
+        std::cout << "[VNC] VNC server host: " << vnc_host << " (ports 5901-5904)" << std::endl;
+        
+        int port = 5901;
+        std::string host_string = std::string(vnc_host) + ":" + std::to_string(port);
+
+        rfbClient* vncClient = connectToTurboVNC(vnc_host, port);
+        if (vncClient) {
+            std::cout << "[VNC] VNC client connected successfully" << std::endl;
+            SDL_Surface* surface = (SDL_Surface*)rfbClientGetClientData(vncClient, (void*)VNC_SURFACE_TAG);
+            
+            // Create OpenGL texture for VNC framebuffer
+            GLuint vncTexture;
+            glGenTextures(1, &vncTexture);
+            glBindTexture(GL_TEXTURE_2D, vncTexture);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, vncClient->width, vncClient->height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            
+            // Create NanoVG image from OpenGL texture
+            int nvgVNCHandle = nvglCreateImageFromHandleGL2(world.try_get<Graphics>()->vg, vncTexture, vncClient->width, vncClient->height, 0);
+            
+            flecs::entity vnc_entity = world.entity()
+            .is_a(UIElement)
+            .set<VNCTexture>({vncTexture, nvgVNCHandle, vncClient->width, vncClient->height, false})
+            .set<ImageRenderable>({nvgVNCHandle, 1.0f, 1.0f, vncClient->width, vncClient->height})
+            .set<VNCClient>({
+                vncClient,
+                surface,
+                true,
+                vnc_host,
+                port,
+                vncClient->width,
+                vncClient->height,
+                0
+            })
+            .set<ZIndex>({9})
+            .set<Expand>({true, 0.0f, 0.0f, 1.0f, false, 0, 0, 0})
+            .set<Constrain>({true, true})
+            .set<Align>({-0.5f, -0.5f, 0.5f, 0.5f})
+            // .add<DebugRenderBounds>()
+            .child_of(leaf.target<EditorCanvas>());
+        }
+
+
     } else
     {
         auto editor_icon_bkg_square = world.entity()
@@ -1245,6 +1649,9 @@ int main(int, char *[]) {
     auto renderQueueEntity = world.entity("RenderQueue")
         .set<RenderQueue>({});
 
+    // Initialize debug logger module (MUST BE FIRST!)
+    DebugLogModule(world);
+
     // Initialize mel spectrogram rendering module (must be after Graphics entity is created)
     MelSpecRenderModule(world);
 
@@ -1324,6 +1731,19 @@ int main(int, char *[]) {
             chat.messages.push_back({"You", chat.draft});
             chat.draft.clear();
         }
+    });
+
+    world.observer<UIElementBounds, AddTagOnLeftClick>()
+    .term_at(1).second<SelectServer>()
+    .event<LeftClickEvent>()
+    .each([&](flecs::entity e, UIElementBounds& bounds, AddTagOnLeftClick)
+    {
+        const ServerScript* script = e.try_get<ServerScript>();
+        if (script)
+        {
+
+        }
+        std::cout << "Start chatter server here" << std::endl;
     });
 
     world.observer<UIElementBounds, AddTagOnLeftClick>()
@@ -1622,7 +2042,7 @@ int main(int, char *[]) {
         .each([&](flecs::entity leaf, ChatPanel& panel, EditorNodeArea&)
         {
             if (!panel.messages_panel.is_alive() || !panel.input_panel.is_alive() ||
-                !panel.input_text.is_alive() || !panel.send_button.is_alive())
+                !panel.input_text.is_alive())
             {
                 leaf.remove<ChatPanel>();
                 return;
@@ -1645,10 +2065,6 @@ int main(int, char *[]) {
             input_rect.width = canvas_w - pad * 2.0f;
             input_rect.height = input_h;
             panel.input_panel.ensure<Position, Local>() = {pad, canvas_h - input_h - pad};
-
-            auto& send_rect = panel.send_button.ensure<RoundedRectRenderable>();
-            float send_w = send_rect.width;
-            panel.send_button.ensure<Position, Local>() = {input_rect.width - send_w - 6.0f, 4.0f};
 
             ChatState& chat = world.ensure<ChatState>();
             std::string caret = chat.input_focused ? "|" : "";
@@ -2372,7 +2788,162 @@ int main(int, char *[]) {
             queue.clear();
         });
 
+    auto vncInitSystem = world.system<VNCClient>()
+        .kind(flecs::PreUpdate)
+        .each([](flecs::iter& it, size_t i, VNCClient& vnc) {
+            static bool initialized[1] = {false};
+            if (!initialized[vnc.quadrant] && vnc.connected && vnc.client) {
+                std::cout << "[VNC INIT] Requesting full framebuffer update for quadrant " << vnc.quadrant << "..." << std::endl;
+                SendFramebufferUpdateRequest(vnc.client, 0, 0, vnc.client->width, vnc.client->height, FALSE);
+                initialized[vnc.quadrant] = true;
+                std::cout << "[VNC INIT] Initial update request sent for quadrant " << vnc.quadrant << " " << vnc.client->width << "x" << vnc.client->height << std::endl;
+            }
+        });
+
+    // Process VNC messages to trigger update callbacks
+    auto vncMessageProcessingSystem = world.system<VNCClient>()
+        .kind(flecs::OnUpdate)
+        .each([](flecs::entity e, VNCClient& vnc) {
+            if (!vnc.connected || !vnc.client) return;
+
+            // Process pending VNC messages (non-blocking)
+            // WaitForMessage with timeout of 0 makes it non-blocking
+            int result = WaitForMessage(vnc.client, 0);
+            if (result > 0) {
+                // Message available, process it
+                if (!HandleRFBServerMessage(vnc.client)) {
+                    LOG_ERROR(LogCategory::VNC_CLIENT, "Failed to handle VNC message for quadrant {}", vnc.quadrant);
+                }
+            } else if (result < 0) {
+                LOG_ERROR(LogCategory::VNC_CLIENT, "VNC connection error for quadrant {}", vnc.quadrant);
+                vnc.connected = false;
+            }
+            // result == 0 means no messages, which is fine
+        });
+
+    auto vncTextureUpdateSystem = world.system<VNCClient, VNCTexture>()
+        .kind(flecs::OnUpdate)
+        .each([](flecs::entity e, VNCClient& vnc, VNCTexture& tex) {
+            if (!vnc.connected || !vnc.client) {
+                static bool warned = false;
+                LOG_DEBUG(LogCategory::VNC_CLIENT, "Client not connected or null");
+                return;
+            }
+            
+            if (!tex.needsUpdate) return;
+            std::cout << "VNC Texture Update System" << std::endl;
+            
+            LOG_TRACE(LogCategory::VNC_CLIENT, "Updating OpenGL texture {} for quadrant {}", tex.texture, vnc.quadrant);
+
+            SDL_Surface* surface = (SDL_Surface*)rfbClientGetClientData(vnc.client, (void*)VNC_SURFACE_TAG);
+            if (surface && surface->pixels) {
+                // Submit vision processing job to background thread instead of blocking
+                VisionProcessingJob job;
+                job.quadrant = vnc.quadrant;
+                job.paletteFile = "../assets/palettes/resurrect-64.hex";
+                job.outputPath = "/tmp/vision_quad_" + std::to_string(vnc.quadrant) + ".png";
+                job.width = surface->w;
+                job.height = surface->h;
+                job.pitch = surface->pitch;
+
+                // Copy pixel data to avoid race conditions with VNC updates
+                size_t dataSize = surface->pitch * surface->h;
+                job.pixelData.resize(dataSize);
+                memcpy(job.pixelData.data(), surface->pixels, dataSize);
+
+                g_visionQueue.submit(job);
+                LOG_TRACE(LogCategory::VNC_CLIENT, "Submitted vision processing job for quadrant {}", vnc.quadrant);
+
+
+                LOG_TRACE(LogCategory::VNC_CLIENT, "Processing {} dirty rectangles", tex.dirtyRects.size());
+                LOG_TRACE(LogCategory::VNC_CLIENT, "Surface info: {}x{}, format: {}", surface->w, surface->h, SDL_GetPixelFormatName(surface->format->format));
+
+                // Update OpenGL texture from SDL surface pixels
+                glBindTexture(GL_TEXTURE_2D, tex.texture);
+
+                // Set pixel unpack alignment to handle pitch correctly
+                int bytesPerPixel = surface->format->BytesPerPixel;
+                int expectedPitch = surface->w * bytesPerPixel;
+
+                // CRITICAL: When updating partial rects, GL_UNPACK_ROW_LENGTH tells OpenGL
+                // how many pixels are in a row of the SOURCE data (the surface)
+                // This must be set to surface->pitch / bytesPerPixel regardless of whether
+                // we're updating the full surface or a partial rect
+                int rowLengthPixels = surface->pitch / bytesPerPixel;
+
+                LOG_TRACE(LogCategory::VNC_CLIENT, "Surface pitch: {}, bytes per pixel: {}", surface->pitch, surface->format->BytesPerPixel);
+
+                // Always set row length for partial updates
+                glPixelStorei(GL_UNPACK_ROW_LENGTH, rowLengthPixels);
+                glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+
+                // Determine the correct pixel format based on SDL surface format
+                GLenum format = GL_BGRA;
+                if (surface->format->Rmask == 0xFF) {
+                    format = GL_RGBA;
+                }
+
+                LOG_TRACE(LogCategory::VNC_CLIENT, "Using OpenGL format: {}", (format == GL_BGRA ? "BGRA" : "RGBA"));
+
+                // Process each dirty rectangle
+                for (const auto& rectIn : tex.dirtyRects) {
+                    // Clamp rect to surface/texture bounds to be safe
+                    int rx = std::max(0, rectIn.x);
+                    int ry = std::max(0, rectIn.y);
+                    int rw = std::min(rectIn.w, surface->w - rx);
+                    int rh = std::min(rectIn.h, surface->h - ry);
+                    if (rw <= 0 || rh <= 0) continue;
+
+                    // Pointer to top-left of the dirty region
+                    uint8_t* regionStart = // NOTE: Changed to non-const for modification
+                        static_cast<uint8_t*>(surface->pixels) + ry * surface->pitch + rx * 4;
+
+                    // --- CRITICAL ADDITION: Force full alpha for the dirty rectangle ---
+                    // This assumes a 32-bit format (bpp=4) where the alpha channel is the
+                    // last byte of the 4-byte pixel (e.g., RGBA or BGRA).
+                    // If the format is different, the offset (bpp - 1) needs adjustment.
+                    for (int y = 0; y < rh; ++y) {
+                        uint8_t* rowStart = regionStart + y * surface->pitch;
+                        for (int x = 0; x < rw; ++x) {
+                            // Set the alpha component (last byte) to 0xFF (fully opaque)
+                            rowStart[x * 4 + (4 - 1)] = 0xFF;
+                        }
+                    }
+                    // ------------------------------------------------------------------
+
+                    // Critical change: we keep GL_UNPACK_ROW_LENGTH set so GL steps by `pitch` each row.
+                    glTexSubImage2D(GL_TEXTURE_2D, 0, rx, ry, rw, rh, format, GL_UNSIGNED_BYTE, regionStart);
+                }
+
+                // Reset to defaults
+                glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+                glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+
+                LOG_TRACE(LogCategory::VNC_CLIENT, "All rects updated successfully");
+
+                // Save screenshot every second
+                struct timeval current_time;
+                gettimeofday(&current_time, NULL);
+                long elapsed_ms = (current_time.tv_sec - g_last_screenshot_time.tv_sec) * 1000 +
+                                  (current_time.tv_usec - g_last_screenshot_time.tv_usec) / 1000;
+
+                // if (elapsed_ms >= 1000) {
+                //     save_vnc_screenshot(surface, vnc.quadrant);
+                //     g_last_screenshot_time = current_time;
+                // }
+
+                // Clear dirty rects and mark as updated
+                tex.dirtyRects.clear();
+                tex.needsUpdate = false;
+
+                std::cout << "Updated tVNC texture " << std::endl;
+            } else {
+                LOG_ERROR(LogCategory::VNC_CLIENT, "Surface or pixels is null");
+            }
+        });
+
     int fontHandle = nvgCreateFont(vg, "ATARISTOCRAT", "../assets/ATARISTOCRAT.ttf");
+    int interFontHandle = nvgCreateFont(vg, "Inter", "../assets/OpenSans-Regular.ttf");
 
     while (!glfwWindowShouldClose(window)) {
         processInput(window);
