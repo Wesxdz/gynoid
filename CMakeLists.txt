@@ -9,7 +9,8 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # add_definitions(AOTInductor_CUDA)
-add_executable(${PROJECT_NAME} src/main.cpp src/mel_spec_render.cpp src/glad.c src/vision_processor.cpp)
+add_executable(${PROJECT_NAME} src/main.cpp src/mel_spec_render.cpp src/glad.c src/vision_processor.cpp src/x11_outline.cpp)
+
 include_directories("src")
 include_directories("deps/mel_spec/src")
 include_directories("deps/mel_spec/deps/glad/include")
@@ -48,7 +49,23 @@ find_package(SDL2_image REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(LibVNCServer)
 
-target_link_libraries(${PROJECT_NAME} flecs glfw glad nanovg X11 Xi Xtst SDL2 SDL2_image ${OpenCV_LIBS})
+# PYTHON QUERY SERVER ----
+# Add spatialindex library
+include_directories("deps/spatialindex-src-2.1.0/include")
+add_subdirectory("deps/spatialindex-src-2.1.0")
+# Add LMDB library
+include_directories("deps/liblmdb")
+add_library(lmdb STATIC deps/liblmdb/mdb.c deps/liblmdb/midl.c)
+set_target_properties(lmdb PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+)
+# Build query server shared library (contains all query/socket/spatial logic)
+add_library(query_server SHARED src/query_server.cpp)
+target_link_libraries(query_server flecs spatialindex lmdb pthread)
+set_property(TARGET query_server PROPERTY CXX_STANDARD 17)
+# ----
+
+target_link_libraries(${PROJECT_NAME} flecs glfw glad nanovg X11 Xi Xtst SDL2 SDL2_image ${OpenCV_LIBS} query_server)
 
 # Add audio stream client executable
 add_executable(audio_stream_client src/audio_stream_client.c)

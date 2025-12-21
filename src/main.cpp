@@ -44,6 +44,83 @@
 #include "mel_spec_render.h"
 #include "vision_processor.h"
 #include "debug_log.h"
+#include "x11_outline.h"
+
+#include "spatial_index.h"
+#include "query_server.h"
+
+struct TextSize { float w, h; };
+
+std::vector<std::string> splitLinesPreserve(std::string s) {
+    std::vector<std::string> out;
+    size_t start = 0;
+    while (start <= s.size()) {
+        size_t nl = s.find('\n', start);
+        if (nl == std::string::npos) {
+            out.push_back(s.substr(start));
+            break;
+        }
+        out.push_back(s.substr(start, nl - start)); // can be empty
+        start = nl + 1;
+        if (start == s.size()) { // trailing newline -> final empty line
+            out.push_back(std::string{});
+            break;
+        }
+    }
+    return out;
+}
+
+TextSize measureText(NVGcontext* vg,
+                            std::string text,
+                            float wrapWidth)
+{
+    float asc = 0, desc = 0, lineh = 0;
+    nvgTextMetrics(vg, &asc, &desc, &lineh);
+
+    float w = 0.0f;
+    float h = 0.0f;
+
+    auto lines = splitLinesPreserve(text);
+
+    if (wrapWidth > 0.0f) {
+        NVGtextRow rows[16];
+
+        for (auto line : lines) {
+            // Even an empty explicit line consumes vertical space.
+            if (line.empty()) { h += lineh; continue; }
+
+            const char* start = line.data();
+            const char* end   = start + line.size();
+
+            while (start < end) {
+                int n = nvgTextBreakLines(vg, start, end, wrapWidth, rows, 16);
+                if (n <= 0) break;
+
+                for (int i = 0; i < n; ++i) {
+                    w = std::max(w, rows[i].width);
+                    h += lineh;
+                }
+                start = rows[n - 1].next;
+            }
+        }
+
+        // Optional: if you want “reported width” to be the box width:
+        // w = std::min(w, wrapWidth);
+
+    } else {
+        float bounds[4];
+
+        for (auto line : lines) {
+            h += lineh;                  // explicit line always counts
+            if (line.empty()) continue;  // blank line => width 0
+
+            nvgTextBounds(vg, 0, 0, line.data(), line.data() + line.size(), bounds);
+            w = std::max(w, bounds[2] - bounds[0]);
+        }
+    }
+
+    return { w, h };
+}
 
 static const char* VNC_SURFACE_TAG = "vnc_surface";
 static struct timeval g_last_screenshot_time;
@@ -270,12 +347,14 @@ struct HorizontalLayoutBox
 {
   float x_progress;
   float padding = 0.0f;
+  float move_dir = 1; // Right
 };
 
 struct VerticalLayoutBox 
 {
   float y_progress;
   float padding;
+  float move_dir = 1; // Down
 };
 
 
@@ -402,6 +481,7 @@ struct TextRenderable {
     float fontSize;
     uint32_t color;
     int alignment;
+    float wrapWidth = 0.0f;  // 0 = no wrapping, >0 = wrap at this width
 };
 
 struct ImageCreator
@@ -478,6 +558,7 @@ struct ChatPanel {
     flecs::entity messages_panel;
     flecs::entity input_panel;
     flecs::entity input_text;
+    flecs::entity message_list;
 };
 
 struct Graphics {
@@ -862,7 +943,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
                 .child_of(server_hud)
                 .set<ImageCreator>({"../assets/server_hud/" + icon + ".png", 1.0f, 1.0f})
                 .set<ZIndex>({10})
-                server_icon.set<ServerScript>({"chatterbox", "chatterbox", "../chatter_server"})
+                .set<ServerScript>({"chatterbox", "chatterbox", "../chatter_server"})
                 .add(ServerStatus::Offline)
                 .add<AddTagOnLeftClick, SelectServer>(); 
             } else
@@ -1010,6 +1091,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
             .add<AddTagOnLeftClick, FocusChatInput>()
             .set<ZIndex>({10});
 
+            // TODO: We need to scale the input bkg to the text/content size...
         auto input_bkg = world.entity()
             .is_a(UIElement)
             .child_of(input_panel)
@@ -1019,24 +1101,41 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
 
         auto input_text = world.entity()
             .is_a(UIElement)
+            .add<DebugRenderBounds>()
             .child_of(input_panel)
             .set<Position, Local>({8.0f, 8.0f})
-            .set<TextRenderable>({"", "Inter", 14.0f, 0xFFFFFFFF, NVG_ALIGN_TOP | NVG_ALIGN_LEFT})
+            .set<TextRenderable>({"", "Inter", 16.0f, 0xFFFFFFFF, NVG_ALIGN_TOP | NVG_ALIGN_LEFT})
             .set<ZIndex>({12});
 
-        const int kMaxMessages = 30;
-        for (int i = 0; i < kMaxMessages; ++i)
-        {
-            world.entity()
-                .is_a(UIElement)
-                .child_of(messages_panel)
-                .set<ChatMessageView>({i})
-                .set<Position, Local>({6.0f, 6.0f + i * 18.0f})
-                .set<TextRenderable>({"", "Inter", 14.0f, 0xDDDDDDFF, NVG_ALIGN_TOP | NVG_ALIGN_LEFT})
-                .set<ZIndex>({7});
-        }
+        auto message_list = world.entity()
+            .is_a(UIElement)
+            .child_of(chat_root)
+            .add(flecs::OrderedChildren)
+            .add<VerticalLayoutBox>();
 
-        leaf.set<ChatPanel>({messages_panel, input_panel, input_text});
+        auto badges = world.entity()
+        .is_a(UIElement)
+        .set<HorizontalLayoutBox>({0.0f, 2.0f})
+        .add(flecs::OrderedChildren)
+        // .add<DebugRenderBounds>()
+        .child_of(message_list);
+
+        world.entity()
+        .is_a(UIElement)
+        .child_of(badges)
+        .set<ImageCreator>({"../assets/wesley_badge.png", 1.0f, 1.0f})
+        .set<ZIndex>({20});        
+
+        world.entity()
+        .is_a(UIElement)
+        .child_of(badges)
+        .set<Position, Local>({0.0f, 5.0f})
+        .set<TextRenderable>({" types", "Inter", 16.0f, 0xFFFFFFFF, NVG_ALIGN_TOP | NVG_ALIGN_LEFT})
+        .set<ZIndex>({20});   
+
+
+
+        leaf.set<ChatPanel>({messages_panel, input_panel, input_text, message_list});
     }
     else if (editor_type == EditorType::Bookshelf)
     {
@@ -1352,6 +1451,7 @@ struct RenderCommand {
     std::variant<RoundedRectRenderable, RectRenderable, TextRenderable, ImageRenderable, LineRenderable, QuadraticBezierRenderable> renderData;
     RenderType type;
     int zIndex;
+    // TODO: Scissors command here...
 
     bool operator<(const RenderCommand& other) const {
         return zIndex < other.zIndex;
@@ -1501,6 +1601,8 @@ static void char_callback(GLFWwindow* window, unsigned int codepoint)
 static void key_callback(GLFWwindow* window, int key, int scancode, int action, int mods)
 {
     if (action != GLFW_PRESS && action != GLFW_REPEAT) return;
+
+    // Retrieve the singleton ChatState
     ChatState* chat = world.try_get_mut<ChatState>();
     if (!chat || !chat->input_focused) return;
 
@@ -1510,9 +1612,45 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
     }
     else if (key == GLFW_KEY_ENTER || key == GLFW_KEY_KP_ENTER)
     {
-        if (!chat->draft.empty())
+        if (mods & GLFW_MOD_SHIFT)
         {
+            // Shift+Enter: insert newline
+            chat->draft.push_back('\n');
+        }
+        else if (!chat->draft.empty())
+        {
+            // Enter: send message
             chat->messages.push_back({"You", chat->draft});
+
+            // Query for the ChatPanel entity to attach the UI element to
+            world.query<ChatPanel>()
+                .each([&](flecs::entity leaf, ChatPanel& chat_panel) {
+                    
+                    auto UIElement = world.lookup("UIElement");
+                    
+                    // Create the background bubble
+                    auto example_message_bkg = world.entity()
+                        .is_a(UIElement)
+                        .child_of(chat_panel.message_list) // Attached to the ChatPanel found via query
+                        .set<RoundedRectRenderable>({100.0f, 16.0f, 2.0f, true, 0x121212FF})
+                        .set<Expand>({true, 4.0f, 4.0f, 1.0f, false, 0, 0, 0})
+                        // .add<DebugRenderBounds>()
+                        .set<ZIndex>({10});
+                    
+                    auto message_content = world.entity()
+                        .is_a(UIElement)
+                        .child_of(example_message_bkg)
+                        // .add<DebugRenderBounds>()
+                        .add<VerticalLayoutBox>();
+
+                    // Create the text content using the actual draft
+                    auto example_message_text = world.entity()
+                        .is_a(UIElement)
+                        .child_of(message_content)
+                        .set<TextRenderable>({chat->draft.c_str(), "Inter", 16.0f, 0xFFFFFFFF, NVG_ALIGN_TOP | NVG_ALIGN_LEFT})
+                        .set<ZIndex>({12});
+                });
+
             chat->draft.clear();
         }
     }
@@ -1537,6 +1675,32 @@ float point_distance_to_edge(Position p, Position a, Position b)
 }
 
 int main(int, char *[]) {
+
+    // Initialize spatial index manager
+    spatial::SpatialIndexManager spatial_manager(&world);
+
+    // Register std::string as an opaque type for serialization
+    world.component<std::string>()
+        .opaque(flecs::String)
+        .serialize([](const flecs::serializer *s, const std::string *data) {
+            const char *str = data->c_str();
+            return s->value(flecs::String, &str);
+        })
+        .assign_string([](std::string *data, const char *value) {
+            *data = value;
+        });
+
+    // TODO: Register spatial data
+
+    query_server::initialize(&world, &spatial_manager);
+
+    // TODO: query_server::register_spatial_handler
+    // Can this be moved elsewhere?
+
+    // Start socket server
+    int port = 8000;
+    query_server::start_server(port);
+
     glfwSetErrorCallback(error_callback);
     
     if (!glfwInit()) {
@@ -1577,18 +1741,26 @@ int main(int, char *[]) {
         return -1;
     }
 
-    world.component<Position>();
+    world.component<Position>()
+    .member<float>("x")
+    .member<float>("y");
     world.component<Velocity>();
     world.component<RectRenderable>();
     world.component<TextRenderable>();
     world.component<ImageCreator>();
     world.component<ImageRenderable>();
-    world.component<ZIndex>();
+    world.component<ZIndex>()
+    .member<int>("layer");
+
     world.component<Window>();
     world.component<CursorState>();
     world.component<Graphics>().add(flecs::Singleton);
     world.component<RenderQueue>();
-    world.component<UIElementBounds>();
+    world.component<UIElementBounds>()
+    .member<float>("xmin")
+    .member<float>("ymin")
+    .member<float>("xmax")
+    .member<float>("ymax");
     world.component<UIElementSize>();
 
     world.component<EditorNodeArea>();
@@ -1624,6 +1796,7 @@ int main(int, char *[]) {
             std::cerr << "Failed to load " << img.path << std::endl;
         }
         e.set<ImageRenderable>({imgHandle, img.scaleX, img.scaleY, 0.0f, 0.0f});
+        e.remove<ImageCreator>();
     });
 
     world.observer<ImageRenderable, Graphics>()
@@ -1651,6 +1824,8 @@ int main(int, char *[]) {
 
     // Initialize debug logger module (MUST BE FIRST!)
     DebugLogModule(world);
+
+    X11OutlineModule(world);
 
     // Initialize mel spectrogram rendering module (must be after Graphics entity is created)
     MelSpecRenderModule(world);
@@ -2008,9 +2183,10 @@ int main(int, char *[]) {
         }
     });
 
-    auto sizeCalculationSystem = world.system<UIElementSize>()
+
+    auto sizeCalculationSystem = world.system<UIElementSize, Graphics>()
         .kind(flecs::PreFrame)
-        .each([&](flecs::entity e, UIElementSize& size) {
+        .each([&](flecs::entity e, UIElementSize& size, Graphics& graphics) {
 
             if (e.has<RectRenderable>()) {
                 auto rect = e.get<RectRenderable>();
@@ -2031,8 +2207,9 @@ int main(int, char *[]) {
                 // Approximate text bounds
                 float approxWidth = text.text.length() * text.fontSize * 0.6f;
                 float approxHeight = text.fontSize;
-                size.width = approxWidth;
-                size.height = approxHeight;
+                TextSize ts = measureText(graphics.vg, text.text, text.wrapWidth);
+                size.width = ts.w;
+                size.height = ts.h;
             }
         });
 
@@ -2054,7 +2231,7 @@ int main(int, char *[]) {
             float canvas_w = canvas_rect->width;
             float canvas_h = canvas_rect->height;
             const float pad = 8.0f;
-            const float input_h = 36.0f;
+            const float input_h = 72.0f;  // Taller input to accommodate multi-line text
 
             auto& messages_rect = panel.messages_panel.ensure<RoundedRectRenderable>();
             messages_rect.width = canvas_w - pad * 2.0f;
@@ -2071,6 +2248,7 @@ int main(int, char *[]) {
             if (auto* input_tr = panel.input_text.try_get_mut<TextRenderable>())
             {
                 input_tr->text = chat.draft + caret;
+                input_tr->wrapWidth = input_rect.width - 16.0f;  // Wrap within input panel with padding
             }
 
             const int kMaxMessages = 30;
@@ -2088,6 +2266,7 @@ int main(int, char *[]) {
                 {
                     const auto& msg = chat.messages[msg_index];
                     tr.text = msg.author + ": " + msg.text;
+                    tr.wrapWidth = messages_rect.width - 12.0f;  // Wrap messages within panel
                     pos.x = 6.0f;
                     pos.y = 6.0f + view.index * 18.0f;
                 }
@@ -2150,10 +2329,19 @@ int main(int, char *[]) {
             const UIElementSize* child_size = child.try_get<UIElementSize>();
             
             if (child_size) {
-                box.y_progress += child_size->height + box.padding;
+                if (box.move_dir == -1.0f)
+                {
+                    // If the vertical box 'stacks elements upwards', then we adjust the position of the VerticalLayoutBox...
+                    box.y_progress = e.ensure<Position, Local>().y;
+                    e.ensure<Position, Local>().y = child_size->height + box.padding;
+                } else
+                {
+                    box.y_progress += child_size->height + box.padding;
+                }
                 if (child_size->width > max_width) {
                     max_width = child_size->width;
                 }
+
             }
         });
 
@@ -2682,6 +2870,7 @@ int main(int, char *[]) {
         .each([&](flecs::entity e, RenderQueue& queue, Graphics& graphics) {
             queue.sort();
 
+            // TODO: Apply scissor regions to relevant entity
             for (const auto& cmd : queue.commands) {
                 switch (cmd.type) {
                     case RenderType::RoundedRectangle: {
@@ -2737,7 +2926,14 @@ int main(int, char *[]) {
                         uint8_t b = (text.color >> 8) & 0xFF;
 
                         nvgFillColor(graphics.vg, nvgRGB(r, g, b));
-                        nvgText(graphics.vg, cmd.pos.x, cmd.pos.y, text.text.c_str(), nullptr);
+                        if (text.wrapWidth > 0.0f)
+                        {
+                            nvgTextBox(graphics.vg, cmd.pos.x, cmd.pos.y, text.wrapWidth, text.text.c_str(), nullptr);
+                        }
+                        else
+                        {
+                            nvgText(graphics.vg, cmd.pos.x, cmd.pos.y, text.text.c_str(), nullptr);
+                        }
                         break;
                     }
                     case RenderType::Image: {
@@ -2942,8 +3138,103 @@ int main(int, char *[]) {
             }
         });
 
+    // X11 window outline rendering system - draws X11 window outlines on top of VNC texture
+    auto x11OutlineRenderSystem = world.system<VNCClient, Position, ImageRenderable>()
+        .term_at(1).second<Local>()
+        .kind(flecs::PostUpdate)
+        .each([&](flecs::entity e, VNCClient& vnc, Position& localPos, ImageRenderable& img) {
+            if (!vnc.connected || !vnc.client) return;
+
+            // TODO: Query to determine what VNC Streams that there are that are visible in Editor VNCStream type
+
+            // TODO: There are no longer quadrants, this is an outdated and no longer acceptable
+            // model of how multiple VNC containers are identified
+            
+            // Get X11 container for this quadrant
+            std::string containerName = "X11Container" + std::to_string(vnc.quadrant);
+            auto container = world.lookup(containerName.c_str());
+            if (!container.is_alive()) return;
+
+            const X11Container* containerComp = container.try_get<X11Container>();
+            if (!containerComp || containerComp->last_update_timestamp.empty()) {
+                static int frameCount[4] = {0};
+                if (frameCount[vnc.quadrant]++ % 300 == 0) {  // Log every 300 frames (~5 sec at 60fps)
+                    std::cout << "[X11 Render] Container " << vnc.quadrant << " has no data" << std::endl;
+                }
+                return;
+            }
+
+            // Calculate scale factor from VNC coordinates to shephleetess screen coordinates
+            float scale_x = img.width / (float)vnc.width;
+            float scale_y = img.height / (float)vnc.height;
+
+            Position worldPos = e.get<Position, World>();
+            RenderQueue& queue = world.ensure<RenderQueue>();
+
+            // Query all visible windows in this container
+            auto windows = world.query_builder<X11WindowInfo, X11WindowBounds, X11WindowVisibility>()
+                .with<X11VisibleWindow>()
+                .with(flecs::ChildOf, container)
+                .build();
+
+            static int debugFrameCount = 0;
+            if (debugFrameCount++ % 60 == 0) {  // Log once per second at 60fps
+                int window_count = 0;
+                windows.each([&](flecs::entity, X11WindowInfo&, X11WindowBounds&, X11WindowVisibility&) { window_count++; });
+                LOG_DEBUG(LogCategory::X11_OUTLINE, "Quadrant {} has {} windows", vnc.quadrant, window_count);
+            }
+
+            // Render each visible window outline
+            windows.each([&](flecs::entity win_e,
+                            X11WindowInfo& info,
+                            X11WindowBounds& bounds,
+                            X11WindowVisibility& vis) {
+                // Map X11 window coordinates to shephleetess screen coordinates
+                float win_x = worldPos.x + (bounds.x * scale_x);
+                float win_y = worldPos.y + (bounds.y * scale_y);
+                float win_w = bounds.width * scale_x;
+                float win_h = bounds.height * scale_y;
+
+                // Bright red outline color
+                uint32_t outline_color = 0xe85d20ff;
+
+                float outline_thickness = 1.0f;  // Increased thickness for visibility
+
+                // Draw window outline (top, bottom, left, right) at very high Z-index
+                queue.addRectCommand(
+                    {win_x, win_y},
+                    {win_w, outline_thickness, true, outline_color},
+                    2000  // Very high Z-index to ensure visibility above everything
+                );
+                queue.addRectCommand(
+                    {win_x, win_y + win_h - outline_thickness},
+                    {win_w, outline_thickness, true, outline_color},
+                    2000
+                );
+                queue.addRectCommand(
+                    {win_x, win_y},
+                    {outline_thickness, win_h, true, outline_color},
+                    2000
+                );
+                queue.addRectCommand(
+                    {win_x + win_w - outline_thickness, win_y},
+                    {outline_thickness, win_h, true, outline_color},
+                    2000
+                );
+
+                // Optionally, draw window name if visibility is high enough
+                // if (vis.visibility_percent > 50.0f && !info.name.empty()) {
+                //     queue.addTextCommand(
+                //         {win_x + 4.0f, win_y + 16.0f},  // Small offset from top-left corner
+                //         {info.name, "sans", 12.0f, 0xFFFFFFFF, NVG_ALIGN_LEFT | NVG_ALIGN_TOP},
+                //         2001  // Z-index above outline
+                //     );
+                // }
+            });
+        });
+
     int fontHandle = nvgCreateFont(vg, "ATARISTOCRAT", "../assets/ATARISTOCRAT.ttf");
-    int interFontHandle = nvgCreateFont(vg, "Inter", "../assets/OpenSans-Regular.ttf");
+    int interFontHandle = nvgCreateFont(vg, "Inter", "../assets/CharisSIL-Regular.ttf");
 
     while (!glfwWindowShouldClose(window)) {
         processInput(window);
