@@ -32,7 +32,6 @@ struct X11WindowVisibility {
 // Container component for X11 quadrants
 struct X11Container {
     std::string container_id;
-    int quadrant;  // 0-3
     X11WindowBounds screen;
     X11WindowBounds work_area;
     bool has_work_area;
@@ -45,22 +44,22 @@ struct X11VisibleWindow {};
 // Tag to mark X11 window entities as special windows
 struct X11SpecialWindow {};
 
+struct X11WindowData {
+    std::string id;
+    std::string name;
+    X11WindowBounds bounds;
+    int z_order;
+    int visible_pixels;
+    int onscreen_pixels;
+    float visibility_percent;
+};
+
 // Temporary structure for parsing JSON (not an ECS component)
 struct X11OutlineData {
     std::string container_id;
     std::string timestamp;
-    int quadrant;
-    struct WindowData {
-        std::string id;
-        std::string name;
-        X11WindowBounds bounds;  // clipped bounds
-        int z_order;
-        int visible_pixels;
-        int onscreen_pixels;
-        float visibility_percent;
-    };
-    std::vector<WindowData> visible_windows;
-    std::vector<WindowData> special_windows;
+    std::vector<X11WindowData> visible_windows;
+    std::vector<X11WindowData> special_windows;
     X11WindowBounds screen;
     X11WindowBounds work_area;
     bool has_work_area;
@@ -93,23 +92,6 @@ struct X11OutlineServer {
 
     X11OutlineServer() : port(5299), running(false), queue(nullptr) {}
 };
-
-// Parse container ID to quadrant (plasma-vnc-1 -> 0, plasma-vnc-2 -> 1, etc.)
-inline int container_id_to_quadrant(const std::string& container_id) {
-    // Check for full container name format
-    if (container_id.find("plasma-vnc-1") != std::string::npos) return 0;
-    if (container_id.find("plasma-vnc-2") != std::string::npos) return 1;
-    if (container_id.find("plasma-vnc-3") != std::string::npos) return 2;
-    if (container_id.find("plasma-vnc-4") != std::string::npos) return 3;
-
-    // Check for simple numeric format (1 -> 0, 2 -> 1, etc.)
-    if (container_id == "1") return 0;
-    if (container_id == "2") return 1;
-    if (container_id == "3") return 2;
-    if (container_id == "4") return 3;
-
-    return -1;  // Unknown container
-}
 
 // Module export
 void X11OutlineModule(flecs::world& ecs);

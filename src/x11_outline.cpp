@@ -7,6 +7,8 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 
+#include "vnc_struct.h"
+
 // Simple JSON parser for our specific format
 X11OutlineData parse_x11_json(const std::string& json_str) {
     X11OutlineData data;
@@ -44,7 +46,6 @@ X11OutlineData parse_x11_json(const std::string& json_str) {
     // Extract basic info
     data.container_id = extract_string(json_str, "container_id");
     data.timestamp = extract_string(json_str, "timestamp");
-    data.quadrant = container_id_to_quadrant(data.container_id);
 
     // Extract screen dimensions
     data.screen.width = extract_int(json_str, "width");
@@ -79,7 +80,7 @@ X11OutlineData parse_x11_json(const std::string& json_str) {
 
             std::string win_str = vw_section.substr(pos, end - pos + 1);
 
-            X11OutlineData::WindowData win;
+            X11WindowData win;
             win.id = extract_string(win_str, "id");
             win.name = extract_string(win_str, "name");
             win.z_order = extract_int(win_str, "z_order");
@@ -174,8 +175,8 @@ void socket_server_thread(flecs::world* ecs, int port, std::atomic<bool>* runnin
             // Parse JSON
             X11OutlineData outline_data = parse_x11_json(json_str);
 
-            LOG_DEBUG(LogCategory::X11_OUTLINE, "Received data from {} (quadrant {}) with {} windows",
-                     outline_data.container_id, outline_data.quadrant, outline_data.visible_windows.size());
+            LOG_DEBUG(LogCategory::X11_OUTLINE, "Received data from {} with {} windows",
+                     outline_data.container_id, outline_data.visible_windows.size());
 
             // Push to thread-safe queue for processing by Flecs system
             queue->push(outline_data);
@@ -206,13 +207,6 @@ void X11OutlineModule(flecs::world& ecs) {
     ecs.component<X11SpecialWindow>();
     LOG_DEBUG(LogCategory::X11_OUTLINE, "Components registered");
 
-    // Create container entities for each quadrant
-    ecs.entity("X11Container0").set<X11Container>({});
-    ecs.entity("X11Container1").set<X11Container>({});
-    ecs.entity("X11Container2").set<X11Container>({});
-    ecs.entity("X11Container3").set<X11Container>({});
-    LOG_DEBUG(LogCategory::X11_OUTLINE, "Container entities created");
-
     // Create queue as a static variable (shared between thread and system)
     static X11OutlineQueue global_queue;
 
@@ -229,85 +223,70 @@ void X11OutlineModule(flecs::world& ecs) {
     server.server_thread = std::thread(socket_server_thread, &ecs, server.port, running_flag, server.queue);
 
     // Add system to process queued X11 outline data
-    ecs.system()
+    ecs.system<X11Container>()
         .kind(flecs::PreUpdate)
-        .each([&]() {
+        .each([&](flecs::entity e, X11Container& container_comp) {
             auto pending_updates = global_queue.pop_all();
-
-            // Get quadrant container entities
-            auto q0 = ecs.lookup("X11Container0");
-            auto q1 = ecs.lookup("X11Container1");
-            auto q2 = ecs.lookup("X11Container2");
-            auto q3 = ecs.lookup("X11Container3");
-
+            
             for (const auto& outline_data : pending_updates) {
-                // Update appropriate quadrant container
-                flecs::entity container;
-                if (outline_data.quadrant == 0 && q0.is_alive()) container = q0;
-                else if (outline_data.quadrant == 1 && q1.is_alive()) container = q1;
-                else if (outline_data.quadrant == 2 && q2.is_alive()) container = q2;
-                else if (outline_data.quadrant == 3 && q3.is_alive()) container = q3;
+                if (outline_data.container_id != "1") continue;
+                std::cout << "Container id is " << outline_data.container_id << std::endl;
 
-                if (container.is_alive()) {
-                    // Update container info
-                    auto& container_comp = container.ensure<X11Container>();
-                    container_comp.container_id = outline_data.container_id;
-                    container_comp.quadrant = outline_data.quadrant;
-                    container_comp.screen = outline_data.screen;
-                    container_comp.work_area = outline_data.work_area;
-                    container_comp.has_work_area = outline_data.has_work_area;
-                    container_comp.last_update_timestamp = outline_data.timestamp;
+                container_comp.container_id = outline_data.container_id;
+                container_comp.screen = outline_data.screen;
+                container_comp.work_area = outline_data.work_area;
+                container_comp.has_work_area = outline_data.has_work_area;
+                container_comp.last_update_timestamp = outline_data.timestamp;
 
-                    // Clear old window entities for this container
-                    auto old_windows = ecs.query_builder()
-                        .with(flecs::ChildOf, container)
-                        .build();
-                    old_windows.each([](flecs::entity e) {
-                        e.destruct();
+                // Clear old window entities for this container
+                auto old_windows = ecs.query_builder()
+                    .with(flecs::ChildOf, e)
+                    .build();
+                old_windows.each([](flecs::entity e) {
+                    e.destruct();
+                });
+
+                // Create window entities for visible windows
+                for (const auto& win_data : outline_data.visible_windows) {
+                    auto win_entity = ecs.entity()
+                        .child_of(e)
+                        .add<X11VisibleWindow>();
+
+                    // Set window info
+                    auto& info = win_entity.ensure<X11WindowInfo>();
+                    info.id = win_data.id;
+                    info.name = win_data.name;
+                    info.z_order = win_data.z_order;
+
+                    // Set window bounds
+                    win_entity.set<X11WindowBounds>(win_data.bounds);
+
+                    // Set visibility metrics
+                    win_entity.set<X11WindowVisibility>({
+                        win_data.visible_pixels,
+                        win_data.onscreen_pixels,
+                        win_data.visibility_percent
                     });
+                }
 
-                    // Create window entities for visible windows
-                    for (const auto& win_data : outline_data.visible_windows) {
-                        auto win_entity = ecs.entity()
-                            .child_of(container)
-                            .add<X11VisibleWindow>();
+                // Create window entities for special windows
+                for (const auto& win_data : outline_data.special_windows) {
+                    auto win_entity = ecs.entity()
+                        .child_of(e)
+                        .add<X11SpecialWindow>();
 
-                        // Set window info
-                        auto& info = win_entity.ensure<X11WindowInfo>();
-                        info.id = win_data.id;
-                        info.name = win_data.name;
-                        info.z_order = win_data.z_order;
+                    auto& info = win_entity.ensure<X11WindowInfo>();
+                    info.id = win_data.id;
+                    info.name = win_data.name;
+                    info.z_order = win_data.z_order;
 
-                        // Set window bounds
-                        win_entity.set<X11WindowBounds>(win_data.bounds);
+                    win_entity.set<X11WindowBounds>(win_data.bounds);
 
-                        // Set visibility metrics
-                        win_entity.set<X11WindowVisibility>({
-                            win_data.visible_pixels,
-                            win_data.onscreen_pixels,
-                            win_data.visibility_percent
-                        });
-                    }
-
-                    // Create window entities for special windows
-                    for (const auto& win_data : outline_data.special_windows) {
-                        auto win_entity = ecs.entity()
-                            .child_of(container)
-                            .add<X11SpecialWindow>();
-
-                        auto& info = win_entity.ensure<X11WindowInfo>();
-                        info.id = win_data.id;
-                        info.name = win_data.name;
-                        info.z_order = win_data.z_order;
-
-                        win_entity.set<X11WindowBounds>(win_data.bounds);
-
-                        win_entity.set<X11WindowVisibility>({
-                            win_data.visible_pixels,
-                            win_data.onscreen_pixels,
-                            win_data.visibility_percent
-                        });
-                    }
+                    win_entity.set<X11WindowVisibility>({
+                        win_data.visible_pixels,
+                        win_data.onscreen_pixels,
+                        win_data.visibility_percent
+                    });
                 }
             }
         });

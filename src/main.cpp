@@ -244,29 +244,7 @@ public:
 // Global vision processing job queue
 static VisionJobQueue g_visionQueue;
 
-struct VNCClient {
-    rfbClient* client = nullptr;
-    SDL_Surface* surface = nullptr;
-    bool connected = false;
-    std::string host;
-    int port;
-    int width = 0;
-    int height = 0;
-    int quadrant = 0;  // Which quadrant this client belongs to (0-3)
-};
-
-struct VNCUpdateRect {
-    int x, y, w, h;
-};
-
-struct VNCTexture {
-    GLuint texture = 0;
-    int nvgHandle = -1;
-    int width = 0;
-    int height = 0;
-    bool needsUpdate = false;
-    std::vector<VNCUpdateRect> dirtyRects;  // Track which regions need updating
-};
+#include "vnc_struct.h"
 
 /*
 These luminous phenomena still manifest themselves
@@ -761,15 +739,16 @@ static rfbBool vnc_resize_callback(rfbClient* client) {
 
 static void vnc_update_callback(rfbClient* client, int x, int y, int w, int h) {
     // Mark texture region for update in ECS - find the texture for this specific client
-    auto query = world.query<VNCClient, VNCTexture>();
+    auto query = world.query<VNCClient>();
     int updateCount = 0;
-    query.each([&](flecs::entity e, VNCClient& vnc, VNCTexture& tex) {
+    query.each([&](flecs::entity e, VNCClient& vnc) {
         if (vnc.client == client) {
             // Add the dirty rectangle to the update queue
-            tex.dirtyRects.push_back({x, y, w, h});
-            tex.needsUpdate = true;
+            std::lock_guard<std::mutex> lock(*vnc.surfaceMutex);
+            vnc.dirtyRects.push_back({x, y, w, h});
+            vnc.needsUpdate = true;
             updateCount++;
-            LOG_TRACE(LogCategory::VNC_CLIENT, "Added dirty rect total rects: {}", tex.dirtyRects.size());
+            LOG_TRACE(LogCategory::VNC_CLIENT, "Added dirty rect total rects: {}", vnc.dirtyRects.size());
         }
     });
 }
@@ -915,6 +894,44 @@ std::vector<std::string> editor_types =
     "Bookshelf",
 };
 
+struct VNCData
+{
+    flecs::entity vnc_stream;
+    VNCClient client;
+};
+
+VNCData get_vnc_source(flecs::world& world, const std::string& host, int port) {
+    std::string addr = host + ":" + std::to_string(port);
+    
+    // 1. Check if we already have this connection
+    auto existing = world.lookup(addr.c_str());
+    if (existing && existing.has<VNCClient>()) {
+        existing.ensure<VNCClient>().reference_count++;
+        return {existing, existing.ensure<VNCClient>()};
+    }
+
+    // 2. Otherwise, create a new one
+    rfbClient* client = connectToTurboVNC(host.c_str(), port);
+    // if (!client) return flecs::entity::null();
+
+    SDL_Surface* surface = (SDL_Surface*)rfbClientGetClientData(client, (void*)VNC_SURFACE_TAG);
+
+    // Create OpenGL texture for VNC framebuffer
+    GLuint vncTexture;
+    glGenTextures(1, &vncTexture);
+    glBindTexture(GL_TEXTURE_2D, vncTexture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, client->width, client->height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+    int nvgVNCHandle = nvglCreateImageFromHandleGL2(world.try_get<Graphics>()->vg, vncTexture, client->width, client->height, 0);
+    
+    // Create an entity to hold the shared VNC state
+    VNCClient client_data = {client, surface, vncTexture, nvgVNCHandle, true, false, host, port, client->width, client->height, 1, std::make_shared<std::mutex>()};
+    flecs::entity created = world.entity(addr.c_str())
+        .set<VNCClient>(client_data);
+    return {created, client_data};
+}
 
 // Factory function to populate editor content, whether the panel is initialized or changed
 void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::entity UIElement)
@@ -1281,6 +1298,12 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         world.entity()
         .is_a(UIElement)
         .child_of(badges)
+        .set<ImageCreator>({"../assets/plasma-productivity-1_badge.png", 1.0f, 1.0f})
+        .set<ZIndex>({20});
+
+        world.entity()
+        .is_a(UIElement)
+        .child_of(badges)
         .set<ImageCreator>({"../assets/kubuntu_badge.png", 1.0f, 1.0f})
         .set<ZIndex>({20});
 
@@ -1306,43 +1329,20 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         int port = 5901;
         std::string host_string = std::string(vnc_host) + ":" + std::to_string(port);
 
-        rfbClient* vncClient = connectToTurboVNC(vnc_host, port);
-        if (vncClient) {
-            std::cout << "[VNC] VNC client connected successfully" << std::endl;
-            SDL_Surface* surface = (SDL_Surface*)rfbClientGetClientData(vncClient, (void*)VNC_SURFACE_TAG);
-            
-            // Create OpenGL texture for VNC framebuffer
-            GLuint vncTexture;
-            glGenTextures(1, &vncTexture);
-            glBindTexture(GL_TEXTURE_2D, vncTexture);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, vncClient->width, vncClient->height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-            
-            // Create NanoVG image from OpenGL texture
-            int nvgVNCHandle = nvglCreateImageFromHandleGL2(world.try_get<Graphics>()->vg, vncTexture, vncClient->width, vncClient->height, 0);
-            
-            flecs::entity vnc_entity = world.entity()
-            .is_a(UIElement)
-            .set<VNCTexture>({vncTexture, nvgVNCHandle, vncClient->width, vncClient->height, false})
-            .set<ImageRenderable>({nvgVNCHandle, 1.0f, 1.0f, vncClient->width, vncClient->height})
-            .set<VNCClient>({
-                vncClient,
-                surface,
-                true,
-                vnc_host,
-                port,
-                vncClient->width,
-                vncClient->height,
-                0
-            })
-            .set<ZIndex>({9})
-            .set<Expand>({true, 0.0f, 0.0f, 1.0f, false, 0, 0, 0})
-            .set<Constrain>({true, true})
-            .set<Align>({-0.5f, -0.5f, 0.5f, 0.5f})
-            // .add<DebugRenderBounds>()
-            .child_of(leaf.target<EditorCanvas>());
-        }
+        VNCData data = get_vnc_source(world, vnc_host, port);
+        // const VNCClient* vncClient = vncStreamSource.try_get<VNCClient>();
+
+        flecs::entity vnc_entity = world.entity()
+        .is_a(UIElement)
+        .add<IsStreamingFrom>(data.vnc_stream)
+        .set<ImageRenderable>({data.client.nvgHandle, 1.0f, 1.0f, (float)data.client.width, (float)data.client.height})
+        .set<ZIndex>({9})
+        .set<Expand>({true, 0.0f, 0.0f, 1.0f, false, 0, 0, 0})
+        .set<Constrain>({true, true})
+        .set<Align>({-0.5f, -0.5f, 0.5f, 0.5f})
+        // .add<DebugRenderBounds>()
+        .add<X11Container>()
+        .child_of(leaf.target<EditorCanvas>());
 
 
     } else
@@ -2988,11 +2988,8 @@ int main(int, char *[]) {
         .kind(flecs::PreUpdate)
         .each([](flecs::iter& it, size_t i, VNCClient& vnc) {
             static bool initialized[1] = {false};
-            if (!initialized[vnc.quadrant] && vnc.connected && vnc.client) {
-                std::cout << "[VNC INIT] Requesting full framebuffer update for quadrant " << vnc.quadrant << "..." << std::endl;
+            if (!vnc.initialized && vnc.connected && vnc.client) {
                 SendFramebufferUpdateRequest(vnc.client, 0, 0, vnc.client->width, vnc.client->height, FALSE);
-                initialized[vnc.quadrant] = true;
-                std::cout << "[VNC INIT] Initial update request sent for quadrant " << vnc.quadrant << " " << vnc.client->width << "x" << vnc.client->height << std::endl;
             }
         });
 
@@ -3008,36 +3005,36 @@ int main(int, char *[]) {
             if (result > 0) {
                 // Message available, process it
                 if (!HandleRFBServerMessage(vnc.client)) {
-                    LOG_ERROR(LogCategory::VNC_CLIENT, "Failed to handle VNC message for quadrant {}", vnc.quadrant);
+                    LOG_ERROR(LogCategory::VNC_CLIENT, "Failed to handle VNC message for quadrant {}", vnc.toString());
                 }
             } else if (result < 0) {
-                LOG_ERROR(LogCategory::VNC_CLIENT, "VNC connection error for quadrant {}", vnc.quadrant);
+                LOG_ERROR(LogCategory::VNC_CLIENT, "VNC connection error for quadrant {}", vnc.toString());
                 vnc.connected = false;
             }
             // result == 0 means no messages, which is fine
         });
 
-    auto vncTextureUpdateSystem = world.system<VNCClient, VNCTexture>()
+    auto vncTextureUpdateSystem = world.system<VNCClient>()
         .kind(flecs::OnUpdate)
-        .each([](flecs::entity e, VNCClient& vnc, VNCTexture& tex) {
+        .each([](flecs::entity e, VNCClient& vnc) {
             if (!vnc.connected || !vnc.client) {
                 static bool warned = false;
                 LOG_DEBUG(LogCategory::VNC_CLIENT, "Client not connected or null");
                 return;
             }
-            
-            if (!tex.needsUpdate) return;
+            if (!vnc.needsUpdate) return;
+            std::lock_guard<std::mutex> lock(*vnc.surfaceMutex);
             std::cout << "VNC Texture Update System" << std::endl;
             
-            LOG_TRACE(LogCategory::VNC_CLIENT, "Updating OpenGL texture {} for quadrant {}", tex.texture, vnc.quadrant);
+            LOG_TRACE(LogCategory::VNC_CLIENT, "Updating OpenGL texture {} for quadrant {}", vnc.vncTexture, vnc.toString());
 
             SDL_Surface* surface = (SDL_Surface*)rfbClientGetClientData(vnc.client, (void*)VNC_SURFACE_TAG);
             if (surface && surface->pixels) {
                 // Submit vision processing job to background thread instead of blocking
                 VisionProcessingJob job;
-                job.quadrant = vnc.quadrant;
+                job.quadrant = (int)e.raw_id(); // TODO: Fucking rename
                 job.paletteFile = "../assets/palettes/resurrect-64.hex";
-                job.outputPath = "/tmp/vision_quad_" + std::to_string(vnc.quadrant) + ".png";
+                job.outputPath = "/tmp/vision_" + std::to_string(e.raw_id()) + ".png";
                 job.width = surface->w;
                 job.height = surface->h;
                 job.pitch = surface->pitch;
@@ -3048,14 +3045,14 @@ int main(int, char *[]) {
                 memcpy(job.pixelData.data(), surface->pixels, dataSize);
 
                 g_visionQueue.submit(job);
-                LOG_TRACE(LogCategory::VNC_CLIENT, "Submitted vision processing job for quadrant {}", vnc.quadrant);
+                LOG_TRACE(LogCategory::VNC_CLIENT, "Submitted vision processing job for quadrant {}", vnc.toString());
 
 
-                LOG_TRACE(LogCategory::VNC_CLIENT, "Processing {} dirty rectangles", tex.dirtyRects.size());
+                LOG_TRACE(LogCategory::VNC_CLIENT, "Processing {} dirty rectangles", vnc.dirtyRects.size());
                 LOG_TRACE(LogCategory::VNC_CLIENT, "Surface info: {}x{}, format: {}", surface->w, surface->h, SDL_GetPixelFormatName(surface->format->format));
 
                 // Update OpenGL texture from SDL surface pixels
-                glBindTexture(GL_TEXTURE_2D, tex.texture);
+                glBindTexture(GL_TEXTURE_2D, vnc.vncTexture);
 
                 // Set pixel unpack alignment to handle pitch correctly
                 int bytesPerPixel = surface->format->BytesPerPixel;
@@ -3082,7 +3079,7 @@ int main(int, char *[]) {
                 LOG_TRACE(LogCategory::VNC_CLIENT, "Using OpenGL format: {}", (format == GL_BGRA ? "BGRA" : "RGBA"));
 
                 // Process each dirty rectangle
-                for (const auto& rectIn : tex.dirtyRects) {
+                for (const auto& rectIn : vnc.dirtyRects) {
                     // Clamp rect to surface/texture bounds to be safe
                     int rx = std::max(0, rectIn.x);
                     int ry = std::max(0, rectIn.y);
@@ -3129,40 +3126,36 @@ int main(int, char *[]) {
                 // }
 
                 // Clear dirty rects and mark as updated
-                tex.dirtyRects.clear();
-                tex.needsUpdate = false;
+                vnc.dirtyRects.clear();
+                vnc.needsUpdate = false;
 
-                std::cout << "Updated tVNC texture " << std::endl;
+                std::cout << "Updated VNC texture " << std::endl;
             } else {
                 LOG_ERROR(LogCategory::VNC_CLIENT, "Surface or pixels is null");
             }
         });
 
     // X11 window outline rendering system - draws X11 window outlines on top of VNC texture
-    auto x11OutlineRenderSystem = world.system<VNCClient, Position, ImageRenderable>()
+    auto x11OutlineRenderSystem = world.system<X11Container, Position, ImageRenderable>()
         .term_at(1).second<Local>()
         .kind(flecs::PostUpdate)
-        .each([&](flecs::entity e, VNCClient& vnc, Position& localPos, ImageRenderable& img) {
+        .immediate()
+        .with<IsStreamingFrom>(flecs::Wildcard)
+        .each([&](flecs::entity e, X11Container& container, Position& localPos, ImageRenderable& img) {
+            flecs::entity vnc_entity = e.target<IsStreamingFrom>();
+            VNCClient& vnc = vnc_entity.ensure<VNCClient>();
             if (!vnc.connected || !vnc.client) return;
+
+            std::cout << "Lets update VNC for " << e << std::endl;
 
             // TODO: Query to determine what VNC Streams that there are that are visible in Editor VNCStream type
 
             // TODO: There are no longer quadrants, this is an outdated and no longer acceptable
             // model of how multiple VNC containers are identified
-            
-            // Get X11 container for this quadrant
-            std::string containerName = "X11Container" + std::to_string(vnc.quadrant);
-            auto container = world.lookup(containerName.c_str());
-            if (!container.is_alive()) return;
-
-            const X11Container* containerComp = container.try_get<X11Container>();
-            if (!containerComp || containerComp->last_update_timestamp.empty()) {
-                static int frameCount[4] = {0};
-                if (frameCount[vnc.quadrant]++ % 300 == 0) {  // Log every 300 frames (~5 sec at 60fps)
-                    std::cout << "[X11 Render] Container " << vnc.quadrant << " has no data" << std::endl;
-                }
-                return;
-            }
+            // if (container.last_update_timestamp.empty()) {
+            //     std::cout << "[X11 Render] Container " << vnc << " has no data" << std::endl;
+            //     return;
+            // }
 
             // Calculate scale factor from VNC coordinates to shephleetess screen coordinates
             float scale_x = img.width / (float)vnc.width;
@@ -3174,14 +3167,14 @@ int main(int, char *[]) {
             // Query all visible windows in this container
             auto windows = world.query_builder<X11WindowInfo, X11WindowBounds, X11WindowVisibility>()
                 .with<X11VisibleWindow>()
-                .with(flecs::ChildOf, container)
+                .with(flecs::ChildOf, e)
                 .build();
 
             static int debugFrameCount = 0;
             if (debugFrameCount++ % 60 == 0) {  // Log once per second at 60fps
                 int window_count = 0;
                 windows.each([&](flecs::entity, X11WindowInfo&, X11WindowBounds&, X11WindowVisibility&) { window_count++; });
-                LOG_DEBUG(LogCategory::X11_OUTLINE, "Quadrant {} has {} windows", vnc.quadrant, window_count);
+                LOG_DEBUG(LogCategory::X11_OUTLINE, "VNC has {} windows", vnc.toString(), window_count);
             }
 
             // Render each visible window outline
