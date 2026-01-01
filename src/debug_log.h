@@ -57,7 +57,7 @@ private:
             if (pair.first == LogCategory::X11_OUTLINE ||
                 pair.first == LogCategory::BLENDER_PANEL) {
                 logger->set_level(spdlog::level::debug);  // Show DEBUG logs for OCR
-            } else if (pair.first == LogCategory::SERVER_LAUNCHER ||
+            } else if (pair.first == LogCategory::X11_OUTLINE ||
                        pair.first == LogCategory::SYSTEM) {
                 logger->set_level(spdlog::level::info);
             } else {

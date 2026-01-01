@@ -328,6 +328,8 @@ struct HorizontalLayoutBox
   float move_dir = 1; // Right
 };
 
+struct FitChildren {};
+
 struct VerticalLayoutBox 
 {
   float y_progress;
@@ -335,6 +337,11 @@ struct VerticalLayoutBox
   float move_dir = 1; // Down
 };
 
+struct RenderGradient
+{
+    uint32_t start;
+    uint32_t end;
+};
 
 struct RectRenderable {
     float width, height;
@@ -458,7 +465,7 @@ struct TextRenderable {
     std::string fontFace;
     float fontSize;
     uint32_t color;
-    int alignment;
+    float scaleY = 1.0f;
     float wrapWidth = 0.0f;  // 0 = no wrapping, >0 = wrap at this width
 };
 
@@ -509,6 +516,14 @@ struct HoverEnterEvent {};
 struct AddTagOnHoverExit {};
 struct HoverExitEvent {};
 
+struct ServerHUDOverlay {};
+struct ServerDescription
+{
+    ecs_entity_t selected;
+};
+struct ShowServerHUDOverlay {};
+struct HideServerHUDOverlay {};
+
 struct CloseEditorSelector {};
 struct SetMenuHighlightColor {};
 struct SetMenuStandardColor {};
@@ -555,6 +570,7 @@ enum class EditorType
     Hearing,
     Memory,
     Bookshelf,
+    Episodic,
     // Bookshelf,
     // MelSpectrogram,
     // VNCStream,
@@ -637,11 +653,22 @@ struct Expand
     bool cap_to_intrinsic = false;
 };
 
+struct UIContainer
+{
+    int pad_horizontal;
+    int pad_vertical;
+};
+
 // Post expand layer to 'fit within editor panel bounds'
 struct Constrain
 {
     bool fit_x; // Scale x to fit within bounds (maintain ratio)
     bool fit_y; // Scale y to fit within bounds (maintain ratio)
+};
+
+struct ProportionalConstraint {
+    float max_width;
+    float max_height;
 };
 
 struct EditorLeafData
@@ -680,6 +707,28 @@ enum class RenderType {
 };
 
 flecs::world world;
+
+void calculate_recursive_bounds(flecs::entity parent, UIElementBounds& total_bounds, bool& first) {
+    // Iterate over all children of this entity
+    parent.children([&](flecs::entity child) {
+        if (child.has<UIElementBounds>() && !child.has<Expand>()) {
+            const auto* child_bounds = child.try_get<UIElementBounds>();
+            
+            if (first) {
+                total_bounds = *child_bounds;
+                first = false;
+            } else {
+                if (child_bounds->xmin < total_bounds.xmin) total_bounds.xmin = child_bounds->xmin;
+                if (child_bounds->ymin < total_bounds.ymin) total_bounds.ymin = child_bounds->ymin;
+                if (child_bounds->xmax > total_bounds.xmax) total_bounds.xmax = child_bounds->xmax;
+                if (child_bounds->ymax > total_bounds.ymax) total_bounds.ymax = child_bounds->ymax;
+            }
+        }
+        
+        // Recurse deeper if the child itself has children
+        calculate_recursive_bounds(child, total_bounds, first);
+    });
+}
 
 // VNC Stream
 
@@ -789,6 +838,113 @@ rfbClient* connectToTurboVNC(const char* host, int port) {
 
 // End VNC Stream
 
+#include <algorithm>
+
+// Helper to convert hex RGBA (0xRRGGBBAA) to NVGcolor
+NVGcolor nvgRGBA8(uint32_t hex) {
+    return nvgRGBA(
+        (uint8_t)(hex >> 24), 
+        (uint8_t)(hex >> 16), 
+        (uint8_t)(hex >> 8), 
+        (uint8_t)(hex)
+    );
+}
+
+// Helper to scale a hex color (RGBA) by a factor
+uint32_t scale_color(uint32_t hex, float factor, uint8_t override_alpha = 0) {
+    uint8_t r = (uint8_t)((hex >> 24) & 0xFF);
+    uint8_t g = (uint8_t)((hex >> 16) & 0xFF);
+    uint8_t b = (uint8_t)((hex >> 8) & 0xFF);
+    uint8_t a = (override_alpha > 0) ? override_alpha : (uint8_t)(hex & 0xFF);
+
+    auto clamp = [](float val) { 
+        return (uint8_t)std::min(255.0f, std::max(0.0f, val)); 
+    };
+
+    return (clamp(r * factor) << 24) | 
+           (clamp(g * factor) << 16) | 
+           (clamp(b * factor) << 8)  | 
+           a;
+}
+
+inline NVGcolor uintToNvgColor(uint32_t hex) {
+    return nvgRGBA(
+        (uint8_t)((hex >> 24) & 0xFF), // Red
+        (uint8_t)((hex >> 16) & 0xFF), // Green
+        (uint8_t)((hex >> 8)  & 0xFF), // Blue
+        (uint8_t)(hex & 0xFF)         // Alpha
+    );
+}
+
+flecs::entity create_popup(flecs::entity parent)
+{
+    flecs::entity UIElement = world.lookup("UIElement");
+
+    // UIElementSiz parent_size = parent.try_get<UIElementSize>();
+
+    flecs::entity ui_popup = world.entity()
+        .is_a(UIElement)
+        .child_of(parent)
+        // TODO: We should add a tag to indicate that we don't want to bubble up bounds...
+        .set<Align>({0.0f, 0.0f, 0.0f, 1.0f})
+        .set<RectRenderable>({64.0f, 96.0f, true, 0xFFFFFFFF})
+        .set<ZIndex>({100});
+
+    return ui_popup;
+}
+
+flecs::entity create_badge(flecs::entity parent, flecs::entity UIElement, 
+                           const char* text, uint32_t base_color, 
+                           bool is_capsule = false) {
+    
+    // --- 1. Color Logic (matching comp_gen.py) ---
+    uint32_t dark = base_color;
+    uint32_t very_dark = scale_color(base_color, 0.2f);
+    uint32_t light = scale_color(base_color, 1.3f); // Clamped to 255 in scale_color
+    uint32_t white = 0xFFFFFFFF;
+    
+    // Outline: Light variation with 50% alpha (128)
+    uint32_t outline_color = (light & 0xFFFFFF00) | 0x80; 
+
+    // --- 2. Dimensions & Shape ---
+    float corner_radius = 4.0f;
+    float badge_height = 25.0f; // Base height
+    
+    if (is_capsule) {
+        corner_radius = badge_height / 2.0f;
+    }
+
+    // --- 3. Create Entities ---
+    
+    // Main Background
+    // Note: Assuming RoundedRectRenderable supports a flag or type for Arrow shapes
+    auto badge = world.entity()
+        .is_a(UIElement)
+        .child_of(parent)
+        .set<RoundedRectRenderable>({100.0f, badge_height, corner_radius, false, 0x000000FF})
+        .set<RenderGradient>({dark, very_dark}) // Vertical gradient
+        .set<UIContainer>({6, 3})
+        .set<ZIndex>({20});
+
+    // Outline Overlay
+    world.entity()
+        .is_a(UIElement)
+        .child_of(badge)
+        .set<Expand>({true, 0, 0, 1.0f, true, 0, 0, 1.0f})
+        .set<RoundedRectRenderable>({100.0f, badge_height, corner_radius, true, outline_color})
+        .set<ZIndex>({22});
+
+    // Text with Gradient
+    world.entity()
+        .is_a(UIElement)
+        .child_of(badge)
+        .set<Position, Local>({6.0f, 6.0f})
+        .set<TextRenderable>({text, "Inter", 16.0f, white, 1.2f})
+        .set<RenderGradient>({white, light})   // Apply gradient to text
+        .set<ZIndex>({25});
+
+    return badge;
+}
 
 void create_editor(flecs::entity leaf, EditorNodeArea& node_area, flecs::world world, flecs::entity UIElement)
 {
@@ -805,7 +961,8 @@ void create_editor(flecs::entity leaf, EditorNodeArea& node_area, flecs::world w
     auto editor_outline = world.entity()
         .is_a(UIElement)
         .child_of(editor_visual)
-        .set<RoundedRectRenderable>({node_area.width-2, node_area.height-2, 4.0f, true, 0x111222FF})
+        // .set<RoundedRectRenderable>({node_area.width-2, node_area.height-2, 4.0f, true, 0x111222FF})
+        .set<RoundedRectRenderable>({node_area.width-2, node_area.height-2, 4.0f, true, 0x030303FF})
         .set<ZIndex>({5});
 
     leaf.add<EditorOutline>(editor_outline);
@@ -835,7 +992,8 @@ void create_editor(flecs::entity leaf, EditorNodeArea& node_area, flecs::world w
         .is_a(UIElement)
         .child_of(editor_visual)
         .set<Position, Local>({0.0f, 0.0f})
-        .set<RoundedRectRenderable>({0.0f, 22.0f, 4.0f, false, 0x282828FF})
+        // .set<RoundedRectRenderable>({0.0f, 22.0f, 4.0f, false, 0x282828FF})
+        .set<RoundedRectRenderable>({0.0f, 22.0f, 4.0f, false, 0x050505FF})
         .set<Expand>({true, 0.0f, 0.0f, 1.0f, false, 0, 0, 0})
         .set<ZIndex>({2});
 
@@ -892,6 +1050,7 @@ std::vector<std::string> editor_types =
     "Hearing",
     "Memory",
     "Bookshelf",
+    "Episodic",
 };
 
 struct VNCData
@@ -942,8 +1101,18 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
 
         auto server_hud = world.entity("ServerHUD")
         .is_a(UIElement)
-        .set<HorizontalLayoutBox>({0.0f, 2.0f})
+        .set<HorizontalLayoutBox>({0.0f, 0.0f})
+        .add<FitChildren>()
+        .set<Expand>({true, 4.0f, 4.0f, 1.0f, true, 4.0f, 4.0f, 1.0f})
         .add(flecs::OrderedChildren)
+        .child_of(leaf.target<EditorCanvas>());
+
+        auto panel_overlay = world.entity()
+        .is_a(UIElement)
+        .set<ZIndex>({15})
+        .set<Expand>({true, 0.0f, 0.0f, 1.0f, true, 0.0f, 0.0f, 1.0f})
+        .set<RectRenderable>({0.0f, 0.0f, false, 0x000000DD})
+        .add<ServerDescription>()
         .child_of(leaf.target<EditorCanvas>());
 
         std::vector<std::string> server_icons = {"peach_core", "aeri_memory", "flecs", "x11", "parakeet", "chatterbox", "doctr", "huggingface", "dino2", "alpaca", "modal"};
@@ -957,17 +1126,28 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
             { 
                 server_icon = world.entity()
                 .is_a(UIElement)
+                .add<ServerHUDOverlay>(panel_overlay)
+                .add<AddTagOnHoverEnter, ShowServerHUDOverlay>()
+                .add<AddTagOnHoverExit, HideServerHUDOverlay>()
                 .child_of(server_hud)
                 .set<ImageCreator>({"../assets/server_hud/" + icon + ".png", 1.0f, 1.0f})
                 .set<ZIndex>({10})
                 .set<ServerScript>({"chatterbox", "chatterbox", "../chatter_server"})
+                .set<Constrain>({true, true}) 
+                .set<Expand>({false, 4.0f, 4.0f, 1.0f, true, 0.0f, 0.0f, 1.0f, true})
                 .add(ServerStatus::Offline)
+
                 .add<AddTagOnLeftClick, SelectServer>(); 
             } else
             {
                 server_icon = world.entity()
                 .is_a(UIElement)
+                .add<ServerHUDOverlay>(panel_overlay)
+                .add<AddTagOnHoverEnter, ShowServerHUDOverlay>()
+                .add<AddTagOnHoverExit, HideServerHUDOverlay>()
                 .child_of(server_hud)
+                .set<Constrain>({true, true}) 
+                .set<Expand>({false, 4.0f, 4.0f, 1.0f, true, 0.0f, 0.0f, 1.0f, true})
                 .set<ImageCreator>({"../assets/server_hud/" + icon + ".png", 1.0f, 1.0f})
                 .set<ZIndex>({10});
             }
@@ -1035,11 +1215,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         .set<Position, Local>({48.0f, 0.0f})
         .child_of(leaf.target<EditorHeader>());
         
-        world.entity()
-        .is_a(UIElement)
-        .child_of(badges)
-        .set<ImageCreator>({"../assets/healthbar_badge.png", 1.0f, 1.0f})
-        .set<ZIndex>({20});
+        create_badge(badges, UIElement, "Healthbar", 0x61c300ff);
     }
     else if (editor_type == EditorType::Embodiment)
     {
@@ -1058,23 +1234,11 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         .set<Position, Local>({48.0f, 0.0f})
         .child_of(leaf.target<EditorHeader>());
         
-        world.entity()
-        .is_a(UIElement)
-        .child_of(badges)
-        .set<ImageCreator>({"../assets/heonae_badge.png", 1.0f, 1.0f})
-        .set<ZIndex>({20});
-
-        world.entity()
-        .is_a(UIElement)
-        .child_of(badges)
-        .set<ImageCreator>({"../assets/virtual_badge.png", 1.0f, 1.0f})
-        .set<ZIndex>({20});
-
-        world.entity()
-        .is_a(UIElement)
-        .child_of(badges)
-        .set<ImageCreator>({"../assets/physical_badge.png", 1.0f, 1.0f})
-        .set<ZIndex>({20});
+        
+        // create_badge(badges, UIElement, "Heonae", 0xc72783ff);
+        create_badge(badges, UIElement, "Kahlo", 0x782910ff);
+        create_badge(badges, UIElement, "Virtual", 0xe575eeff);
+        create_badge(badges, UIElement, "Physical", 0x619393ff);
         
     }
     else if (editor_type == EditorType::LanguageGame)
@@ -1118,36 +1282,37 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
 
         auto input_text = world.entity()
             .is_a(UIElement)
-            .add<DebugRenderBounds>()
+            // .add<DebugRenderBounds>()
             .child_of(input_panel)
             .set<Position, Local>({8.0f, 8.0f})
-            .set<TextRenderable>({"", "Inter", 16.0f, 0xFFFFFFFF, NVG_ALIGN_TOP | NVG_ALIGN_LEFT})
+            .set<TextRenderable>({"", "Inter", 16.0f, 0xFFFFFFFF})
             .set<ZIndex>({12});
 
         auto message_list = world.entity()
             .is_a(UIElement)
             .child_of(chat_root)
             .add(flecs::OrderedChildren)
-            .add<VerticalLayoutBox>();
+            .set<VerticalLayoutBox>({0.0f, 0.0f, 1.0f});
+
+        auto msg_container = world.entity()
+        .is_a(UIElement)
+        .set<UIContainer>({4, 4})
+        .child_of(message_list);
 
         auto badges = world.entity()
         .is_a(UIElement)
         .set<HorizontalLayoutBox>({0.0f, 2.0f})
         .add(flecs::OrderedChildren)
         // .add<DebugRenderBounds>()
-        .child_of(message_list);
-
-        world.entity()
-        .is_a(UIElement)
-        .child_of(badges)
-        .set<ImageCreator>({"../assets/wesley_badge.png", 1.0f, 1.0f})
-        .set<ZIndex>({20});        
+        .child_of(msg_container);
+        
+        create_badge(badges, UIElement, "Wesley", 0xf5a652ff);
 
         world.entity()
         .is_a(UIElement)
         .child_of(badges)
         .set<Position, Local>({0.0f, 5.0f})
-        .set<TextRenderable>({" types", "Inter", 16.0f, 0xFFFFFFFF, NVG_ALIGN_TOP | NVG_ALIGN_LEFT})
+        .set<TextRenderable>({" types", "Inter", 16.0f, 0xFFFFFFFF})
         .set<ZIndex>({20});   
 
 
@@ -1157,46 +1322,40 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
     else if (editor_type == EditorType::Bookshelf)
     {
         auto bookshelf_layer = world.entity()
-        .is_a(UIElement)
-        .child_of(leaf.target<EditorCanvas>())
-        .set<HorizontalLayoutBox>({0.0f, 8.0f})
-        .set<Expand>({true, 0.0f, 0.0f, 1.0f, true, 0.0f, 0.0f, 1.0f});
+            .is_a(UIElement)
+            .child_of(leaf.target<EditorCanvas>())
+            .set<HorizontalLayoutBox>({0.0f, 8.0f})
+            .add<FitChildren>()
+            .set<Expand>({true, 4.0f, 4.0f, 1.0f, true, 4.0f, 4.0f, 1.0f});
         
-        // TODO: Load from folder target
-        world.entity()
-        .is_a(UIElement)
-        .child_of(bookshelf_layer)
-        .set<ImageCreator>({"../assets/cover_james.jpg", 1.0f, 1.0f})
-        .set<Expand>({false, 4.0f, 4.0f, 1.0f, true, 0.0f, 0.0f, 1.0f})
-        .set<ZIndex>({10});
-    
-        world.entity()
-        .is_a(UIElement)
-        .child_of(bookshelf_layer)
-        .set<ImageCreator>({"../assets/cover_cognitive_theory.jpg", 1.0f, 1.0f})
-        .set<Expand>({false, 4.0f, 4.0f, 1.0f, true, 0.0f, 0.0f, 1.0f})
-        .set<ZIndex>({10});
-    
-        world.entity()
-        .is_a(UIElement)
-        .child_of(bookshelf_layer)
-        .set<ImageCreator>({"../assets/cover_soar.jpg", 1.0f, 1.0f})
-        .set<Expand>({false, 4.0f, 4.0f, 1.0f, true, 0.0f, 0.0f, 1.0f})
-        .set<ZIndex>({10});
-    
-        world.entity()
-        .is_a(UIElement)
-        .child_of(bookshelf_layer)
-        .set<ImageCreator>({"../assets/cover_readings_in_kr.jpg", 1.0f, 1.0f})
-        .set<Expand>({false, 4.0f, 4.0f, 1.0f, true, 0.0f, 0.0f, 1.0f})
-        .set<ZIndex>({10});
+        // 2. Add books with 'Constrain' and 'cap_to_intrinsic'
+        // This ensures they fit within the parent bounds while maintaining aspect ratios
+        std::vector<std::string> covers = {
+            "cover_james.jpg", 
+            "cover_cognitive_theory.jpg", 
+            "cover_soar.jpg", 
+            "cover_readings_in_kr.jpg"
+        };
 
-        world.entity()
-        .is_a(UIElement)
-        .child_of(bookshelf_layer)
-        .set<ImageCreator>({"../assets/cuct.png", 1.0f, 1.0f})
-        .set<Expand>({false, 4.0f, 4.0f, 1.0f, true, 0.0f, 0.0f, 1.0f})
-        .set<ZIndex>({10});
+        for (const auto& cover : covers) {
+            world.entity()
+                .is_a(UIElement)
+                .child_of(bookshelf_layer)
+                .set<ImageCreator>({"../assets/" + cover, 1.0f, 1.0f})
+                // Use Constrain{true, true} to force the image to fit the parent 
+                // width/height without overflowing the EditorCanvas
+                .set<Constrain>({true, true}) 
+                .set<Expand>({false, 4.0f, 4.0f, 1.0f, true, 0.0f, 0.0f, 1.0f, true})
+                .set<ZIndex>({10});
+        }
+
+        // TODO: Papers
+        // world.entity()
+        // .is_a(UIElement)
+        // .child_of(bookshelf_layer)
+        // .set<ImageCreator>({"../assets/cuct.png", 1.0f, 1.0f})
+        // .set<Expand>({false, 4.0f, 4.0f, 1.0f, true, 0.0f, 0.0f, 1.0f})
+        // .set<ZIndex>({10});
     } 
     else if (editor_type == EditorType::Hearing)
     {
@@ -1207,18 +1366,9 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         .set<HorizontalLayoutBox>({0.0f, 2.0f})
         .set<Position, Local>({48.0f, 0.0f})
         .child_of(leaf.target<EditorHeader>());
-        
-        world.entity()
-        .is_a(UIElement)
-        .child_of(badges)
-        .set<ImageCreator>({"../assets/system_badge.png", 1.0f, 1.0f})
-        .set<ZIndex>({20});
 
-        world.entity()
-        .is_a(UIElement)
-        .child_of(badges)
-        .set<ImageCreator>({"../assets/microphone_badge.png", 1.0f, 1.0f})
-        .set<ZIndex>({20});
+        create_badge(badges, UIElement, "System", 0x1361b0ff, false);
+        create_badge(badges, UIElement, "Microphone", 0xc43131ff, false);
 
         // Create vertical layout for mel spectrograms
         auto hearing_layer = world.entity()
@@ -1288,36 +1438,13 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         .set<HorizontalLayoutBox>({0.0f, 2.0f})
         .set<Position, Local>({48.0f, 0.0f})
         .child_of(leaf.target<EditorHeader>());
-        
-        world.entity()
-        .is_a(UIElement)
-        .child_of(badges)
-        .set<ImageCreator>({"../assets/docker_badge.png", 1.0f, 1.0f})
-        .set<ZIndex>({20});
 
-        world.entity()
-        .is_a(UIElement)
-        .child_of(badges)
-        .set<ImageCreator>({"../assets/plasma-productivity-1_badge.png", 1.0f, 1.0f})
-        .set<ZIndex>({20});
-
-        world.entity()
-        .is_a(UIElement)
-        .child_of(badges)
-        .set<ImageCreator>({"../assets/kubuntu_badge.png", 1.0f, 1.0f})
-        .set<ZIndex>({20});
-
-        world.entity()
-        .is_a(UIElement)
-        .child_of(badges)
-        .set<ImageCreator>({"../assets/192.168.1.104_badge.png", 1.0f, 1.0f})
-        .set<ZIndex>({20});
-
-        world.entity()
-        .is_a(UIElement)
-        .child_of(badges)
-        .set<ImageCreator>({"../assets/5901_badge.png", 1.0f, 1.0f})
-        .set<ZIndex>({20});
+        create_badge(badges, UIElement, "Docker", 0x1d60e6ff);
+        create_badge(badges, UIElement, "plasma-productivity-1", 0x9740f6ff, true);
+        create_badge(badges, UIElement, "192.168.1.104", 0xa7a7a7ff, true);
+        create_badge(badges, UIElement, "5901", 0xf64242ff, true);
+        create_badge(badges, UIElement, "Kubuntu", 0xe2521fff);
+        create_badge(badges, UIElement, "22.04", 0xe2521fff, true);
 
         const char* vnc_host = getenv("VNC_SERVER_HOST");
         if (!vnc_host) {
@@ -1345,14 +1472,33 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         .child_of(leaf.target<EditorCanvas>());
 
 
-    } else
+    } else if(editor_type == EditorType::Episodic)
+    {
+        // Modulus rows
+        auto channels = world.entity()
+        .is_a(UIElement)
+        .add<VerticalLayoutBox>()
+        .add(flecs::OrderedChildren)
+        .child_of(leaf.target<EditorCanvas>());
+
+        for (size_t i = 0; i < 8; i++)
+        {
+            world.entity()
+                .is_a(UIElement)
+                .child_of(channels)
+                .set<RectRenderable>({10.0f, 24.0f, false, i % 2 == 0 ? 0x222327FF : 0x121212FF })
+                .set<Expand>({true, 0, 0, 1, false, 0, 0, 0})
+                .set<ZIndex>({20});
+        }
+    }
+    else
     {
         auto editor_icon_bkg_square = world.entity()
         .is_a(UIElement)
         .child_of(leaf.target<EditorCanvas>())
         .set<Position, Local>({4.0f, 12.0f})
-        .set<TextRenderable>({editor_types[(int)editor_type].c_str(), "ATARISTOCRAT", 16.0f, 0xFFFFFFFF})
-        .set<ZIndex>({30});
+        .set<TextRenderable>({editor_types[(int)editor_type].c_str(), "Inter", 16.0f, 0xFFFFFFFF})
+        .set<ZIndex>({1000});
     }
 }
 
@@ -1451,6 +1597,10 @@ struct RenderCommand {
     std::variant<RoundedRectRenderable, RectRenderable, TextRenderable, ImageRenderable, LineRenderable, QuadraticBezierRenderable> renderData;
     RenderType type;
     int zIndex;
+
+    bool useGradient;
+    RenderGradient gradient;
+
     // TODO: Scissors command here...
 
     bool operator<(const RenderCommand& other) const {
@@ -1469,12 +1619,12 @@ struct RenderQueue {
         commands.push_back({pos, renderable, RenderType::Rectangle, zIndex});
     }
 
-    void addRoundedRectCommand(const Position& pos, const RoundedRectRenderable& renderable, int zIndex) {
-        commands.push_back({pos, renderable, RenderType::RoundedRectangle, zIndex});
+    void addRoundedRectCommand(const Position& pos, const RoundedRectRenderable& renderable, int zIndex, bool useGradient = false, RenderGradient renderGradient = {0, 0}) {
+        commands.push_back({pos, renderable, RenderType::RoundedRectangle, zIndex, useGradient, renderGradient});
     }
 
-    void addTextCommand(const Position& pos, const TextRenderable& renderable, int zIndex) {
-        commands.push_back({pos, renderable, RenderType::Text, zIndex});
+    void addTextCommand(const Position& pos, const TextRenderable& renderable, int zIndex, bool useGradient = false, RenderGradient renderGradient = {0, 0}) {
+        commands.push_back({pos, renderable, RenderType::Text, zIndex, useGradient, renderGradient});
     }
 
     void addImageCommand(const Position& pos, const ImageRenderable& renderable, int zIndex) {
@@ -1533,25 +1683,28 @@ static void cursor_position_callback(GLFWwindow* window, double xpos, double ypo
         bool in_bounds_prior = point_in_bounds(cursor_state.x, cursor_state.y, bounds);
         bool in_bounds_post = point_in_bounds(xpos, ypos, bounds);
         
-        if (!in_bounds_prior && in_bounds_post && ui_element.has<AddTagOnHoverEnter>(flecs::Wildcard))
-        {   
-            world.event<HoverEnterEvent>()
-            .id<UIElementBounds>()
-            .entity(ui_element)
-            .enqueue();
-        } else if (in_bounds_prior && !in_bounds_post && ui_element.has<AddTagOnHoverExit>(flecs::Wildcard))
+        if (in_bounds_prior && !in_bounds_post && ui_element.has<AddTagOnHoverExit>(flecs::Wildcard))
         {
             // TODO: Store hover state...
             world.event<HoverExitEvent>()
             .id<UIElementBounds>()
             .entity(ui_element)
             .enqueue();  
+        } else if (!in_bounds_prior && in_bounds_post && ui_element.has<AddTagOnHoverEnter>(flecs::Wildcard))
+        {   
+            world.event<HoverEnterEvent>()
+            .id<UIElementBounds>()
+            .entity(ui_element)
+            .enqueue();
         }
     });
 
     cursor_state.x = xpos;
     cursor_state.y = ypos;
 }
+
+// Track mouse button state for VNC
+static int g_vncButtonMask = 0;
 
 void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
 {
@@ -1586,6 +1739,52 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
             .emit();
         }
     }
+    
+    double mouseX, mouseY;
+    glfwGetCursorPos(window, &mouseX, &mouseY);
+
+    // Update button mask based on action
+    int buttonBit = 0;
+    if (button == GLFW_MOUSE_BUTTON_LEFT) buttonBit = rfbButton1Mask;
+    else if (button == GLFW_MOUSE_BUTTON_MIDDLE) buttonBit = rfbButton2Mask;
+    else if (button == GLFW_MOUSE_BUTTON_RIGHT) buttonBit = rfbButton3Mask;
+
+    if (action == GLFW_PRESS) {
+        g_vncButtonMask |= buttonBit;  // Set button bit
+    } else if (action == GLFW_RELEASE) {
+        g_vncButtonMask &= ~buttonBit;  // Clear button bit
+    }
+
+    // Find the active VNC client
+    auto query = world.query<VNCClient, Position, ImageRenderable>();
+    query.each([&](flecs::entity e, VNCClient& vnc, Position& pos, ImageRenderable& img) {
+        if (vnc.connected && vnc.client) {
+            // Convert mouse coordinates from window space to VNC space
+            int win_w, win_h;
+            glfwGetWindowSize(window, &win_w, &win_h);
+
+            float scale_w = img.width / vnc.width;
+            float scale_h = img.height / vnc.height;
+
+            int offset_x = (int)pos.x;
+            int offset_y = (int)pos.y;
+
+            // Convert to VNC coordinates
+            int vnc_x = (int)((mouseX - offset_x) / scale_w);
+            int vnc_y = (int)((mouseY - offset_y) / scale_h);
+
+            // Clamp to VNC bounds
+            if (vnc_x < 0) vnc_x = 0;
+            if (vnc_y < 0) vnc_y = 0;
+            if (vnc_x >= vnc.width) vnc_x = vnc.width - 1;
+            if (vnc_y >= vnc.height) vnc_y = vnc.height - 1;
+
+            // Send pointer event with updated button mask
+            SendPointerEvent(vnc.client, vnc_x, vnc_y, g_vncButtonMask);
+            std::cout << "[VNC INPUT] Mouse " << (action == GLFW_PRESS ? "press" : "release")
+                        << " at VNC coords (" << vnc_x << "," << vnc_y << ") mask=" << g_vncButtonMask << std::endl;
+        }
+    });
 }
 
 static void char_callback(GLFWwindow* window, unsigned int codepoint)
@@ -1598,14 +1797,86 @@ static void char_callback(GLFWwindow* window, unsigned int codepoint)
     }
 }
 
+// GLFW to X11 keysym mapping for VNC input
+rfbKeySym glfw_key_to_rfb_keysym(int key) {
+    switch (key) {
+        case GLFW_KEY_BACKSPACE: return XK_BackSpace;
+        case GLFW_KEY_TAB: return XK_Tab;
+        case GLFW_KEY_ENTER: return XK_Return;
+        case GLFW_KEY_PAUSE: return XK_Pause;
+        case GLFW_KEY_ESCAPE: return XK_Escape;
+        case GLFW_KEY_DELETE: return XK_Delete;
+        case GLFW_KEY_KP_0: return XK_KP_0;
+        case GLFW_KEY_KP_1: return XK_KP_1;
+        case GLFW_KEY_KP_2: return XK_KP_2;
+        case GLFW_KEY_KP_3: return XK_KP_3;
+        case GLFW_KEY_KP_4: return XK_KP_4;
+        case GLFW_KEY_KP_5: return XK_KP_5;
+        case GLFW_KEY_KP_6: return XK_KP_6;
+        case GLFW_KEY_KP_7: return XK_KP_7;
+        case GLFW_KEY_KP_8: return XK_KP_8;
+        case GLFW_KEY_KP_9: return XK_KP_9;
+        case GLFW_KEY_KP_DECIMAL: return XK_KP_Decimal;
+        case GLFW_KEY_KP_DIVIDE: return XK_KP_Divide;
+        case GLFW_KEY_KP_MULTIPLY: return XK_KP_Multiply;
+        case GLFW_KEY_KP_SUBTRACT: return XK_KP_Subtract;
+        case GLFW_KEY_KP_ADD: return XK_KP_Add;
+        case GLFW_KEY_KP_ENTER: return XK_KP_Enter;
+        case GLFW_KEY_KP_EQUAL: return XK_KP_Equal;
+        case GLFW_KEY_UP: return XK_Up;
+        case GLFW_KEY_DOWN: return XK_Down;
+        case GLFW_KEY_RIGHT: return XK_Right;
+        case GLFW_KEY_LEFT: return XK_Left;
+        case GLFW_KEY_INSERT: return XK_Insert;
+        case GLFW_KEY_HOME: return XK_Home;
+        case GLFW_KEY_END: return XK_End;
+        case GLFW_KEY_PAGE_UP: return XK_Page_Up;
+        case GLFW_KEY_PAGE_DOWN: return XK_Page_Down;
+        case GLFW_KEY_F1: return XK_F1;
+        case GLFW_KEY_F2: return XK_F2;
+        case GLFW_KEY_F3: return XK_F3;
+        case GLFW_KEY_F4: return XK_F4;
+        case GLFW_KEY_F5: return XK_F5;
+        case GLFW_KEY_F6: return XK_F6;
+        case GLFW_KEY_F7: return XK_F7;
+        case GLFW_KEY_F8: return XK_F8;
+        case GLFW_KEY_F9: return XK_F9;
+        case GLFW_KEY_F10: return XK_F10;
+        case GLFW_KEY_F11: return XK_F11;
+        case GLFW_KEY_F12: return XK_F12;
+        case GLFW_KEY_F13: return XK_F13;
+        case GLFW_KEY_F14: return XK_F14;
+        case GLFW_KEY_F15: return XK_F15;
+        case GLFW_KEY_NUM_LOCK: return XK_Num_Lock;
+        case GLFW_KEY_CAPS_LOCK: return XK_Caps_Lock;
+        case GLFW_KEY_SCROLL_LOCK: return XK_Scroll_Lock;
+        case GLFW_KEY_RIGHT_SHIFT: return XK_Shift_R;
+        case GLFW_KEY_LEFT_SHIFT: return XK_Shift_L;
+        case GLFW_KEY_RIGHT_CONTROL: return XK_Control_R;
+        case GLFW_KEY_LEFT_CONTROL: return XK_Control_L;
+        case GLFW_KEY_RIGHT_ALT: return XK_Alt_R;
+        case GLFW_KEY_LEFT_ALT: return XK_Alt_L;
+        case GLFW_KEY_RIGHT_SUPER: return XK_Super_R;
+        case GLFW_KEY_LEFT_SUPER: return XK_Super_L;
+        case GLFW_KEY_MENU: return XK_Menu;
+        case GLFW_KEY_PRINT_SCREEN: return XK_Print;
+        default:
+            // For regular character keys
+            if (key >= GLFW_KEY_SPACE && key <= GLFW_KEY_GRAVE_ACCENT) {
+                return key;
+            }
+            return 0;
+    }
+}
+
 static void key_callback(GLFWwindow* window, int key, int scancode, int action, int mods)
 {
     if (action != GLFW_PRESS && action != GLFW_REPEAT) return;
 
     // Retrieve the singleton ChatState
     ChatState* chat = world.try_get_mut<ChatState>();
-    if (!chat || !chat->input_focused) return;
-
+    if (chat)
+    {
     if (key == GLFW_KEY_BACKSPACE)
     {
         if (!chat->draft.empty()) chat->draft.pop_back();
@@ -1647,12 +1918,30 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                     auto example_message_text = world.entity()
                         .is_a(UIElement)
                         .child_of(message_content)
-                        .set<TextRenderable>({chat->draft.c_str(), "Inter", 16.0f, 0xFFFFFFFF, NVG_ALIGN_TOP | NVG_ALIGN_LEFT})
+                        .set<TextRenderable>({chat->draft.c_str(), "Inter", 16.0f, 0xFFFFFFFF})
                         .set<ZIndex>({12});
                 });
 
             chat->draft.clear();
         }
+    }
+    } else // TODO: Check for focused VNC Stream...
+    {
+        auto query = world.query<VNCClient>();
+        query.each([&](flecs::entity e, VNCClient& vnc) {
+            if (vnc.connected && vnc.client) {
+                rfbKeySym keysym = glfw_key_to_rfb_keysym(key);
+                // Only send special keys (not printable characters which are handled by char_callback)
+                // Skip F1 (used for mode toggle), F2 (used for VNC visibility toggle), and regular character keys
+                if (keysym != 0 && key != GLFW_KEY_F1 && key != GLFW_KEY_F2) {
+                    // Only send if it's NOT a regular character key (space to grave accent range)
+                    // These will be handled by char_callback to avoid double input
+                    if (key < GLFW_KEY_SPACE || key > GLFW_KEY_GRAVE_ACCENT) {
+                        SendKeyEvent(vnc.client, keysym, action != GLFW_RELEASE);
+                    }
+                }
+            }
+        });
     }
 }
 
@@ -1752,6 +2041,8 @@ int main(int, char *[]) {
     world.component<ZIndex>()
     .member<int>("layer");
 
+    world.component<RenderGradient>();
+
     world.component<Window>();
     world.component<CursorState>();
     world.component<Graphics>().add(flecs::Singleton);
@@ -1762,6 +2053,7 @@ int main(int, char *[]) {
     .member<float>("xmax")
     .member<float>("ymax");
     world.component<UIElementSize>();
+    world.component<UIContainer>();
 
     world.component<EditorNodeArea>();
     world.component<PanelSplit>();
@@ -1841,7 +2133,45 @@ int main(int, char *[]) {
     // TODO: Text search field
     // auto FieldEntry = world.prefab("FieldEntry")
 
+    world.observer<UIElementBounds, AddTagOnHoverEnter>()
+    .term_at(1).second<ShowServerHUDOverlay>()
+    .event<HoverEnterEvent>()
+    .each([&](flecs::entity e, UIElementBounds& bounds, AddTagOnHoverEnter)
+    {
+        e.set<ZIndex>({18});
+        auto overlay = e.target<ServerHUDOverlay>();
+        overlay.set<ServerDescription>({e});
+        // create_popup(e);
+        // overlay.set<ZIndex>({15});
+    });
+    
+    world.observer<UIElementBounds, AddTagOnHoverExit>()
+    .term_at(1).second<HideServerHUDOverlay>()
+    .event<HoverExitEvent>()
+    .each([&](flecs::entity e, UIElementBounds& bounds, AddTagOnHoverExit)
+    {
+        auto overlay = e.target<ServerHUDOverlay>();
+        auto desc = overlay.ensure<ServerDescription>();
+        if (desc.selected == e)
+        {
+            overlay.set<ServerDescription>({0});
+        }
+        e.set<ZIndex>({10});
+    });
 
+    world.system<ServerDescription, ZIndex>()
+    .each([&](flecs::entity e, ServerDescription& desc, ZIndex& index) 
+    {
+        if (ecs_is_valid(world, desc.selected))
+        {
+            e.set<ZIndex>({15});
+        } 
+        else
+        {
+            e.set<ZIndex>({0});
+        }
+    });
+    
     world.observer<UIElementBounds, AddTagOnHoverExit>()
     .term_at(1).second<CloseEditorSelector>()
     .event<HoverExitEvent>()
@@ -2003,7 +2333,7 @@ int main(int, char *[]) {
             world.entity()
             .is_a(UIElement)
             .child_of(edtior_type_btn)
-            .set<TextRenderable>({editor_type_name.c_str(), "ATARISTOCRAT", 16.0f, 0xFFFFFFFF, NVG_ALIGN_TOP | NVG_ALIGN_LEFT})
+            .set<TextRenderable>({editor_type_name.c_str(), "ATARISTOCRAT", 16.0f, 0xFFFFFFFF})
             .set<Position, Local>({4.0f, 2.0f})
             .set<ZIndex>({40});
             
@@ -2152,7 +2482,7 @@ int main(int, char *[]) {
                     // TODO: Only modify first two params...
                     visual.set<RoundedRectRenderable>({node_area.width-2, node_area.height-2, 4.0f, false, 0x010222});
                     flecs::entity outline = editor.target<EditorOutline>();
-                    outline.set<RoundedRectRenderable>({node_area.width-2, node_area.height-2, 4.0f, true, 0x5f5f5fFF});
+                    outline.set<RoundedRectRenderable>({node_area.width-2, node_area.height-2, 4.0f, true, 0x191919FF});
                 }
 
                 PanelSplit* split = editor.try_get_mut<PanelSplit>();
@@ -2195,8 +2525,11 @@ int main(int, char *[]) {
             }
             else if (e.has<RoundedRectRenderable>()) {
                 auto rect = e.get<RoundedRectRenderable>();
-                size.width = rect.width;
-                size.height = rect.height;
+                if (!e.has<UIContainer>())
+                {
+                    size.width = rect.width;
+                    size.height = rect.height;
+                }
                 //std::cout << "Setting size to" << size.width << std::endl;
             } else if (e.has<ImageRenderable>()) {
                 auto img = e.get<ImageRenderable>();
@@ -2205,11 +2538,13 @@ int main(int, char *[]) {
             } else if (e.has<TextRenderable>()) {
                 auto text = e.get<TextRenderable>();
                 // Approximate text bounds
+                nvgFontSize(graphics.vg, text.fontSize);
+                nvgFontFace(graphics.vg, text.fontFace.c_str());
                 float approxWidth = text.text.length() * text.fontSize * 0.6f;
                 float approxHeight = text.fontSize;
                 TextSize ts = measureText(graphics.vg, text.text, text.wrapWidth);
                 size.width = ts.w;
-                size.height = ts.h;
+                size.height = ts.h * text.scaleY;
             }
         });
 
@@ -2277,6 +2612,56 @@ int main(int, char *[]) {
             });
         });
 
+    world.system<const UIElementBounds, HorizontalLayoutBox>()
+    .kind(flecs::PreUpdate)
+    .term_at(0).parent() 
+    .with<FitChildren>()
+    .each([](flecs::entity e, const UIElementBounds& container_bounds, HorizontalLayoutBox& box) {
+        float container_w = container_bounds.xmax - container_bounds.xmin;
+        float container_h = container_bounds.ymax - container_bounds.ymin;
+        
+        float total_intrinsic_w = 0;
+        int child_count = 0;
+
+        // Pass 1: Sum up current natural widths
+        e.children([&](flecs::entity child) {
+            const ImageRenderable* img = child.try_get<ImageRenderable>();
+            if (img && img->width > 0) {
+                total_intrinsic_w += img->width;
+                child_count++;
+            }
+        });
+
+        if (child_count == 0 || total_intrinsic_w <= 0) return;
+
+        // Pass 2: Calculate Scale Factors
+        float total_padding = box.padding * (child_count - 1);
+        float available_w = container_w - total_padding;
+        
+        // This is our ideal horizontal scale factor
+        float scale_factor = available_w / total_intrinsic_w;
+
+        // Pass 3: Distribute Constraints with Y-Limit
+        e.children([&](flecs::entity child) {
+            const ImageRenderable* img = child.try_get<ImageRenderable>();
+            if (img) {
+                float aspect = img->width / img->height;
+                float target_w = img->width * scale_factor;
+                float target_h = target_w / aspect;
+
+                // --- THE Y-OVERFLOW FIX ---
+                // If the target width makes the book too tall, 
+                // clamp based on container height instead.
+                if (target_h > container_h) {
+                    target_h = container_h;
+                    target_w = target_h * aspect;
+                }
+
+                child.set<ProportionalConstraint>({ target_w, target_h });
+            }
+        });
+    });
+
     world.system<HorizontalLayoutBox, UIElementSize>("ResetHProgress")
         .kind(flecs::PostLoad)
         .each([](flecs::entity e, HorizontalLayoutBox& box, UIElementSize& container_size)
@@ -2316,46 +2701,33 @@ int main(int, char *[]) {
 
     world.system<VerticalLayoutBox, UIElementSize>("ResetVProgress")
     .kind(flecs::PostLoad)
-    .each([](flecs::entity e, VerticalLayoutBox& box, UIElementSize& container_size)
-    {
-        box.y_progress = 0.0f;
+    .each([](flecs::entity e, VerticalLayoutBox& box, UIElementSize& container_size) {
+        float current_y = 0.0f;
         float max_width = 0.0f;
 
-        e.children([&](flecs::entity child)
-        {
-            Position& pos = child.ensure<Position, Local>();
-            pos.y = box.y_progress;
-            
+        e.children([&](flecs::entity child) {
             const UIElementSize* child_size = child.try_get<UIElementSize>();
-            
-            if (child_size) {
-                if (box.move_dir == -1.0f)
-                {
-                    // If the vertical box 'stacks elements upwards', then we adjust the position of the VerticalLayoutBox...
-                    box.y_progress = e.ensure<Position, Local>().y;
-                    e.ensure<Position, Local>().y = child_size->height + box.padding;
-                } else
-                {
-                    box.y_progress += child_size->height + box.padding;
-                }
-                if (child_size->width > max_width) {
-                    max_width = child_size->width;
-                }
+            if (!child_size) return;
 
+            Position& pos = child.ensure<Position, Local>();
+            
+            if (box.move_dir == -1.0f) {
+                // Stack upwards by moving the child into negative space 
+                // rather than moving the parent into positive space.
+                current_y -= (child_size->height + box.padding);
+                pos.y = current_y;
+            } else {
+                pos.y = current_y;
+                current_y += child_size->height + box.padding;
             }
+
+            max_width = std::max(max_width, child_size->width);
         });
 
+        // Update container size without shifting the container's own Position
         const Expand* expand = e.try_get<Expand>();
-
-        // Only auto-resize HEIGHT if not expanding in Y
-        if (!expand || !expand->y_enabled) {
-            container_size.height = box.y_progress;
-        }
-
-        // Only auto-resize WIDTH if not expanding in X
-        if (!expand || !expand->x_enabled) {
-            container_size.width = max_width;
-        }
+        if (!expand || !expand->y_enabled) container_size.height = std::abs(current_y);
+        if (!expand || !expand->x_enabled) container_size.width = max_width;
     });
 
     auto cursorEvents = world.observer<CursorState, EditorRoot>()
@@ -2517,6 +2889,29 @@ int main(int, char *[]) {
                 }
         });
 
+    world.system<UIElementBounds, UIContainer, RoundedRectRenderable, UIElementSize>()
+    .kind(flecs::PreFrame)
+    .each([&](flecs::entity e, UIElementBounds& bounds, UIContainer& container, RoundedRectRenderable& renderable, UIElementSize& size)
+    {
+        UIElementBounds children_aabb = {0, 0, 0, 0};
+        bool first = true;
+
+        // 1. Traverse children to find the collective bounding box
+        calculate_recursive_bounds(e, children_aabb, first);
+
+        // 2. If children were found, update the parent's bounds
+        if (!first) {
+            bounds = children_aabb;
+        }
+
+        // 3. Apply padding and update render/size components
+        renderable.width = (bounds.xmax - bounds.xmin) + (container.pad_horizontal * 2);
+        renderable.height = (bounds.ymax - bounds.ymin) + (container.pad_vertical * 2);
+        
+        size.width = renderable.width;
+        size.height = renderable.height;
+    });
+
     auto bubbleUpBoundsSecondarySystem = world.system<UIElementBounds, UIElementBounds*, RenderStatus*>()
         .kind(flecs::PostLoad) 
         .term_at(1).parent().up()
@@ -2557,10 +2952,8 @@ int main(int, char *[]) {
     world.system<UIElementBounds*, RectRenderable, Expand>()
     .term_at(0).parent()
     .kind(flecs::PreUpdate)
+    .immediate()
     .each([&](flecs::entity e, UIElementBounds* bounds, RectRenderable& rect, Expand& expand) {
-        // std::cout << bounds->xmin << std::endl;
-        // std::cout << bounds->xmax << std::endl;
-        
         if (expand.x_enabled)
         {
             rect.width = (bounds->xmax - bounds->xmin - (expand.pad_left + expand.pad_right))*expand.x_percent;
@@ -2599,113 +2992,71 @@ int main(int, char *[]) {
         }
     });
 
-    world.system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
+world.system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
     .term_at(0).parent()
     .term_at(3).optional()
     .kind(flecs::PreUpdate)
     .each([&](flecs::entity e, UIElementBounds* bounds, ImageRenderable& sprite, Expand& expand, Constrain* constrain, Graphics& graphics) {        
-        if (bounds)
-        {
-            int img_width, img_height;
-            nvgImageSize(graphics.vg, sprite.imageHandle, &img_width, &img_height);
-            
-            if (img_width == 0 || img_height == 0) return;
+        if (!bounds) return;
 
-            float aspect = (float)img_width / (float)img_height;
-            float bounds_w = bounds->xmax - bounds->xmin;
-            float bounds_h = bounds->ymax - bounds->ymin;
-            
-            // Calculate available space after padding
-            float avail_w = bounds_w - (expand.pad_left + expand.pad_right);
-            float avail_h = bounds_h - (expand.pad_top + expand.pad_bottom);
+        int img_width, img_height;
+        nvgImageSize(graphics.vg, sprite.imageHandle, &img_width, &img_height);
+        if (img_width == 0 || img_height == 0) return;
 
-            float desired_w = sprite.width;
-            float desired_h = sprite.height;
+        float aspect = (float)img_width / (float)img_height;
+        float desired_w = sprite.width;
+        float desired_h = sprite.height;
 
-            if (expand.x_enabled)
-            {
-                // Start by trying to fill the width
+        // PRIORITY 1: Respect the Proportional Constraint if it exists
+        const ProportionalConstraint* prop = e.try_get<ProportionalConstraint>();
+        if (prop && prop->max_width > 0) {
+            desired_w = prop->max_width;
+            desired_h = prop->max_height; 
+        } 
+        else {
+            // PRIORITY 2: Fallback to standard Expand/Constrain logic
+            float avail_w = (bounds->xmax - bounds->xmin) - (expand.pad_left + expand.pad_right);
+            float avail_h = (bounds->ymax - bounds->ymin) - (expand.pad_top + expand.pad_bottom);
+
+            if (expand.x_enabled) {
                 float target_w = avail_w;
-
-                // If we also need to fit Y, check if our target width causes a height overflow
-                if (constrain && constrain->fit_y)
-                {
-                    float height_from_width = target_w / aspect;
-                    
-                    // If the resulting height is too big, constrain by height instead
-                    if (height_from_width > avail_h)
-                    {
-
-                        target_w = avail_h * aspect;
-                    }
-                }
+                if (constrain && constrain->fit_y && (target_w / aspect) > avail_h) 
+                    target_w = avail_h * aspect;
                 
                 desired_w = target_w * expand.x_percent;
-                
-                // If Y is not enabled, calculate height based on the aspect ratio of the final width
-                if (!expand.y_enabled)
-                {
-                    desired_h = desired_w / aspect;
-                }
+                if (!expand.y_enabled) desired_h = desired_w / aspect;
             }
             
-            if (expand.y_enabled)
-            {
-                // Logic for Y-driven expansion (e.g. for vertical lists or sidebars)
+            if (expand.y_enabled) {
                 float target_h = avail_h;
-
-                if (!expand.x_enabled) 
-                {
-                    if (constrain && constrain->fit_x)
-                    {
-                         float width_from_height = target_h * aspect;
-                         if (width_from_height > avail_w)
-                         {
-                             target_h = avail_w / aspect;
-                         }
-                    }
+                if (!expand.x_enabled) {
+                    if (constrain && constrain->fit_x && (target_h * aspect) > avail_w) 
+                        target_h = avail_w / aspect;
                     desired_h = target_h * expand.y_percent;
                     desired_w = desired_h * aspect;
-                }
-                else 
-                {
-                    // If BOTH X and Y are enabled (and we have constraints), 
-                    // we perform a centered "Aspect Fit" inside the box.
-                    if (constrain && (constrain->fit_x || constrain->fit_y))
-                    {
-                        float scale_x = avail_w / img_width;
-                        float scale_y = avail_h / img_height;
-                        float scale = std::min(scale_x, scale_y);
-
+                } else {
+                    if (constrain && (constrain->fit_x || constrain->fit_y)) {
+                        float scale = std::min(avail_w / img_width, avail_h / img_height);
                         desired_w = img_width * scale * expand.x_percent;
                         desired_h = img_height * scale * expand.y_percent;
-                    }
-                    else
-                    {
-                        // No constraints = stretch to fill
+                    } else {
                         desired_h = avail_h * expand.y_percent;
-                        // sprite.width was already set in the x_enabled block
                     }
                 }
             }
-
-            if (expand.cap_to_intrinsic) {
-                float max_w = img_width * sprite.scaleX;
-                float max_h = img_height * sprite.scaleY;
-                if (max_w > 0.0f && max_h > 0.0f) {
-                    float cap_scale = 1.0f;
-                    if (desired_w > max_w) cap_scale = std::min(cap_scale, max_w / desired_w);
-                    if (desired_h > max_h) cap_scale = std::min(cap_scale, max_h / desired_h);
-                    if (cap_scale < 1.0f) {
-                        desired_w *= cap_scale;
-                        desired_h *= cap_scale;
-                    }
-                }
-            }
-
-            sprite.width = desired_w;
-            sprite.height = desired_h;
         }
+
+        // Apply global Intrinsic Caps
+        if (expand.cap_to_intrinsic) {
+            float max_w = img_width * sprite.scaleX;
+            float max_h = img_height * sprite.scaleY;
+            float cap = std::min({1.0f, max_w / desired_w, max_h / desired_h});
+            desired_w *= cap;
+            desired_h *= cap;
+        }
+
+        sprite.width = desired_w;
+        sprite.height = desired_h;
     });
 
     auto debugRenderBounds = world.system<RenderQueue, UIElementBounds, DebugRenderBounds>()
@@ -2716,12 +3067,13 @@ int main(int, char *[]) {
         render_queue.addRectCommand({bounds.xmin, bounds.ymin}, debug_bound, 100);
     });
 
-    auto roundedRectQueueSystem = world.system<Position, RoundedRectRenderable, ZIndex>()
+    auto roundedRectQueueSystem = world.system<Position, RoundedRectRenderable, ZIndex, RenderGradient*>()
     .term_at(0).second<World>()
+    .term_at(3).optional()
     .kind(flecs::PostUpdate)
-        .each([&](flecs::entity e, Position& pos, RoundedRectRenderable& renderable, ZIndex& zIndex) {
+        .each([&](flecs::entity e, Position& pos, RoundedRectRenderable& renderable, ZIndex& zIndex, RenderGradient* rg) {
             RenderQueue& queue = world.ensure<RenderQueue>();
-            queue.addRoundedRectCommand(pos, renderable, zIndex.layer);
+            queue.addRoundedRectCommand(pos, renderable, zIndex.layer, rg, rg ? *rg : RenderGradient{0, 0});
         });
 
 
@@ -2733,12 +3085,13 @@ int main(int, char *[]) {
             queue.addRectCommand(pos, renderable, zIndex.layer);
         });
 
-    auto textQueueSystem = world.system<Position, TextRenderable, ZIndex>()
+    auto textQueueSystem = world.system<Position, TextRenderable, ZIndex, RenderGradient*>()
     .kind(flecs::PostUpdate)
     .term_at(0).second<World>()
-    .each([&](flecs::entity e, Position& pos, TextRenderable& renderable, ZIndex& zIndex) {
+    .term_at(3).optional()
+    .each([&](flecs::entity e, Position& pos, TextRenderable& renderable, ZIndex& zIndex, RenderGradient* rg) {
         RenderQueue& queue = world.ensure<RenderQueue>();
-        queue.addTextCommand(pos, renderable, zIndex.layer);
+        queue.addTextCommand(pos, renderable, zIndex.layer, rg, rg ? *rg : RenderGradient{0, 0});
     });
 
     auto imageQueueSystem = world.system<Position, ImageRenderable, ZIndex>()
@@ -2881,15 +3234,30 @@ int main(int, char *[]) {
                         uint8_t r = (rect.color >> 24) & 0xFF;
                         uint8_t g = (rect.color >> 16) & 0xFF;
                         uint8_t b = (rect.color >> 8) & 0xFF;
-
+                        uint8_t a = (rect.color >> 0) & 0xFF;
+                        
                         if (rect.stroke)
                         {
                             nvgStrokeWidth(graphics.vg, 1.0f);
-                            nvgStrokeColor(graphics.vg, nvgRGB(r, g, b));
+                            if (cmd.useGradient)
+                            {
+                                NVGpaint gradient = nvgLinearGradient(graphics.vg, cmd.pos.x, cmd.pos.y, cmd.pos.x, cmd.pos.y + rect.height, uintToNvgColor(cmd.gradient.start), uintToNvgColor(cmd.gradient.end));
+                                nvgStrokePaint(graphics.vg, gradient);
+                            } else
+                            {
+                                nvgStrokeColor(graphics.vg, nvgRGBA(r, g, b, a));
+                            }
                             nvgStroke(graphics.vg);
                         } else
                         {
-                            nvgFillColor(graphics.vg, nvgRGB(r, g, b));
+                            if (cmd.useGradient)
+                            {
+                                NVGpaint gradient = nvgLinearGradient(graphics.vg, cmd.pos.x, cmd.pos.y, cmd.pos.x, cmd.pos.y + rect.height, uintToNvgColor(cmd.gradient.start), uintToNvgColor(cmd.gradient.end));
+                                nvgFillPaint(graphics.vg, gradient);
+                            } else
+                            {
+                                nvgFillColor(graphics.vg, nvgRGBA(r, g, b, a));
+                            }
                             nvgFill(graphics.vg);
                         }
                         break;
@@ -2917,23 +3285,40 @@ int main(int, char *[]) {
                     }
                     case RenderType::Text: {
                         const auto& text = std::get<TextRenderable>(cmd.renderData);
+
+                        nvgSave(graphics.vg);
+                        nvgTranslate(graphics.vg, cmd.pos.x, cmd.pos.y);
+                        nvgScale(graphics.vg, 1.0f, text.scaleY);
+
+                        // it's not easy to render text with a gradient color
                         nvgFontSize(graphics.vg, text.fontSize);
                         nvgFontFace(graphics.vg, text.fontFace.c_str());
-                        nvgTextAlign(graphics.vg, text.alignment);
+                        nvgTextAlign(graphics.vg, NVG_ALIGN_TOP | NVG_ALIGN_LEFT);
 
                         uint8_t r = (text.color >> 24) & 0xFF;
                         uint8_t g = (text.color >> 16) & 0xFF;
                         uint8_t b = (text.color >> 8) & 0xFF;
 
-                        nvgFillColor(graphics.vg, nvgRGB(r, g, b));
+                        // NVGpaint gradient = nvgLinearGradient(graphics.vg, cmd.pos.x, cmd.pos.y, cmd.pos.x, cmd.pos.y + rect.height, cmd.gradient.start, cmd.gradient.end);
+                        
+                        if (cmd.useGradient)
+                        {
+                            NVGpaint gradient = nvgLinearGradient(graphics.vg, 0, 0, 0, 0 + text.fontSize, uintToNvgColor(cmd.gradient.start), uintToNvgColor(cmd.gradient.end));
+                            nvgFillPaint(graphics.vg, gradient);
+                        } else
+                        {
+                            nvgFillColor(graphics.vg, nvgRGB(r, g, b));
+                        }
+
                         if (text.wrapWidth > 0.0f)
                         {
-                            nvgTextBox(graphics.vg, cmd.pos.x, cmd.pos.y, text.wrapWidth, text.text.c_str(), nullptr);
+                            nvgTextBox(graphics.vg, 0, 0, text.wrapWidth, text.text.c_str(), nullptr);
                         }
                         else
                         {
-                            nvgText(graphics.vg, cmd.pos.x, cmd.pos.y, text.text.c_str(), nullptr);
+                            nvgText(graphics.vg, 0, 0, text.text.c_str(), nullptr);
                         }
+                        nvgRestore(graphics.vg);
                         break;
                     }
                     case RenderType::Image: {
@@ -2999,19 +3384,49 @@ int main(int, char *[]) {
         .each([](flecs::entity e, VNCClient& vnc) {
             if (!vnc.connected || !vnc.client) return;
 
-            // Process pending VNC messages (non-blocking)
-            // WaitForMessage with timeout of 0 makes it non-blocking
-            int result = WaitForMessage(vnc.client, 0);
-            if (result > 0) {
-                // Message available, process it
+            // DRAIN the message queue
+            while (WaitForMessage(vnc.client, 0) > 0) { 
                 if (!HandleRFBServerMessage(vnc.client)) {
-                    LOG_ERROR(LogCategory::VNC_CLIENT, "Failed to handle VNC message for quadrant {}", vnc.toString());
+                    vnc.connected = false;
+                    break;
                 }
-            } else if (result < 0) {
-                LOG_ERROR(LogCategory::VNC_CLIENT, "VNC connection error for quadrant {}", vnc.toString());
-                vnc.connected = false;
             }
-            // result == 0 means no messages, which is fine
+        });
+
+    // VNC mouse tracking system - sends mouse position to active VNC client in interactive mode
+    auto vncMouseTrackingSystem = world.system<Position, ImageRenderable>()
+        .with<IsStreamingFrom>(flecs::Wildcard)
+        .term_at(0).second<World>()
+        .kind(flecs::PreUpdate)
+        .each([&](flecs::entity e, Position& pos, ImageRenderable& img) {
+            VNCClient& vnc = e.target<IsStreamingFrom>().ensure<VNCClient>();
+            if (!vnc.connected || !vnc.client) return;
+            // Get cursor state
+            auto glfw_state = world.lookup("GLFWState");
+            if (!glfw_state.is_valid()) return;
+
+            const CursorState* cursorState = glfw_state.try_get<CursorState>();
+            if (!cursorState) return;
+
+            // Convert mouse coordinates from window space to VNC space
+            float scale_w = img.width / vnc.width;
+            float scale_h = img.height / vnc.height;
+
+            int offset_x = (int)pos.x;
+            int offset_y = (int)pos.y;
+
+            // Convert to VNC coordinates
+            int vnc_x = (int)((cursorState->x - offset_x) / scale_w);
+            int vnc_y = (int)((cursorState->y - offset_y) / scale_h);
+
+            // Clamp to VNC bounds
+            if (vnc_x < 0) vnc_x = 0;
+            if (vnc_y < 0) vnc_y = 0;
+            if (vnc_x >= vnc.width) vnc_x = vnc.width - 1;
+            if (vnc_y >= vnc.height) vnc_y = vnc.height - 1;
+
+            // Send pointer event with current button mask (preserves button state during drags)
+            SendPointerEvent(vnc.client, vnc_x, vnc_y, g_vncButtonMask);
         });
 
     auto vncTextureUpdateSystem = world.system<VNCClient>()
@@ -3024,7 +3439,6 @@ int main(int, char *[]) {
             }
             if (!vnc.needsUpdate) return;
             std::lock_guard<std::mutex> lock(*vnc.surfaceMutex);
-            std::cout << "VNC Texture Update System" << std::endl;
             
             LOG_TRACE(LogCategory::VNC_CLIENT, "Updating OpenGL texture {} for quadrant {}", vnc.vncTexture, vnc.toString());
 
@@ -3146,8 +3560,6 @@ int main(int, char *[]) {
             VNCClient& vnc = vnc_entity.ensure<VNCClient>();
             if (!vnc.connected || !vnc.client) return;
 
-            std::cout << "Lets update VNC for " << e << std::endl;
-
             // TODO: Query to determine what VNC Streams that there are that are visible in Editor VNCStream type
 
             // TODO: There are no longer quadrants, this is an outdated and no longer acceptable
@@ -3174,7 +3586,7 @@ int main(int, char *[]) {
             if (debugFrameCount++ % 60 == 0) {  // Log once per second at 60fps
                 int window_count = 0;
                 windows.each([&](flecs::entity, X11WindowInfo&, X11WindowBounds&, X11WindowVisibility&) { window_count++; });
-                LOG_DEBUG(LogCategory::X11_OUTLINE, "VNC has {} windows", vnc.toString(), window_count);
+                LOG_DEBUG(LogCategory::X11_OUTLINE, "VNC {} has {} windows", vnc.toString(), window_count);
             }
 
             // Render each visible window outline
