@@ -1477,6 +1477,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         // Modulus rows
         auto channels = world.entity()
         .is_a(UIElement)
+        .set<Expand>({true, 0, 0, 1, false, 0, 0, 0})
         .add<VerticalLayoutBox>()
         .add(flecs::OrderedChildren)
         .child_of(leaf.target<EditorCanvas>());
@@ -2728,6 +2729,19 @@ int main(int, char *[]) {
         const Expand* expand = e.try_get<Expand>();
         if (!expand || !expand->y_enabled) container_size.height = std::abs(current_y);
         if (!expand || !expand->x_enabled) container_size.width = max_width;
+
+        // Immediately recalculate bounds for dimensions VerticalLayoutBox controls
+        // so Expand systems see the updated size this frame (prevents flickering)
+        if (e.has<UIElementBounds>()) {
+            UIElementBounds& bounds = e.ensure<UIElementBounds>();
+            const Position& world_pos = e.get<Position, World>();
+            if (!expand || !expand->y_enabled) {
+                bounds.ymax = world_pos.y + container_size.height;
+            }
+            if (!expand || !expand->x_enabled) {
+                bounds.xmax = world_pos.x + container_size.width;
+            }
+        }
     });
 
     auto cursorEvents = world.observer<CursorState, EditorRoot>()
