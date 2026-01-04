@@ -1,4 +1,5 @@
 #include <iostream>
+#include <fstream>
 #include <cmath>
 #include <vector>
 #include <stack>
@@ -1625,6 +1626,7 @@ void replace_editor_content(flecs::entity leaf, EditorType editor_type, flecs::e
     {
         child.destruct();
     });
+    leaf.set<EditorLeafData>({editor_type});
     create_editor_content(leaf, editor_type, UIElement);
 }
 
@@ -1966,29 +1968,157 @@ rfbKeySym glfw_key_to_rfb_keysym(int key) {
     }
 }
 
+// Editor config serialization
+struct EditorConfigNode {
+    bool is_leaf;
+    EditorType editor_type; // Only valid if is_leaf
+    float split_percent;    // Only valid if !is_leaf
+    PanelSplitType split_dim; // Only valid if !is_leaf
+    std::unique_ptr<EditorConfigNode> child_a; // Left/Upper
+    std::unique_ptr<EditorConfigNode> child_b; // Right/Lower
+};
+
+std::unique_ptr<EditorConfigNode> save_editor_config_recursive(flecs::entity node) {
+    auto config = std::make_unique<EditorConfigNode>();
+
+    const PanelSplit* split = node.try_get<PanelSplit>();
+    if (split) {
+        config->is_leaf = false;
+        config->split_percent = split->percent;
+        config->split_dim = split->dim;
+
+        if (split->dim == PanelSplitType::Horizontal) {
+            flecs::entity left = node.target<LeftNode>();
+            flecs::entity right = node.target<RightNode>();
+            if (left.is_valid()) config->child_a = save_editor_config_recursive(left);
+            if (right.is_valid()) config->child_b = save_editor_config_recursive(right);
+        } else {
+            flecs::entity upper = node.target<UpperNode>();
+            flecs::entity lower = node.target<LowerNode>();
+            if (upper.is_valid()) config->child_a = save_editor_config_recursive(upper);
+            if (lower.is_valid()) config->child_b = save_editor_config_recursive(lower);
+        }
+    } else {
+        config->is_leaf = true;
+        const EditorLeafData* leaf_data = node.try_get<EditorLeafData>();
+        config->editor_type = leaf_data ? leaf_data->editor_type : EditorType::VNCStream;
+    }
+
+    return config;
+}
+
+void write_editor_config(std::ofstream& out, const EditorConfigNode& node, int depth = 0) {
+    std::string indent(depth * 2, ' ');
+    if (node.is_leaf) {
+        out << indent << "leaf " << static_cast<int>(node.editor_type) << "\n";
+    } else {
+        out << indent << "split " << node.split_percent << " "
+            << (node.split_dim == PanelSplitType::Horizontal ? "h" : "v") << "\n";
+        if (node.child_a) write_editor_config(out, *node.child_a, depth + 1);
+        if (node.child_b) write_editor_config(out, *node.child_b, depth + 1);
+    }
+}
+
+void save_editor_layout(flecs::entity editor_root) {
+    auto config = save_editor_config_recursive(editor_root);
+    std::ofstream out("editor_layout.cfg");
+    if (out.is_open()) {
+        write_editor_config(out, *config);
+        std::cout << "Editor layout saved to editor_layout.cfg" << std::endl;
+    }
+}
+
+std::unique_ptr<EditorConfigNode> read_editor_config(std::ifstream& in) {
+    std::string type;
+    if (!(in >> type)) return nullptr;
+
+    auto node = std::make_unique<EditorConfigNode>();
+    if (type == "leaf") {
+        node->is_leaf = true;
+        int editor_type_int;
+        in >> editor_type_int;
+        node->editor_type = static_cast<EditorType>(editor_type_int);
+    } else if (type == "split") {
+        node->is_leaf = false;
+        char dim;
+        in >> node->split_percent >> dim;
+        node->split_dim = (dim == 'h') ? PanelSplitType::Horizontal : PanelSplitType::Vertical;
+        node->child_a = read_editor_config(in);
+        node->child_b = read_editor_config(in);
+    }
+    return node;
+}
+
+void apply_editor_config(const EditorConfigNode& config, flecs::entity node, flecs::world& world, flecs::entity UIElement);
+
+void apply_editor_config(const EditorConfigNode& config, flecs::entity node, flecs::world& world, flecs::entity UIElement) {
+    if (config.is_leaf) {
+        EditorNodeArea& area = node.ensure<EditorNodeArea>();
+        create_editor(node, area, world, UIElement);
+        // Override the default Void type and create content
+        node.set<EditorLeafData>({config.editor_type});
+        create_editor_content(node, config.editor_type, UIElement);
+    } else {
+        split_editor({config.split_percent, config.split_dim}, node, world, UIElement);
+
+        if (config.split_dim == PanelSplitType::Horizontal) {
+            flecs::entity left = node.target<LeftNode>();
+            flecs::entity right = node.target<RightNode>();
+            // Remove the default editor content created by split_editor so we can apply config
+            if (left.is_valid() && config.child_a) {
+                flecs::entity visual = left.target<EditorVisual>();
+                if (visual.is_valid()) visual.destruct();
+                left.remove<EditorLeafData>();
+                apply_editor_config(*config.child_a, left, world, UIElement);
+            }
+            if (right.is_valid() && config.child_b) {
+                flecs::entity visual = right.target<EditorVisual>();
+                if (visual.is_valid()) visual.destruct();
+                right.remove<EditorLeafData>();
+                apply_editor_config(*config.child_b, right, world, UIElement);
+            }
+        } else {
+            flecs::entity upper = node.target<UpperNode>();
+            flecs::entity lower = node.target<LowerNode>();
+            if (upper.is_valid() && config.child_a) {
+                flecs::entity visual = upper.target<EditorVisual>();
+                if (visual.is_valid()) visual.destruct();
+                upper.remove<EditorLeafData>();
+                apply_editor_config(*config.child_a, upper, world, UIElement);
+            }
+            if (lower.is_valid() && config.child_b) {
+                flecs::entity visual = lower.target<EditorVisual>();
+                if (visual.is_valid()) visual.destruct();
+                lower.remove<EditorLeafData>();
+                apply_editor_config(*config.child_b, lower, world, UIElement);
+            }
+        }
+    }
+}
+
+bool load_editor_layout(flecs::entity editor_root, flecs::world& world, flecs::entity UIElement) {
+    std::ifstream in("editor_layout.cfg");
+    if (!in.is_open()) return false;
+
+    auto config = read_editor_config(in);
+    if (!config) return false;
+
+    apply_editor_config(*config, editor_root, world, UIElement);
+    std::cout << "Editor layout loaded from editor_layout.cfg" << std::endl;
+    return true;
+}
+
 static void key_callback(GLFWwindow* window, int key, int scancode, int action, int mods)
 {
     if (action != GLFW_PRESS && action != GLFW_REPEAT) return;
 
     if (key == GLFW_KEY_S && mods & GLFW_MOD_CONTROL)
     {
-        // TODO: For now, just save editor layout
-        flecs::entity editor_root = ecs.lookup("editor_root");
-        
-        flecs::entity left_node = editor_root.target<LeftNode>();
-        flecs::entity right_node = editor_root.target<RightNode>();
-        
-        flecs::entity upper_node = editor_root.target<UpperNode>();
-        flecs::entity lower_node = editor_root.target<LowerNode>();
-
-        if (editor_root.has<LeftNode>())
-        {
-            // Add horizontal split/data to save config
-        } else if (editor_root.has<RightNode>())
-        {
-            
+        flecs::entity editor_root = world.lookup("editor_root");
+        if (editor_root.is_valid()) {
+            save_editor_layout(editor_root);
         }
-
+        return;
     }
 
     // Retrieve the singleton ChatState
@@ -2531,14 +2661,15 @@ int main(int, char *[]) {
         .set<ImageCreator>({"../assets/ecs_header.png", 1.0f, 1.0f})
         .set<ZIndex>({5});
 
-    // TODO: Load default editor config
-
-    // create_editor(editor_root, world, UIElement);
-    split_editor({0.5, PanelSplitType::Horizontal}, editor_root, world, UIElement);
-    auto right_node = editor_root.target<RightNode>();
-    split_editor({0.35, PanelSplitType::Vertical}, right_node, world, UIElement);
-    auto left_node = editor_root.target<LeftNode>();
-    split_editor({0.25, PanelSplitType::Vertical}, left_node, world, UIElement);
+    // Load saved editor config if it exists, otherwise use default layout
+    if (!load_editor_layout(editor_root, world, UIElement)) {
+        // Default layout
+        split_editor({0.5, PanelSplitType::Horizontal}, editor_root, world, UIElement);
+        auto right_node = editor_root.target<RightNode>();
+        split_editor({0.35, PanelSplitType::Vertical}, right_node, world, UIElement);
+        auto left_node = editor_root.target<LeftNode>();
+        split_editor({0.25, PanelSplitType::Vertical}, left_node, world, UIElement);
+    }
 
     float diurnal_pos = 0.0f;
     world.system<DiurnalHour, QuadraticBezierRenderable>()
