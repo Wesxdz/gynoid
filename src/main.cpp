@@ -349,6 +349,19 @@ struct RectRenderable {
     uint32_t color;
 };
 
+// Forward declaration
+struct RenderCommand; 
+
+// Example, diamond
+struct CustomRenderable
+{
+    float width, height;
+    bool stroke;
+    uint32_t color;
+
+    std::function<void(NVGcontext*, const RenderCommand*, const CustomRenderable&)> render_function;
+};
+
 struct RoundedRectRenderable {
     float width, height, radius;
     bool stroke;
@@ -704,6 +717,7 @@ enum class RenderType {
     Image,
     Line,
     QuadraticBezier,
+    CustomRenderable,
 };
 
 flecs::world world;
@@ -1092,6 +1106,62 @@ VNCData get_vnc_source(flecs::world& world, const std::string& host, int port) {
     return {created, client_data};
 }
 
+struct RenderCommand {
+    Position pos;
+    std::variant<RoundedRectRenderable, RectRenderable, TextRenderable, ImageRenderable, LineRenderable, QuadraticBezierRenderable, CustomRenderable> renderData;
+    RenderType type;
+    int zIndex;
+
+    bool useGradient;
+    RenderGradient gradient;
+
+    // TODO: Scissors command here...
+
+    bool operator<(const RenderCommand& other) const {
+        return zIndex < other.zIndex;
+    }
+};
+
+
+void draw_diamond(NVGcontext* vg, const RenderCommand* cmd, const CustomRenderable& data) {
+    // Assuming (x, y) is the top-left of the bounding box
+    float x = cmd->pos.x; 
+    float y = cmd->pos.y;
+    
+    float midX = x + data.width / 2.0f;
+    float midY = y + data.height / 2.0f;
+
+    nvgBeginPath(vg);
+    
+    // Move to Top Center
+    nvgMoveTo(vg, midX, y); 
+    // Line to Right Center
+    nvgLineTo(vg, x + data.width, midY); 
+    // Line to Bottom Center
+    nvgLineTo(vg, midX, y + data.height); 
+    // Line to Left Center
+    nvgLineTo(vg, x, midY); 
+    
+    nvgClosePath(vg);
+
+    // Convert uint32_t color to NVGcolor (assuming ARGB or RGBA)
+    // This example assumes RGBA: 0xRRGGBBAA
+    unsigned char r = (data.color >> 24) & 0xFF;
+    unsigned char g = (data.color >> 16) & 0xFF;
+    unsigned char b = (data.color >> 8) & 0xFF;
+    unsigned char a = (data.color) & 0xFF;
+    NVGcolor color = nvgRGBA(r, g, b, a);
+
+    if (data.stroke) {
+        nvgStrokeColor(vg, color);
+        nvgStrokeWidth(vg, 1.0f);
+        nvgStroke(vg);
+    } else {
+        nvgFillColor(vg, color);
+        nvgFill(vg);
+    }
+}
+
 // Factory function to populate editor content, whether the panel is initialized or changed
 void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::entity UIElement)
 {
@@ -1115,7 +1185,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         .add<ServerDescription>()
         .child_of(leaf.target<EditorCanvas>());
 
-        std::vector<std::string> server_icons = {"peach_core", "aeri_memory", "flecs", "x11", "parakeet", "chatterbox", "doctr", "huggingface", "dino2", "alpaca", "modal"};
+        std::vector<std::string> server_icons = {"peach_core", "aeri_memory", "flecs", "x11", "parakeet", "chatterbox", "doctr", "huggingface", "dino2", "autodistill", "yolo", "alpaca", "modal"};
         // std::vector<std::string> server_icons = {"peach_core"};
 
         for (const auto& icon : server_icons)
@@ -1475,6 +1545,8 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
     } else if(editor_type == EditorType::Episodic)
     {
         // Modulus rows
+
+        // TODO: Fractal granularity navigation
         auto channels = world.entity()
         .is_a(UIElement)
         .set<Expand>({true, 0, 0, 1, false, 0, 0, 0})
@@ -1482,7 +1554,23 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         .add(flecs::OrderedChildren)
         .child_of(leaf.target<EditorCanvas>());
 
-        for (size_t i = 0; i < 8; i++)
+        auto channels_2 = world.entity()
+        .is_a(UIElement)
+        .set<Expand>({true, 0, 0, 1, false, 0, 0, 0})
+        .add<VerticalLayoutBox>()
+        .add(flecs::OrderedChildren)
+        .child_of(leaf.target<EditorCanvas>());
+
+        auto channels_3 = world.entity()
+        .is_a(UIElement)
+        .set<Expand>({true, 0, 0, 1, false, 0, 0, 0})
+        .add<VerticalLayoutBox>()
+        .add(flecs::OrderedChildren)
+        .child_of(leaf.target<EditorCanvas>());
+
+        // TODO: Implement scissors/vertical scrollbar
+
+        for (size_t i = 0; i < 6; i++)
         {
             world.entity()
                 .is_a(UIElement)
@@ -1490,6 +1578,26 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
                 .set<RectRenderable>({10.0f, 24.0f, false, i % 2 == 0 ? 0x222327FF : 0x121212FF })
                 .set<Expand>({true, 0, 0, 1, false, 0, 0, 0})
                 .set<ZIndex>({20});
+        }
+            
+        for (size_t i = 0; i < 2; i++)
+        {
+            world.entity()
+            .is_a(UIElement)
+            .set<Align>({0.0f, 0.0f, 0.8f, 0.0f})
+            .set<CustomRenderable>({24*3, 24*3, false, i % 2 == 1 ? 0x222327FF : 0x121212FF, draw_diamond})
+            .set<ZIndex>({25})
+            .child_of(channels_2);
+            // .child_of(leaf.target<EditorCanvas>());
+
+            world.entity()
+            .is_a(UIElement)
+            .child_of(channels_3)
+            .set<Align>({0.0f, 0.0f, 0.8f, 0.0f})
+            // .add<DebugRenderBounds>()
+            .set<RectRenderable>({10.0f, 24.0f*3, false, i % 2 == 1 ? 0x222327FF : 0x121212FF })
+            .set<Expand>({true, 24*1.5f, 0, 0.2f, false, 0, 0, 0})
+            .set<ZIndex>({24});
         }
     }
     else
@@ -1593,22 +1701,6 @@ void split_editor(PanelSplit split, flecs::entity leaf, flecs::world world, flec
     }
 }
 
-struct RenderCommand {
-    Position pos;
-    std::variant<RoundedRectRenderable, RectRenderable, TextRenderable, ImageRenderable, LineRenderable, QuadraticBezierRenderable> renderData;
-    RenderType type;
-    int zIndex;
-
-    bool useGradient;
-    RenderGradient gradient;
-
-    // TODO: Scissors command here...
-
-    bool operator<(const RenderCommand& other) const {
-        return zIndex < other.zIndex;
-    }
-};
-
 struct RenderQueue {
     std::vector<RenderCommand> commands;
 
@@ -1638,6 +1730,10 @@ struct RenderQueue {
 
     void addQuadraticBezierCommand(const Position& pos, const QuadraticBezierRenderable& renderable, int zIndex) {
         commands.push_back({pos, renderable, RenderType::QuadraticBezier, zIndex});
+    }
+
+    void addCustomCommand(const Position& pos, const CustomRenderable& renderable, int zIndex) {
+        commands.push_back({pos, renderable, RenderType::CustomRenderable, zIndex});
     }
 
     void sort() {
@@ -1874,6 +1970,27 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
 {
     if (action != GLFW_PRESS && action != GLFW_REPEAT) return;
 
+    if (key == GLFW_KEY_S && mods & GLFW_MOD_CONTROL)
+    {
+        // TODO: For now, just save editor layout
+        flecs::entity editor_root = ecs.lookup("editor_root");
+        
+        flecs::entity left_node = editor_root.target<LeftNode>();
+        flecs::entity right_node = editor_root.target<RightNode>();
+        
+        flecs::entity upper_node = editor_root.target<UpperNode>();
+        flecs::entity lower_node = editor_root.target<LowerNode>();
+
+        if (editor_root.has<LeftNode>())
+        {
+            // Add horizontal split/data to save config
+        } else if (editor_root.has<RightNode>())
+        {
+            
+        }
+
+    }
+
     // Retrieve the singleton ChatState
     ChatState* chat = world.try_get_mut<ChatState>();
     if (chat)
@@ -2036,6 +2153,7 @@ int main(int, char *[]) {
     .member<float>("y");
     world.component<Velocity>();
     world.component<RectRenderable>();
+    world.component<CustomRenderable>();
     world.component<TextRenderable>();
     world.component<ImageCreator>();
     world.component<ImageRenderable>();
@@ -2413,6 +2531,8 @@ int main(int, char *[]) {
         .set<ImageCreator>({"../assets/ecs_header.png", 1.0f, 1.0f})
         .set<ZIndex>({5});
 
+    // TODO: Load default editor config
+
     // create_editor(editor_root, world, UIElement);
     split_editor({0.5, PanelSplitType::Horizontal}, editor_root, world, UIElement);
     auto right_node = editor_root.target<RightNode>();
@@ -2546,6 +2666,11 @@ int main(int, char *[]) {
                 TextSize ts = measureText(graphics.vg, text.text, text.wrapWidth);
                 size.width = ts.w;
                 size.height = ts.h * text.scaleY;
+            } else if (e.has<CustomRenderable>())
+            {
+                auto custom = e.get<CustomRenderable>();
+                size.width = custom.width;
+                size.height = custom.height;
             }
         });
 
@@ -2953,14 +3078,21 @@ int main(int, char *[]) {
                 }
         });
 
-    world.system<Position, UIElementBounds*, UIElementSize, UIElementBounds, Align>()
+    world.system<Position, UIElementBounds*, UIElementSize, UIElementBounds, Align, Expand*>()
     .term_at(0).second<Local>()
     .term_at(1).parent()
+    .term_at(5).optional()
     .kind(flecs::PreFrame)
-    .each([&](flecs::entity e, Position& pos, UIElementBounds* parent_bounds, UIElementSize& ui_size, UIElementBounds& bounds, Align& align) 
+    .each([&](flecs::entity e, Position& pos, UIElementBounds* parent_bounds, UIElementSize& ui_size, UIElementBounds& bounds, Align& align, Expand* expand) 
     {
-        pos.x = align.horizontal * (parent_bounds->xmax - parent_bounds->xmin) + ui_size.width * align.self_horizontal;
-        pos.y = align.vertical * (parent_bounds->ymax - parent_bounds->ymin) + ui_size.height * align.self_vertical;
+        if (!e.parent().has<HorizontalLayoutBox>())
+        {
+            pos.x = align.horizontal * (parent_bounds->xmax - parent_bounds->xmin) + ui_size.width * align.self_horizontal + (expand ? expand->pad_left : 0);
+        }
+        if (!e.parent().has<VerticalLayoutBox>())
+        {
+            pos.y = align.vertical * (parent_bounds->ymax - parent_bounds->ymin) + ui_size.height * align.self_vertical;
+        }
     });
 
     world.system<UIElementBounds*, RectRenderable, Expand>()
@@ -2970,11 +3102,11 @@ int main(int, char *[]) {
     .each([&](flecs::entity e, UIElementBounds* bounds, RectRenderable& rect, Expand& expand) {
         if (expand.x_enabled)
         {
-            rect.width = (bounds->xmax - bounds->xmin - (expand.pad_left + expand.pad_right))*expand.x_percent;
+            rect.width = (bounds->xmax - bounds->xmin)*expand.x_percent - (expand.pad_left + expand.pad_right);
         }
         if (expand.y_enabled)
         {
-            rect.height = (bounds->ymax - bounds->ymin - (expand.pad_top + expand.pad_bottom))*expand.y_percent;
+            rect.height = (bounds->ymax - bounds->ymin)*expand.y_percent- (expand.pad_top + expand.pad_bottom);
         }
     });
 
@@ -3132,6 +3264,14 @@ world.system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
         queue.addQuadraticBezierCommand(pos, renderable, zIndex.layer);
     });
 
+    auto customQueueSystem = world.system<Position, CustomRenderable, ZIndex>()
+    .kind(flecs::PostUpdate)
+    .term_at(0).second<World>()
+    .each([&](flecs::entity e, Position& pos, CustomRenderable& renderable, ZIndex& zIndex) {
+        RenderQueue& queue = world.ensure<RenderQueue>();
+        queue.addCustomCommand(pos, renderable, zIndex.layer);
+    });
+
     world.system<Position, EditorNodeArea, EditorLeafData, EditorRoot>()
     .term_at(0).second<World>()
     .term_at(3).src(editor_root)
@@ -3240,6 +3380,11 @@ world.system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
             // TODO: Apply scissor regions to relevant entity
             for (const auto& cmd : queue.commands) {
                 switch (cmd.type) {
+                    case RenderType::CustomRenderable: {
+                        const auto& custom = std::get<CustomRenderable>(cmd.renderData);
+                        custom.render_function(graphics.vg, &cmd, custom);
+                        break;
+                    }
                     case RenderType::RoundedRectangle: {
                         const auto& rect = std::get<RoundedRectRenderable>(cmd.renderData);
                         nvgBeginPath(graphics.vg);
