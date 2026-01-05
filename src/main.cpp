@@ -1107,16 +1107,22 @@ VNCData get_vnc_source(flecs::world& world, const std::string& host, int port) {
     return {created, client_data};
 }
 
+struct ScissorContainer {};
+// TODO: Make it transitive
+
+
 struct RenderCommand {
     Position pos;
     std::variant<RoundedRectRenderable, RectRenderable, TextRenderable, ImageRenderable, LineRenderable, QuadraticBezierRenderable, CustomRenderable> renderData;
     RenderType type;
     int zIndex;
 
+    ecs_entity_t scissorEntity;
+    
     bool useGradient;
     RenderGradient gradient;
 
-    // TODO: Scissors command here...
+    // flecs::ref<UIElementBounds> scissorRegion;
 
     bool operator<(const RenderCommand& other) const {
         return zIndex < other.zIndex;
@@ -1306,8 +1312,8 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         .child_of(leaf.target<EditorHeader>());
         
         
-        // create_badge(badges, UIElement, "Heonae", 0xc72783ff);
-        create_badge(badges, UIElement, "Kahlo", 0x782910ff);
+        create_badge(badges, UIElement, "Heonae", 0xc72783ff);
+        // create_badge(badges, UIElement, "Kahlo", 0x782910ff);
         create_badge(badges, UIElement, "Virtual", 0xe575eeff);
         create_badge(badges, UIElement, "Physical", 0x619393ff);
         
@@ -1553,6 +1559,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         .set<Expand>({true, 0, 0, 1, false, 0, 0, 0})
         .add<VerticalLayoutBox>()
         .add(flecs::OrderedChildren)
+        .add<ScissorContainer>(leaf.target<EditorCanvas>())
         .child_of(leaf.target<EditorCanvas>());
 
         auto channels_2 = world.entity()
@@ -1560,6 +1567,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         .set<Expand>({true, 0, 0, 1, false, 0, 0, 0})
         .add<VerticalLayoutBox>()
         .add(flecs::OrderedChildren)
+        .add<ScissorContainer>(leaf.target<EditorCanvas>())
         .child_of(leaf.target<EditorCanvas>());
 
         auto channels_3 = world.entity()
@@ -1567,6 +1575,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         .set<Expand>({true, 0, 0, 1, false, 0, 0, 0})
         .add<VerticalLayoutBox>()
         .add(flecs::OrderedChildren)
+        .add<ScissorContainer>(leaf.target<EditorCanvas>())
         .child_of(leaf.target<EditorCanvas>());
 
         // TODO: Implement scissors/vertical scrollbar
@@ -1578,6 +1587,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
                 .child_of(channels)
                 .set<RectRenderable>({10.0f, 24.0f, false, i % 2 == 0 ? 0x222327FF : 0x121212FF })
                 .set<Expand>({true, 0, 0, 1, false, 0, 0, 0})
+                .add<ScissorContainer>(leaf.target<EditorCanvas>())
                 .set<ZIndex>({20});
         }
             
@@ -1588,6 +1598,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
             .set<Align>({0.0f, 0.0f, 0.8f, 0.0f})
             .set<CustomRenderable>({24*3, 24*3, false, i % 2 == 1 ? 0x222327FF : 0x121212FF, draw_diamond})
             .set<ZIndex>({25})
+            .add<ScissorContainer>(leaf.target<EditorCanvas>())
             .child_of(channels_2);
             // .child_of(leaf.target<EditorCanvas>());
 
@@ -1597,6 +1608,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
             .set<Align>({0.0f, 0.0f, 0.8f, 0.0f})
             // .add<DebugRenderBounds>()
             .set<RectRenderable>({10.0f, 24.0f*3, false, i % 2 == 1 ? 0x222327FF : 0x121212FF })
+            .add<ScissorContainer>(leaf.target<EditorCanvas>())
             .set<Expand>({true, 24*1.5f, 0, 0.2f, false, 0, 0, 0})
             .set<ZIndex>({24});
         }
@@ -1715,11 +1727,11 @@ struct RenderQueue {
     }
 
     void addRoundedRectCommand(const Position& pos, const RoundedRectRenderable& renderable, int zIndex, bool useGradient = false, RenderGradient renderGradient = {0, 0}) {
-        commands.push_back({pos, renderable, RenderType::RoundedRectangle, zIndex, useGradient, renderGradient});
+        commands.push_back({pos, renderable, RenderType::RoundedRectangle, zIndex, 0, useGradient, renderGradient});
     }
 
     void addTextCommand(const Position& pos, const TextRenderable& renderable, int zIndex, bool useGradient = false, RenderGradient renderGradient = {0, 0}) {
-        commands.push_back({pos, renderable, RenderType::Text, zIndex, useGradient, renderGradient});
+        commands.push_back({pos, renderable, RenderType::Text, zIndex, 0, useGradient, renderGradient});
     }
 
     void addImageCommand(const Position& pos, const ImageRenderable& renderable, int zIndex) {
@@ -2301,8 +2313,11 @@ int main(int, char *[]) {
     .member<float>("ymin")
     .member<float>("xmax")
     .member<float>("ymax");
+    ECS_COMPONENT(world, UIElementBounds);
     world.component<UIElementSize>();
     world.component<UIContainer>();
+
+    world.component<ScissorContainer>().add(flecs::Transitive);
 
     world.component<EditorNodeArea>();
     world.component<PanelSplit>();
@@ -3359,7 +3374,16 @@ world.system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
     .term_at(0).second<World>()
         .each([&](flecs::entity e, Position& pos, RectRenderable& renderable, ZIndex& zIndex) {
             RenderQueue& queue = world.ensure<RenderQueue>();
-            queue.addRectCommand(pos, renderable, zIndex.layer);
+            // flecs::entity scissorEntity = flecs::entity::null();
+            if (e.has<ScissorContainer>(flecs::Wildcard))
+            {
+                flecs::entity scissorEntity = e.target<ScissorContainer>();
+                queue.commands.push_back({pos, renderable, RenderType::Rectangle, zIndex.layer, scissorEntity});
+                // TODO: Pushback target UIElementBounds as the scissorRegion of RenderCommand
+            } else
+            {
+                queue.commands.push_back({pos, renderable, RenderType::Rectangle, zIndex.layer, 0});
+            }
         });
 
     auto textQueueSystem = world.system<Position, TextRenderable, ZIndex, RenderGradient*>()
@@ -3553,6 +3577,14 @@ world.system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
                         break;
                     }
                     case RenderType::Rectangle: {
+                        if (ecs_is_valid(world, cmd.scissorEntity))
+                        {
+
+                            // flecs::entity scissorEnt = (flecs::entity)cmd.scissorEntity;
+                            // UIElementBounds& scissorBounds = scissorEnt.ensure<UIElementBounds>();
+                            UIElementBounds* scissorBounds = ecs_ensure(world, cmd.scissorEntity, UIElementBounds);
+                            nvgScissor(graphics.vg, scissorBounds->xmin, scissorBounds->ymin, scissorBounds->xmax - scissorBounds->xmin, scissorBounds->ymax - scissorBounds->ymin);
+                        }
                         const auto& rect = std::get<RectRenderable>(cmd.renderData);
                         nvgBeginPath(graphics.vg);
                         nvgRect(graphics.vg, cmd.pos.x, cmd.pos.y, rect.width, rect.height);
@@ -3571,6 +3603,7 @@ world.system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
                             nvgFillColor(graphics.vg, nvgRGBA(r, g, b, a));
                             nvgFill(graphics.vg);
                         }
+                        nvgResetScissor(graphics.vg);
                         break;
                     }
                     case RenderType::Text: {
