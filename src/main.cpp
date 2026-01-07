@@ -1122,8 +1122,6 @@ struct RenderCommand {
     bool useGradient;
     RenderGradient gradient;
 
-    // flecs::ref<UIElementBounds> scissorRegion;
-
     bool operator<(const RenderCommand& other) const {
         return zIndex < other.zIndex;
     }
@@ -1299,7 +1297,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         world.entity()
         .is_a(UIElement)
         .child_of(leaf.target<EditorCanvas>())
-        .set<ImageCreator>({"../assets/heonae_work.png", 1.0f, 1.0f})
+        .set<ImageCreator>({"../assets/blur.jpeg", 1.0f, 1.0f})
         .set<Expand>({true, 0.0f, 0.0f, 1.0f, false, 0.0f, 0.0f, 1.0f})
         .set<Align>({-0.5f, -0.5f, 0.5f, 0.5f})
         .set<Constrain>({true, true})
@@ -1906,6 +1904,15 @@ static void char_callback(GLFWwindow* window, unsigned int codepoint)
     {
         chat->draft.push_back(static_cast<char>(codepoint));
     }
+
+    auto query = world.query<VNCClient>();
+    query.each([&](flecs::entity e, VNCClient& vnc) {
+        if (vnc.connected && vnc.client) {
+            // Send as keysym (Unicode codepoint)
+            SendKeyEvent(vnc.client, codepoint, TRUE);
+            SendKeyEvent(vnc.client, codepoint, FALSE);
+        }
+    });
 }
 
 // GLFW to X11 keysym mapping for VNC input
@@ -3530,10 +3537,14 @@ world.system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
     auto renderExecutionSystem = world.system<RenderQueue, Graphics>()
         .kind(flecs::PostUpdate)
         .each([&](flecs::entity e, RenderQueue& queue, Graphics& graphics) {
-            queue.sort();
-
+            queue.sort();            
             // TODO: Apply scissor regions to relevant entity
             for (const auto& cmd : queue.commands) {
+                if (ecs_is_valid(world, cmd.scissorEntity) && ecs_is_alive(world, cmd.scissorEntity))
+                {
+                    UIElementBounds* scissorBounds = ecs_ensure(world, cmd.scissorEntity, UIElementBounds);
+                    nvgScissor(graphics.vg, scissorBounds->xmin, scissorBounds->ymin, scissorBounds->xmax - scissorBounds->xmin, scissorBounds->ymax - scissorBounds->ymin);
+                }
                 switch (cmd.type) {
                     case RenderType::CustomRenderable: {
                         const auto& custom = std::get<CustomRenderable>(cmd.renderData);
@@ -3577,14 +3588,6 @@ world.system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
                         break;
                     }
                     case RenderType::Rectangle: {
-                        if (ecs_is_valid(world, cmd.scissorEntity))
-                        {
-
-                            // flecs::entity scissorEnt = (flecs::entity)cmd.scissorEntity;
-                            // UIElementBounds& scissorBounds = scissorEnt.ensure<UIElementBounds>();
-                            UIElementBounds* scissorBounds = ecs_ensure(world, cmd.scissorEntity, UIElementBounds);
-                            nvgScissor(graphics.vg, scissorBounds->xmin, scissorBounds->ymin, scissorBounds->xmax - scissorBounds->xmin, scissorBounds->ymax - scissorBounds->ymin);
-                        }
                         const auto& rect = std::get<RectRenderable>(cmd.renderData);
                         nvgBeginPath(graphics.vg);
                         nvgRect(graphics.vg, cmd.pos.x, cmd.pos.y, rect.width, rect.height);
@@ -3603,7 +3606,6 @@ world.system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
                             nvgFillColor(graphics.vg, nvgRGBA(r, g, b, a));
                             nvgFill(graphics.vg);
                         }
-                        nvgResetScissor(graphics.vg);
                         break;
                     }
                     case RenderType::Text: {
@@ -3687,6 +3689,7 @@ world.system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
                         nvgStroke(graphics.vg);
                         break;
                 }
+                nvgResetScissor(graphics.vg);
             }
 
             queue.clear();
