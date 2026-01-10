@@ -592,6 +592,9 @@ enum class EditorType
     Bookshelf,
     Episodic,
     BFO,
+    SceneGraph,
+    // SystemNavigator,
+
     // Bookshelf,
     // MelSpectrogram,
     // VNCStream,
@@ -1172,6 +1175,7 @@ std::vector<std::string> editor_types =
     "Bookshelf",
     "Episodic",
     "BFO",
+    "Scene Graph",
 };
 
 struct VNCData
@@ -1757,6 +1761,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
 
         flecs::entity vnc_entity = world.entity()
         .is_a(UIElement)
+        .add<ActiveIndicator>(vnc_active_outline_indicator)
         .add<IsStreamingFrom>(data.vnc_stream)
         .set<ImageRenderable>({data.client.nvgHandle, 1.0f, 1.0f, (float)data.client.width, (float)data.client.height})
         .set<ZIndex>({9})
@@ -1858,6 +1863,16 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         .set<CustomRenderable>({100.0f, 25.0f, true, 0xFFFFFFFF, draw_double_arrow}) // Support custom arrow badge
         .set<ZIndex>({30})
         .child_of(leaf.target<EditorCanvas>());
+    } else if (editor_type == EditorType::SceneGraph)
+    {
+        flecs::entity root = world.entity()
+        .is_a(UIElement)
+        .set<RectRenderable>({0.0f, 24.0f, false, 0x222327FF })
+        .set<Expand>({true, 0.0f, 0.0f, 1.0f, false, 0, 0, 0})
+        .set<ZIndex>({15})
+        .child_of(leaf.target<EditorCanvas>());
+
+        // TODO: Sprite?
     }
     else
     {
@@ -2154,16 +2169,6 @@ static void char_callback(GLFWwindow* window, unsigned int codepoint)
         {
             chat->draft.push_back(static_cast<char>(codepoint));
         }
-    } else // TODO: Check if VNCClient panel is active like mouse over...
-    {
-        // auto query = world.query<VNCClient>();
-        // query.each([&](flecs::entity e, VNCClient& vnc) {
-        //     if (vnc.connected && vnc.client) {
-        //         // Send as keysym (Unicode codepoint)
-        //         SendKeyEvent(vnc.client, codepoint, TRUE);
-        //         SendKeyEvent(vnc.client, codepoint, FALSE);
-        //     }
-        // });
     }
 
 }
@@ -2488,7 +2493,7 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
     // TODO: Check for focused VNC Stream...
     auto query = world.query<VNCClient>();
     query.each([&](flecs::entity e, VNCClient& vnc) {
-        if (vnc.connected && vnc.client) {
+        if (vnc.connected && vnc.client && vnc.eventPassthroughEnabled) {
             rfbKeySym keysym = glfw_key_to_rfb_keysym(key, mods);
 
             if (action == GLFW_PRESS) {
@@ -3720,20 +3725,23 @@ world.system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
         });
 
 
-    auto rectQueueSystem = world.system<Position, RectRenderable, ZIndex>()
+    auto rectQueueSystem = world.system<Position, RectRenderable, ZIndex, RenderStatus>()
     .kind(flecs::PostUpdate)
     .term_at(0).second<World>()
-        .each([&](flecs::entity e, Position& pos, RectRenderable& renderable, ZIndex& zIndex) {
-            RenderQueue& queue = world.ensure<RenderQueue>();
-            // flecs::entity scissorEntity = flecs::entity::null();
-            if (e.has<ScissorContainer>(flecs::Wildcard))
+        .each([&](flecs::entity e, Position& pos, RectRenderable& renderable, ZIndex& zIndex, RenderStatus& status) {
+            if (status.visible)
             {
-                flecs::entity scissorEntity = e.target<ScissorContainer>();
-                queue.commands.push_back({pos, renderable, RenderType::Rectangle, zIndex.layer, scissorEntity});
-                // TODO: Pushback target UIElementBounds as the scissorRegion of RenderCommand
-            } else
-            {
-                queue.commands.push_back({pos, renderable, RenderType::Rectangle, zIndex.layer, 0});
+                RenderQueue& queue = world.ensure<RenderQueue>();
+                // flecs::entity scissorEntity = flecs::entity::null();
+                if (e.has<ScissorContainer>(flecs::Wildcard))
+                {
+                    flecs::entity scissorEntity = e.target<ScissorContainer>();
+                    queue.commands.push_back({pos, renderable, RenderType::Rectangle, zIndex.layer, scissorEntity});
+                    // TODO: Pushback target UIElementBounds as the scissorRegion of RenderCommand
+                } else
+                {
+                    queue.commands.push_back({pos, renderable, RenderType::Rectangle, zIndex.layer, 0});
+                }
             }
         });
 
@@ -3746,12 +3754,15 @@ world.system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
         queue.addTextCommand(pos, renderable, zIndex.layer, rg, rg ? *rg : RenderGradient{0, 0});
     });
 
-    auto imageQueueSystem = world.system<Position, ImageRenderable, ZIndex>()
+    auto imageQueueSystem = world.system<Position, ImageRenderable, ZIndex, RenderStatus>()
     .kind(flecs::PostUpdate)
     .term_at(0).second<World>()
-    .each([&](flecs::entity e, Position& pos, ImageRenderable& renderable, ZIndex& zIndex) {
+    .each([&](flecs::entity e, Position& pos, ImageRenderable& renderable, ZIndex& zIndex, RenderStatus& status) {
         RenderQueue& queue = world.ensure<RenderQueue>();
-        queue.addImageCommand(pos, renderable, zIndex.layer);
+        if (status.visible)
+        {
+            queue.addImageCommand(pos, renderable, zIndex.layer);
+        }
     });
 
     auto lineQueueSystem = world.system<Position, LineRenderable, ZIndex>()
@@ -4097,14 +4108,25 @@ world.system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
             int vnc_x = (int)((cursorState->x - offset_x) / scale_w);
             int vnc_y = (int)((cursorState->y - offset_y) / scale_h);
 
-            // Clamp to VNC bounds
-            if (vnc_x < 0) vnc_x = 0;
-            if (vnc_y < 0) vnc_y = 0;
-            if (vnc_x >= vnc.width) vnc_x = vnc.width - 1;
-            if (vnc_y >= vnc.height) vnc_y = vnc.height - 1;
+            bool mouseOutOfBounds = vnc_x < 0 || vnc_y < 0 || cursorState->x >= offset_x + img.width || cursorState->y >= offset_y + img.height;
 
-            // Send pointer event with current button mask (preserves button state during drags)
-            SendPointerEvent(vnc.client, vnc_x, vnc_y, g_vncButtonMask);
+            std::cout << vnc_x << std::endl;
+            vnc.eventPassthroughEnabled = !mouseOutOfBounds;
+
+            if (!mouseOutOfBounds)
+            {
+                // Send pointer event with current button mask (preserves button state during drags)
+                SendPointerEvent(vnc.client, vnc_x, vnc_y, g_vncButtonMask);
+            }
+        });
+
+    auto vncPassthroughIndicatorVisibility = world.system<ImageRenderable>()
+        .with<IsStreamingFrom>(flecs::Wildcard)
+        .kind(flecs::PreUpdate)
+        .each([&](flecs::entity e, ImageRenderable& img) {
+            VNCClient& vnc = e.target<IsStreamingFrom>().ensure<VNCClient>();
+            if (!vnc.connected || !vnc.client) return;
+            e.target<ActiveIndicator>().ensure<RenderStatus>().visible = vnc.eventPassthroughEnabled;
         });
 
     auto vncTextureUpdateSystem = world.system<VNCClient>()
@@ -4133,7 +4155,7 @@ world.system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
 
                 // Copy pixel data to avoid race conditions with VNC updates
                 size_t dataSize = surface->pitch * surface->h;
-                job.pixelData.resize(dataSize);
+                job.pixelData.resize(dataSize);                // Send pointer event with current button mask (preserves button state during drags)
                 memcpy(job.pixelData.data(), surface->pixels, dataSize);
 
                 g_visionQueue.submit(job);
@@ -4242,7 +4264,7 @@ world.system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
 
             // TODO: There are no longer quadrants, this is an outdated and no longer acceptable
             // model of how multiple VNC containers are identified
-            // if (container.last_update_timestamp.empty()) {
+            // if (container.last_update_timestamp.empty()) {2000
             //     std::cout << "[X11 Render] Container " << vnc << " has no data" << std::endl;
             //     return;
             // }

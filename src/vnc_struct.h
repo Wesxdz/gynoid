@@ -30,6 +30,7 @@ struct VNCClient {
     std::shared_ptr<std::mutex> surfaceMutex;
     bool needsUpdate = false;
     std::vector<VNCUpdateRect> dirtyRects;
+    bool eventPassthroughEnabled;
 
     friend std::ostream& operator<<(std::ostream& os, const VNCClient& vnc) {
         return os << vnc.host << ":" << vnc.port;
@@ -41,3 +42,4 @@ struct VNCClient {
 };
 
 struct IsStreamingFrom {};
+struct ActiveIndicator {};
