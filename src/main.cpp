@@ -4293,12 +4293,16 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
             if (!vnc.connected || !vnc.client) {
                 return;
             }
-            if (!vnc.needsUpdate) return;
+            if (!vnc.needsUpdate.load(std::memory_order_acquire)) return;
 
             // Swap dirty rect queue (fast, non-blocking)
             auto newRects = vnc.dirtyRectQueue->swap();
             if (newRects.empty()) {
-                vnc.needsUpdate = false;
+                // Double-check queue is still empty before clearing flag
+                std::lock_guard<std::mutex> queueLock(vnc.dirtyRectQueue->mutex);
+                if (vnc.dirtyRectQueue->pending.empty()) {
+                    vnc.needsUpdate.store(false, std::memory_order_release);
+                }
                 return;
             }
 
@@ -4417,8 +4421,14 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
 
                 LOG_TRACE(LogCategory::VNC_CLIENT, "All rects updated successfully");
 
-                // Mark as updated
-                vnc.needsUpdate = false;
+                // Check if more updates arrived while we were processing
+                // Only clear needsUpdate if the queue is truly empty
+                {
+                    std::lock_guard<std::mutex> queueLock(vnc.dirtyRectQueue->mutex);
+                    if (vnc.dirtyRectQueue->pending.empty()) {
+                        vnc.needsUpdate.store(false, std::memory_order_release);
+                    }
+                }
 
                 std::cout << "Updated VNC texture (async PBO)" << std::endl;
             } else {
