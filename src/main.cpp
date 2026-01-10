@@ -737,7 +737,7 @@ enum class RenderType {
     CustomRenderable,
 };
 
-flecs::world world;
+flecs::world* world = nullptr;
 
 void calculate_recursive_bounds(flecs::entity parent, UIElementBounds& total_bounds, bool& first) {
     // Iterate over all children of this entity
@@ -819,7 +819,7 @@ static rfbBool vnc_resize_callback(rfbClient* client) {
 
 static void vnc_update_callback(rfbClient* client, int x, int y, int w, int h) {
     // Mark texture region for update in ECS - find the texture for this specific client
-    auto query = world.query<VNCClient>();
+    auto query = world->query<VNCClient>();
     int updateCount = 0;
     query.each([&](flecs::entity e, VNCClient& vnc) {
         if (vnc.client == client) {
@@ -909,11 +909,11 @@ inline NVGcolor uintToNvgColor(uint32_t hex) {
 
 flecs::entity create_popup(flecs::entity parent)
 {
-    flecs::entity UIElement = world.lookup("UIElement");
+    flecs::entity UIElement = world->lookup("UIElement");
 
     // UIElementSiz parent_size = parent.try_get<UIElementSize>();
 
-    flecs::entity ui_popup = world.entity()
+    flecs::entity ui_popup = world->entity()
         .is_a(UIElement)
         .child_of(parent)
         // TODO: We should add a tag to indicate that we don't want to bubble up bounds...
@@ -1009,7 +1009,7 @@ flecs::entity create_badge(flecs::entity parent, flecs::entity UIElement,
     if (is_double_arrow)
     {
         xPad += 25.0f/2;
-        badge = world.entity()
+        badge = world->entity()
             .is_a(UIElement)
             .child_of(parent)
             .set<CustomRenderable>({100.0f, 25.0f, true, outline_color, draw_double_arrow})
@@ -1019,7 +1019,7 @@ flecs::entity create_badge(flecs::entity parent, flecs::entity UIElement,
 
     } else
     {        
-        badge = world.entity()
+        badge = world->entity()
             .is_a(UIElement)
             .child_of(parent)
             .set<RoundedRectRenderable>({100.0f, badge_height, corner_radius, false, 0x000000FF})
@@ -1028,7 +1028,7 @@ flecs::entity create_badge(flecs::entity parent, flecs::entity UIElement,
             .set<ZIndex>({20});
     
         // Outline Overlay
-        world.entity()
+        world->entity()
             .is_a(UIElement)
             .child_of(badge)
             .set<Expand>({true, 0, 0, 1.0f, true, 0, 0, 1.0f})
@@ -1039,7 +1039,7 @@ flecs::entity create_badge(flecs::entity parent, flecs::entity UIElement,
     flecs::entity badge_text_parent = badge;
     if (bind_to_entity >= 0)
     {
-        auto badge_content = world.entity()
+        auto badge_content = world->entity()
         .is_a(UIElement)
         .set<HorizontalLayoutBox>({0.0f, 0.0f})
         .set<Position, Local>({xPad, 0.0f}) // reduce Y spacing for MNIST
@@ -1050,7 +1050,7 @@ flecs::entity create_badge(flecs::entity parent, flecs::entity UIElement,
     }
 
     // Text with Gradient
-    world.entity()
+    world->entity()
         .is_a(UIElement)
         .child_of(badge_text_parent)
         .set<Position, Local>({xPad, 6.0f})
@@ -1060,7 +1060,7 @@ flecs::entity create_badge(flecs::entity parent, flecs::entity UIElement,
 
     if (bind_to_entity >= 0)
     {
-        world.entity()
+        world->entity()
         .is_a(UIElement)
         .child_of(badge_text_parent)
         .set<ImageCreator>({"../assets/mnist/set_0/0.png", 0.9f, 0.9f})
@@ -1072,11 +1072,11 @@ flecs::entity create_badge(flecs::entity parent, flecs::entity UIElement,
 }
 
 
-void create_editor(flecs::entity leaf, EditorNodeArea& node_area, flecs::world world, flecs::entity UIElement)
+void create_editor(flecs::entity leaf, EditorNodeArea& node_area, flecs::entity UIElement)
 {
     leaf.set<EditorLeafData>({EditorType::Void});
 
-    auto editor_visual = world.entity()
+    auto editor_visual = world->entity()
         .is_a(UIElement)
         .set<Position, Local>({1.0f, 1.0f})
         .set<RoundedRectRenderable>({node_area.width-2, node_area.height-2, 4.0f, false, 0x010222})
@@ -1084,7 +1084,7 @@ void create_editor(flecs::entity leaf, EditorNodeArea& node_area, flecs::world w
 
     leaf.add<EditorVisual>(editor_visual);
 
-    auto editor_outline = world.entity()
+    auto editor_outline = world->entity()
         .is_a(UIElement)
         .child_of(editor_visual)
         // .set<RoundedRectRenderable>({node_area.width-2, node_area.height-2, 4.0f, true, 0x111222FF})
@@ -1093,7 +1093,7 @@ void create_editor(flecs::entity leaf, EditorNodeArea& node_area, flecs::world w
 
     leaf.add<EditorOutline>(editor_outline);
 
-    auto editor_header = world.entity()
+    auto editor_header = world->entity()
         .is_a(UIElement)
         .child_of(editor_visual)
         // .set<RectRenderable>({node_area.width-2-8.0f, 27.0f, true, 0x00000000})
@@ -1103,7 +1103,7 @@ void create_editor(flecs::entity leaf, EditorNodeArea& node_area, flecs::world w
     leaf.add<EditorHeader>(editor_header);
 
     // Add 'expand to parent UIElement bounds with padding'
-    auto editor_canvas = world.entity()
+    auto editor_canvas = world->entity()
         .is_a(UIElement)
         .child_of(editor_visual)
         .set<Position, Local>({4.0f, 23.0f})
@@ -1114,7 +1114,7 @@ void create_editor(flecs::entity leaf, EditorNodeArea& node_area, flecs::world w
 
     leaf.add<EditorCanvas>(editor_canvas);
 
-    auto editor_header_bkg = world.entity()
+    auto editor_header_bkg = world->entity()
         .is_a(UIElement)
         .child_of(editor_visual)
         .set<Position, Local>({0.0f, 0.0f})
@@ -1123,7 +1123,7 @@ void create_editor(flecs::entity leaf, EditorNodeArea& node_area, flecs::world w
         .set<Expand>({true, 0.0f, 0.0f, 1.0f, false, 0, 0, 0})
         .set<ZIndex>({2});
 
-    auto editor_icon_bkg = world.entity()
+    auto editor_icon_bkg = world->entity()
         .is_a(UIElement)
         .child_of(editor_visual)
         .set<Position, Local>({8.0f, 2.0f})
@@ -1133,21 +1133,21 @@ void create_editor(flecs::entity leaf, EditorNodeArea& node_area, flecs::world w
         .add<AddTagOnLeftClick, ShowEditorPanels>()
         .set<ZIndex>({4});
 
-    auto editor_icon = world.entity()
+    auto editor_icon = world->entity()
         .is_a(UIElement)
         .child_of(editor_icon_bkg)
         .set<Position, Local>({2.0f, 0.0f})
         .set<ImageCreator>({"../assets/embodiment.png", 1.0f, 1.0f})
         .set<ZIndex>({12});
 
-    auto editor_dropdown = world.entity()
+    auto editor_dropdown = world->entity()
         .is_a(UIElement)
         .child_of(editor_icon_bkg)
         .set<Position, Local>({22.0f, 8.0f})
         .set<ImageCreator>({"../assets/arrow_down.png", 1.0f, 1.0f})
         .set<ZIndex>({12});
         
-    world.entity()
+    world->entity()
         .is_a(UIElement)
         .child_of(editor_icon_bkg)
         .set<RoundedRectRenderable>({32.0f, 20.0f, 4.0f, true, 0x5f5f5fFF})
@@ -1187,11 +1187,11 @@ struct VNCData
     VNCClient client;
 };
 
-VNCData get_vnc_source(flecs::world& world, const std::string& host, int port) {
+VNCData get_vnc_source(const std::string& host, int port) {
     std::string addr = host + ":" + std::to_string(port);
     
     // 1. Check if we already have this connection
-    auto existing = world.lookup(addr.c_str());
+    auto existing = world->lookup(addr.c_str());
     if (existing && existing.has<VNCClient>()) {
         existing.ensure<VNCClient>().reference_count++;
         return {existing, existing.ensure<VNCClient>()};
@@ -1211,11 +1211,11 @@ VNCData get_vnc_source(flecs::world& world, const std::string& host, int port) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 
-    int nvgVNCHandle = nvglCreateImageFromHandleGL2(world.try_get<Graphics>()->vg, vncTexture, client->width, client->height, 0);
+    int nvgVNCHandle = nvglCreateImageFromHandleGL2(world->try_get<Graphics>()->vg, vncTexture, client->width, client->height, 0);
     
     // Create an entity to hold the shared VNC state
     VNCClient client_data = {client, surface, vncTexture, nvgVNCHandle, true, false, host, port, client->width, client->height, 1, std::make_shared<std::mutex>()};
-    flecs::entity created = world.entity(addr.c_str())
+    flecs::entity created = world->entity(addr.c_str())
         .set<VNCClient>(client_data);
     return {created, client_data};
 }
@@ -1281,13 +1281,12 @@ std::unordered_map<std::string, Position> load_layout(const std::string& path) {
 }
 
 // --- Entity Creation ---
-flecs::entity create_ontology_sprite(flecs::world& world, 
-                                     const std::string& sprite_path, 
+flecs::entity create_ontology_sprite(const std::string& sprite_path, 
                                      flecs::entity parent, 
                                      flecs::entity UIElement, 
                                      Position pos) 
 {  
-    return world.entity()
+    return world->entity()
         .is_a(UIElement)
         .child_of(parent)
         .set<Position, Local>(pos)
@@ -1299,7 +1298,7 @@ flecs::entity create_ontology_sprite(flecs::world& world,
 }
 
 // --- Main Setup Logic ---
-void setup_bfo_hierarchy(flecs::world& ecs, flecs::entity bfo_editor, flecs::entity UIElement) {
+void setup_bfo_hierarchy(flecs::entity bfo_editor, flecs::entity UIElement) {
     // 1. Load layout coordinates from your Krita export
     auto layout_map = load_layout("../assets/config/bfo_layout.txt");
 
@@ -1354,7 +1353,7 @@ void setup_bfo_hierarchy(flecs::world& ecs, flecs::entity bfo_editor, flecs::ent
             pos = layout_map[name + ".png"];
         }
 
-        return create_ontology_sprite(ecs, name, p, UIElement, pos);
+        return create_ontology_sprite(name, p, UIElement, pos);
     };
 
     // 4. Create the root 'entity'
@@ -1384,7 +1383,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
     if (editor_type == EditorType::PeachCore)
     {
 
-        auto server_hud = world.entity("ServerHUD")
+        auto server_hud = world->entity("ServerHUD")
         .is_a(UIElement)
         .set<HorizontalLayoutBox>({0.0f, 0.0f})
         .add<FitChildren>()
@@ -1392,7 +1391,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         .add(flecs::OrderedChildren)
         .child_of(leaf.target<EditorCanvas>());
 
-        auto panel_overlay = world.entity()
+        auto panel_overlay = world->entity()
         .is_a(UIElement)
         .set<ZIndex>({15})
         .set<Expand>({true, 0.0f, 0.0f, 1.0f, true, 0.0f, 0.0f, 1.0f})
@@ -1409,7 +1408,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
 
             if (icon == "chatterbox")
             { 
-                server_icon = world.entity()
+                server_icon = world->entity()
                 .is_a(UIElement)
                 .add<ServerHUDOverlay>(panel_overlay)
                 .add<AddTagOnHoverEnter, ShowServerHUDOverlay>()
@@ -1425,7 +1424,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
                 .add<AddTagOnLeftClick, SelectServer>(); 
             } else
             {
-                server_icon = world.entity()
+                server_icon = world->entity()
                 .is_a(UIElement)
                 .add<ServerHUDOverlay>(panel_overlay)
                 .add<AddTagOnHoverEnter, ShowServerHUDOverlay>()
@@ -1437,7 +1436,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
                 .set<ZIndex>({10});
             }
             // TODO: Server dot should only exist if the server is active...
-            world.entity()
+            world->entity()
             .is_a(UIElement)
             .child_of(server_icon)
             .set<ImageCreator>({"../assets/server_dot.png", 1.0f, 1.0f})
@@ -1452,7 +1451,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         std::cout << diurnal_pos << std::endl;
         int segments = 24;
         for (size_t i = 0; i < segments; ++i) {
-            world.entity()
+            world->entity()
                 .is_a(UIElement)
                 .child_of(leaf.target<EditorCanvas>())
                 .set<DiurnalHour>({i})
@@ -1463,7 +1462,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
     {
         // Healthbar base level
         // Threshold at 0.5
-        world.entity()
+        world->entity()
         .is_a(UIElement)
         .child_of(leaf.target<EditorCanvas>())
         .set<LineRenderable>({0.0f, 0.0f, 100.0f, 0.0f, 2.0f, 0x00FF00FF})
@@ -1471,7 +1470,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         .set<Expand>({true, 0, 0, 1.0, false, 0, 0, 0})
         .set<ZIndex>({10});
 
-        auto threshold_line = world.entity()
+        auto threshold_line = world->entity()
         .is_a(UIElement)
         .child_of(leaf.target<EditorCanvas>())
         .set<RectRenderable>({0.0f, 0.0f, false, 0x00FF0055})
@@ -1480,21 +1479,21 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         .set<Expand>({true, 0, 0, 1.0, true, 0, 0, 0.5})
         .set<ZIndex>({10});
 
-        auto endowment_monthly_income = world.entity()
+        auto endowment_monthly_income = world->entity()
         .is_a(UIElement)
         .child_of(threshold_line)
         .set<Position, Local>({4.0f, -4.0f})
         .set<TextRenderable>({"0.5%", "ATARISTOCRAT", 16.0f, 0xFFFFFFFF})
         .set<ZIndex>({30});
         
-        auto threshold_amount = world.entity()
+        auto threshold_amount = world->entity()
         .is_a(UIElement)
         .child_of(threshold_line)
         .set<Position, Local>({4.0f, 12.0f})
         .set<TextRenderable>({"$1200", "ATARISTOCRAT", 16.0f, 0x00FF00FF})
         .set<ZIndex>({30});
 
-        auto badges = world.entity()
+        auto badges = world->entity()
         .is_a(UIElement)
         .set<HorizontalLayoutBox>({0.0f, 2.0f})
         .set<Position, Local>({48.0f, 0.0f})
@@ -1504,7 +1503,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
     }
     else if (editor_type == EditorType::Embodiment)
     {
-        auto profile = world.entity()
+        auto profile = world->entity()
         .is_a(UIElement)
         .child_of(leaf.target<EditorCanvas>())
         .set<ImageCreator>({"../assets/heonae_profile.png", 1.0f, 1.0f})
@@ -1513,14 +1512,14 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         .set<Constrain>({true, true})
         .set<ZIndex>({10});
 
-        world.entity()
+        world->entity()
         .is_a(UIElement)
         .set<ImageCreator>({"../assets/mnist_version.png", 1.0f, 1.0f})
         // .set<Align>({-0.5f, -0.5f, 1.0f, 0.0f})
         .set<ZIndex>({15})
         .child_of(profile);
 
-        auto badges = world.entity()
+        auto badges = world->entity()
         .is_a(UIElement)
         .set<HorizontalLayoutBox>({0.0f, 2.0f})
         .set<Position, Local>({48.0f, 0.0f})
@@ -1537,19 +1536,19 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
     {
         auto canvas = leaf.target<EditorCanvas>();
 
-        auto chat_root = world.entity()
+        auto chat_root = world->entity()
             .is_a(UIElement)
             .child_of(canvas)
             .set<ZIndex>({5});
 
-        // auto input_text_bar = world.entity()
+        // auto input_text_bar = world->entity()
         //     .is_a(UIElement)
         //     .child_of(chat_root)
         //     .set<RoundedRectRenderable>({100.0f, 32.0f, 2.0f, false, 0x444444FF})
         //     .set<Expand>({true, 0.0f, 4.0f, 1.0f, false, 0, 0, 0})
         //     .set<ZIndex>({10});
 
-        auto messages_panel = world.entity()
+        auto messages_panel = world->entity()
             .is_a(UIElement)
             .child_of(chat_root)
             .set<RoundedRectRenderable>({100.0f, 100.0f, 4.0f, false, 0x050505FF})
@@ -1557,7 +1556,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
             // .set<Expand>({true, 8.0f, 8.0f, 1.0f, true, 8.0f, 36.0f, })
             .set<ZIndex>({10});
 
-        auto input_panel = world.entity()
+        auto input_panel = world->entity()
             .is_a(UIElement)
             .child_of(chat_root)
             .set<RoundedRectRenderable>({100.0f, 36.0f, 2.0f, true, 0x555555FF})
@@ -1565,14 +1564,14 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
             .set<ZIndex>({10});
 
             // TODO: We need to scale the input bkg to the text/content size...
-        auto input_bkg = world.entity()
+        auto input_bkg = world->entity()
             .is_a(UIElement)
             .child_of(input_panel)
             .set<RoundedRectRenderable>({10.0f, 10.0f, 2.0f, false, 0x222327FF})
             .set<Expand>({true, 0, 0, 1, true, 0, 0, 1})
             .set<ZIndex>({9});
 
-        auto input_text = world.entity()
+        auto input_text = world->entity()
             .is_a(UIElement)
             // .add<DebugRenderBounds>()
             .child_of(input_panel)
@@ -1580,26 +1579,26 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
             .set<TextRenderable>({"", "Inter", 16.0f, 0xFFFFFFFF})
             .set<ZIndex>({12});
 
-        auto message_list = world.entity()
+        auto message_list = world->entity()
             .is_a(UIElement)
             .child_of(chat_root)
             .add(flecs::OrderedChildren)
             .set<Position, Local>({12.0f, 16.0f})
             .set<VerticalLayoutBox>({0.0f, 4.0f, 1.0f});
 
-        auto msg_container = world.entity()
+        auto msg_container = world->entity()
         .is_a(UIElement)
         .set<UIContainer>({4, 4})
         .child_of(message_list);
 
-        auto meta_input = world.entity()
+        auto meta_input = world->entity()
         .is_a(UIElement)
         .set<HorizontalLayoutBox>({0.0f, 2.0f})
         .add(flecs::OrderedChildren)
         // .add<DebugRenderBounds>()
         .child_of(message_list);
 
-        auto black_bkg = world.entity()
+        auto black_bkg = world->entity()
         .is_a(UIElement)
         .set<ZIndex>({8})
         .set<Expand>({true, 0.0f, 0.0f, 1.0f, true, 0.0f, 0.0f, 1.0f})
@@ -1616,7 +1615,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
     }
     else if (editor_type == EditorType::Bookshelf)
     {
-        auto bookshelf_layer = world.entity()
+        auto bookshelf_layer = world->entity()
             .is_a(UIElement)
             .child_of(leaf.target<EditorCanvas>())
             .set<HorizontalLayoutBox>({0.0f, 8.0f})
@@ -1633,7 +1632,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         };
 
         for (const auto& cover : covers) {
-            world.entity()
+            world->entity()
                 .is_a(UIElement)
                 .child_of(bookshelf_layer)
                 .set<ImageCreator>({"../assets/" + cover, 1.0f, 1.0f})
@@ -1645,7 +1644,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         }
 
         // TODO: Papers
-        // world.entity()
+        // world->entity()
         // .is_a(UIElement)
         // .child_of(bookshelf_layer)
         // .set<ImageCreator>({"../assets/cuct.png", 1.0f, 1.0f})
@@ -1656,7 +1655,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
     {
         std::cout << "Creating Hearing editor..." << std::endl;
 
-        auto badges = world.entity()
+        auto badges = world->entity()
         .is_a(UIElement)
         .set<HorizontalLayoutBox>({0.0f, 2.0f})
         .set<Position, Local>({48.0f, 0.0f})
@@ -1666,14 +1665,14 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         create_badge(badges, UIElement, "Microphone", 0xc43131ff, false);
 
         // Create vertical layout for mel spectrograms
-        auto hearing_layer = world.entity()
+        auto hearing_layer = world->entity()
             .is_a(UIElement)
             .child_of(leaf.target<EditorCanvas>())
             .set<VerticalLayoutBox>({0.0f, 4.0f})
             .set<Align>({-0.5f, -0.5f, 0.5f, 0.5f});
         // Look up the mel spec renderer entities
-        auto micRenderer = world.lookup("MelSpecRenderer");
-        auto sysAudioRenderer = world.lookup("SystemAudioRenderer");
+        auto micRenderer = world->lookup("MelSpecRenderer");
+        auto sysAudioRenderer = world->lookup("SystemAudioRenderer");
 
         std::cout << "MicRenderer exists: " << (micRenderer ? "yes" : "no") << std::endl;
         std::cout << "SysAudioRenderer exists: " << (sysAudioRenderer ? "yes" : "no") << std::endl;
@@ -1685,7 +1684,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
                       << " size: " << melSpec.width << "x" << melSpec.height << std::endl;
 
             // Create microphone mel spec display
-            world.entity()
+            world->entity()
                 .is_a(UIElement)
                 .child_of(hearing_layer)
                 .set<ImageRenderable>({melSpec.nvgTextureHandle, 1.0f, 1.0f, (float)melSpec.width, (float)melSpec.height})
@@ -1694,7 +1693,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
                 .set<ZIndex>({10});
 
             // Add label for microphone
-            // world.entity()
+            // world->entity()
             //     .is_a(UIElement)
             //     .child_of(hearing_layer)
             //     .set<Position, Local>({8.0f, 0.0f})
@@ -1709,7 +1708,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
                       << " size: " << melSpec.width << "x" << melSpec.height << std::endl;
 
             // Create system audio mel spec display
-            world.entity()
+            world->entity()
                 .is_a(UIElement)
                 .child_of(hearing_layer)
                 .set<ImageRenderable>({melSpec.nvgTextureHandle, 1.0f, 1.0f, (float)melSpec.width, (float)melSpec.height})
@@ -1718,7 +1717,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
                 .set<ZIndex>({10});
 
             // Add label for system audio
-            // world.entity()
+            // world->entity()
             //     .is_a(UIElement)
             //     .child_of(hearing_layer)
             //     .set<Position, Local>({8.0f, 0.0f})
@@ -1728,7 +1727,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
     }
     else if (editor_type == EditorType::VNCStream)
     {
-        auto badges = world.entity()
+        auto badges = world->entity()
         .is_a(UIElement)
         .set<HorizontalLayoutBox>({0.0f, 2.0f})
         .set<Position, Local>({48.0f, 0.0f})
@@ -1751,10 +1750,10 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         int port = 5901;
         std::string host_string = std::string(vnc_host) + ":" + std::to_string(port);
 
-        VNCData data = get_vnc_source(world, vnc_host, port);
+        VNCData data = get_vnc_source(vnc_host, port);
         // const VNCClient* vncClient = vncStreamSource.try_get<VNCClient>();
 
-        flecs::entity vnc_active_outline_indicator = world.entity()
+        flecs::entity vnc_active_outline_indicator = world->entity()
         .is_a(UIElement)
         .set<ZIndex>({100})
         .set<RectRenderable>({100, 1, true, 0x00ff00ff})
@@ -1762,7 +1761,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         .set<Expand>({true, 0.0f, 0.0f, 1.0f, false, 0, 0, 0.0f})
         .child_of(leaf.target<EditorCanvas>());
 
-        flecs::entity vnc_entity = world.entity()
+        flecs::entity vnc_entity = world->entity()
         .is_a(UIElement)
         .add<ActiveIndicator>(vnc_active_outline_indicator)
         .add<IsStreamingFrom>(data.vnc_stream)
@@ -1781,7 +1780,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         // Modulus rows
 
         // TODO: Fractal granularity navigation
-        auto channels = world.entity()
+        auto channels = world->entity()
         .is_a(UIElement)
         .set<Expand>({true, 0, 0, 1, false, 0, 0, 0})
         .add<VerticalLayoutBox>()
@@ -1789,7 +1788,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         .add<ScissorContainer>(leaf.target<EditorCanvas>())
         .child_of(leaf.target<EditorCanvas>());
 
-        auto channels_2 = world.entity()
+        auto channels_2 = world->entity()
         .is_a(UIElement)
         .set<Expand>({true, 0, 0, 1, false, 0, 0, 0})
         .add<VerticalLayoutBox>()
@@ -1797,7 +1796,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         .add<ScissorContainer>(leaf.target<EditorCanvas>())
         .child_of(leaf.target<EditorCanvas>());
 
-        auto channels_3 = world.entity()
+        auto channels_3 = world->entity()
         .is_a(UIElement)
         .set<Expand>({true, 0, 0, 1, false, 0, 0, 0})
         .add<VerticalLayoutBox>()
@@ -1809,7 +1808,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
 
         for (size_t i = 0; i < 6; i++)
         {
-            world.entity()
+            world->entity()
                 .is_a(UIElement)
                 .child_of(channels)
                 .set<RectRenderable>({10.0f, 24.0f, false, i % 2 == 0 ? 0x222327FF : 0x121212FF })
@@ -1820,7 +1819,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
             
         for (size_t i = 0; i < 2; i++)
         {
-            world.entity()
+            world->entity()
             .is_a(UIElement)
             .set<Align>({0.0f, 0.0f, 0.8f, 0.0f})
             .set<CustomRenderable>({24*3, 24*3, false, i % 2 == 1 ? 0x222327FF : 0x121212FF, draw_diamond})
@@ -1829,7 +1828,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
             .child_of(channels_2);
             // .child_of(leaf.target<EditorCanvas>());
 
-            world.entity()
+            world->entity()
             .is_a(UIElement)
             .child_of(channels_3)
             .set<Align>({0.0f, 0.0f, 0.8f, 0.0f})
@@ -1841,7 +1840,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         }
     } else if (editor_type == EditorType::BFO)
     {
-        auto bfo_editor = world.entity()
+        auto bfo_editor = world->entity()
         .is_a(UIElement)
         // .add<HorizontalLayoutBox>()
         // .add(flecs::OrderedChildren)
@@ -1849,26 +1848,26 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         .set<ZIndex>({30})
         .child_of(leaf.target<EditorCanvas>());
 
-        auto bfo_editor_outline = world.entity()
+        auto bfo_editor_outline = world->entity()
         .is_a(UIElement)
         .set<RectRenderable>({156.0f, 195.0f, true, 0xc92b23FF})
         .set<ZIndex>({32})
         .child_of(leaf.target<EditorCanvas>());
     
-        setup_bfo_hierarchy(world, bfo_editor, UIElement);
+        setup_bfo_hierarchy(bfo_editor, UIElement);
         
 
         // std::vector<std::string> bfo_categories = {"entity", "continuant", "occurrent", "process_boundary", "process", "spatiotemporal_region", "temporal_interval", "independent_continuant", "material"entity, "fiat_object_part", "specifically_dependent_continuant", "generically_dependent_continuant", "object_aggregate", "object", "site", "spatial_region", "immaterial_entity"};
     } else if (editor_type == EditorType::Void)
     {
-        auto test = world.entity()
+        auto test = world->entity()
         .is_a(UIElement)
         .set<CustomRenderable>({100.0f, 25.0f, true, 0xFFFFFFFF, draw_double_arrow}) // Support custom arrow badge
         .set<ZIndex>({30})
         .child_of(leaf.target<EditorCanvas>());
     } else if (editor_type == EditorType::SceneGraph)
     {
-        flecs::entity root = world.entity()
+        flecs::entity root = world->entity()
         .is_a(UIElement)
         .set<RectRenderable>({0.0f, 24.0f, false, 0x222327FF })
         .set<Expand>({true, 0.0f, 0.0f, 1.0f, false, 0, 0, 0})
@@ -1879,7 +1878,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
     }
     else
     {
-        auto editor_icon_bkg_square = world.entity()
+        auto editor_icon_bkg_square = world->entity()
         .is_a(UIElement)
         .child_of(leaf.target<EditorCanvas>())
         .set<Position, Local>({4.0f, 12.0f})
@@ -1906,7 +1905,7 @@ void replace_editor_content(flecs::entity leaf, EditorType editor_type, flecs::e
     create_editor_content(leaf, editor_type, UIElement);
 }
 
-void merge_editor(flecs::entity non_leaf, flecs::world world, flecs::entity UIElement)
+void merge_editor(flecs::entity non_leaf, flecs::entity UIElement)
 {
     non_leaf.remove<PanelSplit>();
     non_leaf.remove<LeftNode>(flecs::Wildcard);
@@ -1918,10 +1917,10 @@ void merge_editor(flecs::entity non_leaf, flecs::world world, flecs::entity UIEl
         child.destruct();
     });
     EditorNodeArea& intermediate_area = non_leaf.ensure<EditorNodeArea>();
-    create_editor(non_leaf, intermediate_area, world, UIElement);
+    create_editor(non_leaf, intermediate_area, UIElement);
 }
 
-void split_editor(PanelSplit split, flecs::entity leaf, flecs::world world, flecs::entity UIElement)
+void split_editor(PanelSplit split, flecs::entity leaf, flecs::entity UIElement)
 {
     // Destroy any existing visual
     flecs::entity existing_visual = leaf.target<EditorVisual>();
@@ -1936,45 +1935,45 @@ void split_editor(PanelSplit split, flecs::entity leaf, flecs::world world, flec
     if (split.dim == PanelSplitType::Horizontal)
     {   
         EditorNodeArea left_node_area = {node_area->width*split.percent, node_area->height};
-        auto left_editor_leaf = world.entity()
+        auto left_editor_leaf = world->entity()
             .child_of(leaf)
             .set<Position, Local>({0.0f, 0.0f})
             .set<Position, World>({0.0f, 0.0f})
             .set<EditorNodeArea>(left_node_area)
             .add(flecs::OrderedChildren);
-        create_editor(left_editor_leaf, left_node_area, world, UIElement);
+        create_editor(left_editor_leaf, left_node_area, UIElement);
         leaf.add<LeftNode>(left_editor_leaf);
 
         EditorNodeArea right_node_area = {node_area->width*(1.0f-split.percent), node_area->height};
-        auto right_editor_leaf = world.entity()
+        auto right_editor_leaf = world->entity()
             .child_of(leaf)
             .set<Position, Local>({node_area->width*split.percent, 0.0f})
             .set<Position, World>({0.0f, 0.0f})
             .set<EditorNodeArea>(right_node_area) 
             .add(flecs::OrderedChildren);
-        create_editor(right_editor_leaf, right_node_area, world, UIElement);
+        create_editor(right_editor_leaf, right_node_area, UIElement);
         leaf.add<RightNode>(right_editor_leaf);
     }
     if (split.dim == PanelSplitType::Vertical)
     {   
         EditorNodeArea upper_node_area = {node_area->width, node_area->height*split.percent};
-        auto upper_editor_leaf = world.entity()
+        auto upper_editor_leaf = world->entity()
             .child_of(leaf)
             .set<Position, Local>({0.0f, 0.0f})
             .set<Position, World>({0.0f, 0.0f})
             .set<EditorNodeArea>(upper_node_area) 
             .add(flecs::OrderedChildren);
-        create_editor(upper_editor_leaf, upper_node_area, world, UIElement);
+        create_editor(upper_editor_leaf, upper_node_area, UIElement);
         leaf.add<UpperNode>(upper_editor_leaf);
         
         EditorNodeArea lower_node_area = {node_area->width, node_area->height*(1-split.percent)};
-        auto lower_editor_leaf = world.entity()
+        auto lower_editor_leaf = world->entity()
             .child_of(leaf)
             .set<Position, Local>({0.0f, node_area->height*split.percent})
             .set<Position, World>({0.0f, 0.0f})
             .set<EditorNodeArea>(lower_node_area) 
             .add(flecs::OrderedChildren);
-        create_editor(lower_editor_leaf, lower_node_area, world, UIElement);
+        create_editor(lower_editor_leaf, lower_node_area, UIElement);
         leaf.add<LowerNode>(lower_editor_leaf);
     }
 }
@@ -2029,7 +2028,7 @@ void framebuffer_size_callback(GLFWwindow* window, int width, int height) {
 
 void window_size_callback(GLFWwindow* window, int width, int height)
 {
-    Window& window_comp = world.lookup("GLFWState").ensure<Window>();
+    Window& window_comp = world->lookup("GLFWState").ensure<Window>();
     window_comp.width = width;
     window_comp.height = height;
 }
@@ -2047,9 +2046,9 @@ bool point_in_bounds(float x, float y, UIElementBounds bounds)
 static void cursor_position_callback(GLFWwindow* window, double xpos, double ypos)
 {
     // TODO: Move to Observer?
-    CursorState& cursor_state = world.lookup("GLFWState").ensure<CursorState>();
+    CursorState& cursor_state = world->lookup("GLFWState").ensure<CursorState>();
     // TODO: Query for hoverable UIElement 
-    flecs::query hoverable_elements = world.query_builder<AddTagOnHoverEnter, AddTagOnHoverExit, UIElementBounds>()
+    flecs::query hoverable_elements = world->query_builder<AddTagOnHoverEnter, AddTagOnHoverExit, UIElementBounds>()
     .term_at(0).second(flecs::Wildcard).optional()
     .term_at(1).second(flecs::Wildcard).optional()
     .build();
@@ -2061,13 +2060,13 @@ static void cursor_position_callback(GLFWwindow* window, double xpos, double ypo
         if (in_bounds_prior && !in_bounds_post && ui_element.has<AddTagOnHoverExit>(flecs::Wildcard))
         {
             // TODO: Store hover state...
-            world.event<HoverExitEvent>()
+            world->event<HoverExitEvent>()
             .id<UIElementBounds>()
             .entity(ui_element)
             .enqueue();  
         } else if (!in_bounds_prior && in_bounds_post && ui_element.has<AddTagOnHoverEnter>(flecs::Wildcard))
         {   
-            world.event<HoverEnterEvent>()
+            world->event<HoverEnterEvent>()
             .id<UIElementBounds>()
             .entity(ui_element)
             .enqueue();
@@ -2083,32 +2082,32 @@ static int g_vncButtonMask = 0;
 
 void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
 {
-    flecs::entity glfw_state = world.lookup("GLFWState");
+    flecs::entity glfw_state = world->lookup("GLFWState");
     if (button == GLFW_MOUSE_BUTTON_LEFT)
     {
         if (action == GLFW_PRESS)
         {
-            flecs::query interactive_elements = world.query_builder<AddTagOnLeftClick, UIElementBounds>()
+            flecs::query interactive_elements = world->query_builder<AddTagOnLeftClick, UIElementBounds>()
             .term_at(0).second(flecs::Wildcard)
             .build();
             // TODO: Eventually this should use a more efficient partition bound check as the first layer
-            const CursorState* cursor_state = world.lookup("GLFWState").try_get<CursorState>();
+            const CursorState* cursor_state = world->lookup("GLFWState").try_get<CursorState>();
             interactive_elements.each([&](flecs::entity ui_element, AddTagOnLeftClick, UIElementBounds& bounds) {
                 if (point_in_bounds(cursor_state->x, cursor_state->y, bounds))
                 {
-                    world.event<LeftClickEvent>()
+                    world->event<LeftClickEvent>()
                     .id<UIElementBounds>()
                     .entity(ui_element)
                     .emit();
                 } 
             });
-            world.event<LeftClickEvent>()
+            world->event<LeftClickEvent>()
             .id<CursorState>()
             .entity(glfw_state)
             .emit();
         } else if (action == GLFW_RELEASE)
         {
-            world.event<LeftReleaseEvent>()
+            world->event<LeftReleaseEvent>()
             .id<CursorState>()
             .entity(glfw_state)
             .emit();
@@ -2131,7 +2130,7 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
     }
 
     // Find the active VNC client
-    auto query = world.query<VNCClient, Position, ImageRenderable>();
+    auto query = world->query<VNCClient, Position, ImageRenderable>();
     query.each([&](flecs::entity e, VNCClient& vnc, Position& pos, ImageRenderable& img) {
         if (vnc.connected && vnc.client) {
             // Convert mouse coordinates from window space to VNC space
@@ -2165,7 +2164,7 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
 static void char_callback(GLFWwindow* window, unsigned int codepoint)
 {
     // Multiple chat query... only one active
-    ChatState* chat = world.try_get_mut<ChatState>();
+    ChatState* chat = world->try_get_mut<ChatState>();
     if (chat && chat->input_focused)
     {
         if (codepoint >= 32 && codepoint < 127)
@@ -2365,17 +2364,17 @@ std::unique_ptr<EditorConfigNode> read_editor_config(std::ifstream& in) {
     return node;
 }
 
-void apply_editor_config(const EditorConfigNode& config, flecs::entity node, flecs::world& world, flecs::entity UIElement);
+void apply_editor_config(const EditorConfigNode& config, flecs::entity node, flecs::entity UIElement);
 
-void apply_editor_config(const EditorConfigNode& config, flecs::entity node, flecs::world& world, flecs::entity UIElement) {
+void apply_editor_config(const EditorConfigNode& config, flecs::entity node, flecs::entity UIElement) {
     if (config.is_leaf) {
         EditorNodeArea& area = node.ensure<EditorNodeArea>();
-        create_editor(node, area, world, UIElement);
+        create_editor(node, area, UIElement);
         // Override the default Void type and create content
         node.set<EditorLeafData>({config.editor_type});
         create_editor_content(node, config.editor_type, UIElement);
     } else {
-        split_editor({config.split_percent, config.split_dim}, node, world, UIElement);
+        split_editor({config.split_percent, config.split_dim}, node, UIElement);
 
         if (config.split_dim == PanelSplitType::Horizontal) {
             flecs::entity left = node.target<LeftNode>();
@@ -2385,13 +2384,13 @@ void apply_editor_config(const EditorConfigNode& config, flecs::entity node, fle
                 flecs::entity visual = left.target<EditorVisual>();
                 if (visual.is_valid()) visual.destruct();
                 left.remove<EditorLeafData>();
-                apply_editor_config(*config.child_a, left, world, UIElement);
+                apply_editor_config(*config.child_a, left, UIElement);
             }
             if (right.is_valid() && config.child_b) {
                 flecs::entity visual = right.target<EditorVisual>();
                 if (visual.is_valid()) visual.destruct();
                 right.remove<EditorLeafData>();
-                apply_editor_config(*config.child_b, right, world, UIElement);
+                apply_editor_config(*config.child_b, right, UIElement);
             }
         } else {
             flecs::entity upper = node.target<UpperNode>();
@@ -2400,26 +2399,26 @@ void apply_editor_config(const EditorConfigNode& config, flecs::entity node, fle
                 flecs::entity visual = upper.target<EditorVisual>();
                 if (visual.is_valid()) visual.destruct();
                 upper.remove<EditorLeafData>();
-                apply_editor_config(*config.child_a, upper, world, UIElement);
+                apply_editor_config(*config.child_a, upper, UIElement);
             }
             if (lower.is_valid() && config.child_b) {
                 flecs::entity visual = lower.target<EditorVisual>();
                 if (visual.is_valid()) visual.destruct();
                 lower.remove<EditorLeafData>();
-                apply_editor_config(*config.child_b, lower, world, UIElement);
+                apply_editor_config(*config.child_b, lower, UIElement);
             }
         }
     }
 }
 
-bool load_editor_layout(flecs::entity editor_root, flecs::world& world, flecs::entity UIElement) {
+bool load_editor_layout(flecs::entity editor_root, flecs::entity UIElement) {
     std::ifstream in("editor_layout.cfg");
     if (!in.is_open()) return false;
 
     auto config = read_editor_config(in);
     if (!config) return false;
 
-    apply_editor_config(*config, editor_root, world, UIElement);
+    apply_editor_config(*config, editor_root, UIElement);
     std::cout << "Editor layout loaded from editor_layout.cfg" << std::endl;
     return true;
 }
@@ -2430,7 +2429,7 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
     {
         if (key == GLFW_KEY_S && mods & GLFW_MOD_CONTROL)
         {
-            flecs::entity editor_root = world.lookup("editor_root");
+            flecs::entity editor_root = world->lookup("editor_root");
             if (editor_root.is_valid()) {
                 save_editor_layout(editor_root);
             }
@@ -2438,7 +2437,7 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
         }
 
     // Retrieve the singleton ChatState
-    ChatState* chat = world.try_get_mut<ChatState>();
+    ChatState* chat = world->try_get_mut<ChatState>();
     if (chat)
     {
     if (key == GLFW_KEY_BACKSPACE)
@@ -2458,13 +2457,13 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
             chat->messages.push_back({"You", chat->draft});
 
             // Query for the ChatPanel entity to attach the UI element to
-            world.query<ChatPanel>()
+            world->query<ChatPanel>()
                 .each([&](flecs::entity leaf, ChatPanel& chat_panel) {
                     
-                    auto UIElement = world.lookup("UIElement");
+                    auto UIElement = world->lookup("UIElement");
                     
                     // Create the background bubble
-                    auto example_message_bkg = world.entity()
+                    auto example_message_bkg = world->entity()
                         .is_a(UIElement)
                         .child_of(chat_panel.message_list) // Attached to the ChatPanel found via query
                         .set<RoundedRectRenderable>({100.0f, 16.0f, 2.0f, false, 0x121212FF})
@@ -2473,7 +2472,7 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                         // .add<DebugRenderBounds>()
                         .set<ZIndex>({15});
                         
-                        auto message_content = world.entity()
+                        auto message_content = world->entity()
                         .is_a(UIElement)
                         .set<Position, Local>({8, 8})
                         .child_of(example_message_bkg)
@@ -2481,7 +2480,7 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                         .add<VerticalLayoutBox>();
 
                     // Create the text content using the actual draft
-                    auto example_message_text = world.entity()
+                    auto example_message_text = world->entity()
                         .is_a(UIElement)
                         .child_of(message_content)
                         .set<TextRenderable>({chat->draft.c_str(), "Inter", 16.0f, 0xFFFFFFFF})
@@ -2494,7 +2493,7 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
     } 
     }
     // TODO: Check for focused VNC Stream...
-    auto query = world.query<VNCClient>();
+    auto query = world->query<VNCClient>();
     query.each([&](flecs::entity e, VNCClient& vnc) {
         if (vnc.connected && vnc.client && vnc.eventPassthroughEnabled) {
             rfbKeySym keysym = glfw_key_to_rfb_keysym(key, mods);
@@ -2560,11 +2559,14 @@ int main(int, char *[]) {
     os_api.perf_trace_pop_ = trace_pop;
     ecs_os_set_api(&os_api);
 
+    flecs::world world_instance;
+    world = &world_instance;
+
     // Initialize spatial index manager
-    spatial::SpatialIndexManager spatial_manager(&world);
+    spatial::SpatialIndexManager spatial_manager(world);
 
     // Register std::string as an opaque type for serialization
-    world.component<std::string>()
+    world->component<std::string>()
         .opaque(flecs::String)
         .serialize([](const flecs::serializer *s, const std::string *data) {
             const char *str = data->c_str();
@@ -2576,7 +2578,7 @@ int main(int, char *[]) {
 
     // TODO: Register spatial data
 
-    query_server::initialize(&world, &spatial_manager);
+    query_server::initialize(world, &spatial_manager);
 
     // TODO: query_server::register_spatial_handler
     // Can this be moved elsewhere?
@@ -2625,62 +2627,62 @@ int main(int, char *[]) {
         return -1;
     }
 
-    world.component<Position>()
+    world->component<Position>()
     .member<float>("x")
     .member<float>("y");
-    world.component<Velocity>();
-    world.component<RectRenderable>();
-    world.component<CustomRenderable>();
-    world.component<TextRenderable>();
-    world.component<ImageCreator>();
-    world.component<ImageRenderable>();
-    world.component<ZIndex>()
+    world->component<Velocity>();
+    world->component<RectRenderable>();
+    world->component<CustomRenderable>();
+    world->component<TextRenderable>();
+    world->component<ImageCreator>();
+    world->component<ImageRenderable>();
+    world->component<ZIndex>()
     .member<int>("layer");
 
-    world.component<RenderGradient>();
+    world->component<RenderGradient>();
 
-    world.component<Window>();
-    world.component<CursorState>();
-    world.component<Graphics>().add(flecs::Singleton);
-    world.component<RenderQueue>();
-    world.component<UIElementBounds>()
+    world->component<Window>();
+    world->component<CursorState>();
+    world->component<Graphics>().add(flecs::Singleton);
+    world->component<RenderQueue>();
+    world->component<UIElementBounds>()
     .member<float>("xmin")
     .member<float>("ymin")
     .member<float>("xmax")
     .member<float>("ymax");
-    ECS_COMPONENT(world, UIElementBounds);
-    world.component<UIElementSize>();
-    world.component<UIContainer>();
+    ECS_COMPONENT(*world, UIElementBounds);
+    world->component<UIElementSize>();
+    world->component<UIContainer>();
 
-    world.component<ScissorContainer>().add(flecs::Transitive);
+    world->component<ScissorContainer>().add(flecs::Transitive);
 
-    world.component<EditorNodeArea>();
-    world.component<PanelSplit>();
+    world->component<EditorNodeArea>();
+    world->component<PanelSplit>();
 
-    world.component<Align>();
-    world.component<Expand>();
-    world.component<Constrain>();
-    world.component<BFOSprite>();
+    world->component<Align>();
+    world->component<Expand>();
+    world->component<Constrain>();
+    world->component<BFOSprite>();
 
-    world.component<ParentClass>().add(flecs::Transitive);
+    world->component<ParentClass>().add(flecs::Transitive);
 
-    world.component<HorizontalLayoutBox>();
-    world.component<VerticalLayoutBox>();
+    world->component<HorizontalLayoutBox>();
+    world->component<VerticalLayoutBox>();
     
-    world.component<DiurnalHour>();
+    world->component<DiurnalHour>();
 
-    world.component<ChatMessage>();
-    world.component<ChatMessageView>();
-    world.component<ChatState>().add(flecs::Singleton);
-    world.component<ChatPanel>();
-    world.component<FocusChatInput>();
-    world.component<SendChatMessage>();
-    world.set<ChatState>({std::vector<ChatMessage>{}, "", false});
+    world->component<ChatMessage>();
+    world->component<ChatMessageView>();
+    world->component<ChatState>().add(flecs::Singleton);
+    world->component<ChatPanel>();
+    world->component<FocusChatInput>();
+    world->component<SendChatMessage>();
+    world->set<ChatState>({std::vector<ChatMessage>{}, "", false});
 
-    world.component<DragContext>().add(flecs::Singleton);
-    world.set<DragContext>({false, flecs::entity::null(), PanelSplitType::Horizontal, 0.0f});
+    world->component<DragContext>().add(flecs::Singleton);
+    world->set<DragContext>({false, flecs::entity::null(), PanelSplitType::Horizontal, 0.0f});
 
-    world.observer<ImageCreator, Graphics>()
+    world->observer<ImageCreator, Graphics>()
     .event(flecs::OnSet)
     .each([&](flecs::entity e, ImageCreator& img, Graphics& graphics)
     {
@@ -2693,7 +2695,7 @@ int main(int, char *[]) {
         e.remove<ImageCreator>();
     });
 
-    world.observer<ImageRenderable, Graphics>()
+    world->observer<ImageRenderable, Graphics>()
     .event(flecs::OnSet)
     .each([&](flecs::entity e, ImageRenderable& img, Graphics& graphics)
     {
@@ -2706,25 +2708,25 @@ int main(int, char *[]) {
     double cursorXPos, cursorYPos;
     glfwGetCursorPos(window, &cursorXPos, &cursorYPos);
 
-    auto glfwStateEntity = world.entity("GLFWState")
+    auto glfwStateEntity = world->entity("GLFWState")
         .set<Window>({window, 800, 600})
         .set<CursorState>({cursorXPos, cursorYPos});
 
-    auto graphicsEntity = world.entity("Graphics")
+    auto graphicsEntity = world->entity("Graphics")
         .set<Graphics>({vg});
 
-    auto renderQueueEntity = world.entity("RenderQueue")
+    auto renderQueueEntity = world->entity("RenderQueue")
         .set<RenderQueue>({});
 
     // Initialize debug logger module (MUST BE FIRST!)
-    DebugLogModule(world);
+    DebugLogModule(*world);
 
-    X11OutlineModule(world);
+    X11OutlineModule(*world);
 
     // Initialize mel spectrogram rendering module (must be after Graphics entity is created)
-    MelSpecRenderModule(world);
+    MelSpecRenderModule(*world);
 
-    auto UIElement = world.prefab("UIElement")
+    auto UIElement = world->prefab("UIElement")
         .set<Position, Local>({0.0f, 0.0f})
         .set<Position, World>({0.0f, 0.0f})
         .set<UIElementBounds>({0, 0, 0, 0})
@@ -2733,9 +2735,9 @@ int main(int, char *[]) {
         .set<ZIndex>({0});
 
     // TODO: Text search field
-    // auto FieldEntry = world.prefab("FieldEntry")
+    // auto FieldEntry = world->prefab("FieldEntry")
 
-    world.observer<UIElementBounds, AddTagOnHoverEnter>()
+    world->observer<UIElementBounds, AddTagOnHoverEnter>()
     .term_at(1).second<ShowServerHUDOverlay>()
     .event<HoverEnterEvent>()
     .each([&](flecs::entity e, UIElementBounds& bounds, AddTagOnHoverEnter)
@@ -2747,7 +2749,7 @@ int main(int, char *[]) {
         // overlay.set<ZIndex>({15});
     });
     
-    world.observer<UIElementBounds, AddTagOnHoverExit>()
+    world->observer<UIElementBounds, AddTagOnHoverExit>()
     .term_at(1).second<HideServerHUDOverlay>()
     .event<HoverExitEvent>()
     .each([&](flecs::entity e, UIElementBounds& bounds, AddTagOnHoverExit)
@@ -2761,12 +2763,12 @@ int main(int, char *[]) {
         e.set<ZIndex>({10});
     });
 
-    world.observer<UIElementBounds, AddTagOnHoverEnter>()
+    world->observer<UIElementBounds, AddTagOnHoverEnter>()
     .term_at(1).second<HighlightBFOInheritanceHierarchy>()
     .event<HoverEnterEvent>()
     .each([&](flecs::entity e, UIElementBounds& bounds, AddTagOnHoverEnter)
     {
-        auto bfo_sprite_query = world.query_builder<ZIndex>()
+        auto bfo_sprite_query = world->query_builder<ZIndex>()
         .with<BFOSprite>()
         .without<ParentClass>(e)
         .build();
@@ -2780,12 +2782,12 @@ int main(int, char *[]) {
         });
     });
 
-    world.observer<UIElementBounds, AddTagOnHoverExit>()
+    world->observer<UIElementBounds, AddTagOnHoverExit>()
     .term_at(1).second<ResetBFOSprites>()
     .event<HoverExitEvent>()
     .each([&](flecs::entity e, UIElementBounds& bounds, AddTagOnHoverExit)
     {
-        auto bfo_sprite_query = world.query_builder<ZIndex>()
+        auto bfo_sprite_query = world->query_builder<ZIndex>()
         .with<BFOSprite>()
         .build();
 
@@ -2795,10 +2797,10 @@ int main(int, char *[]) {
         });
     });
 
-    world.system<ServerDescription, ZIndex>()
+    world->system<ServerDescription, ZIndex>()
     .each([&](flecs::entity e, ServerDescription& desc, ZIndex& index) 
     {
-        if (ecs_is_valid(world, desc.selected))
+        if (ecs_is_valid(*world, desc.selected))
         {
             e.set<ZIndex>({15});
         } 
@@ -2808,7 +2810,7 @@ int main(int, char *[]) {
         }
     });
     
-    world.observer<UIElementBounds, AddTagOnHoverExit>()
+    world->observer<UIElementBounds, AddTagOnHoverExit>()
     .term_at(1).second<CloseEditorSelector>()
     .event<HoverExitEvent>()
     .each([&](flecs::entity e, UIElementBounds& bounds, AddTagOnHoverExit)
@@ -2817,7 +2819,7 @@ int main(int, char *[]) {
         e.destruct();
     });
 
-    world.observer<UIElementBounds, AddTagOnLeftClick>()
+    world->observer<UIElementBounds, AddTagOnLeftClick>()
     .term_at(1).second<CloseEditorSelector>()
     .event<LeftClickEvent>()
     .each([&](flecs::entity e, UIElementBounds& bounds, AddTagOnLeftClick)
@@ -2826,7 +2828,7 @@ int main(int, char *[]) {
         e.destruct();
     });
 
-    world.observer<UIElementBounds, AddTagOnHoverEnter>()
+    world->observer<UIElementBounds, AddTagOnHoverEnter>()
     .term_at(1).second<SetMenuHighlightColor>()
     .event<HoverEnterEvent>()
     .each([&](flecs::entity e, UIElementBounds& bounds, AddTagOnHoverEnter)
@@ -2835,7 +2837,7 @@ int main(int, char *[]) {
         bkg.color = 0x585858FF;
     });
 
-    world.observer<UIElementBounds, AddTagOnHoverExit>()
+    world->observer<UIElementBounds, AddTagOnHoverExit>()
     .term_at(1).second<SetMenuStandardColor>()
     .event<HoverExitEvent>()
     .each([&](flecs::entity e, UIElementBounds& bounds, AddTagOnHoverExit)
@@ -2844,7 +2846,7 @@ int main(int, char *[]) {
         bkg.color = 0x383838FF;
     });
 
-    world.observer<UIElementBounds, AddTagOnLeftClick>()
+    world->observer<UIElementBounds, AddTagOnLeftClick>()
     .term_at(1).second<SetPanelEditorType>()
     .event<LeftClickEvent>()
     .each([&](flecs::entity e, UIElementBounds& bounds, AddTagOnLeftClick)
@@ -2852,21 +2854,21 @@ int main(int, char *[]) {
         replace_editor_content(e.target<EditorLeaf>(), e.get_constant<EditorType>(), UIElement);
     });
 
-    world.observer<UIElementBounds, AddTagOnLeftClick>()
+    world->observer<UIElementBounds, AddTagOnLeftClick>()
     .term_at(1).second<FocusChatInput>()
     .event<LeftClickEvent>()
     .each([&](flecs::entity e, UIElementBounds&, AddTagOnLeftClick)
     {
-        ChatState& chat = world.ensure<ChatState>();
+        ChatState& chat = world->ensure<ChatState>();
         chat.input_focused = true;
     });
 
-    world.observer<UIElementBounds, AddTagOnLeftClick>()
+    world->observer<UIElementBounds, AddTagOnLeftClick>()
     .term_at(1).second<SendChatMessage>()
     .event<LeftClickEvent>()
     .each([&](flecs::entity e, UIElementBounds&, AddTagOnLeftClick)
     {
-        ChatState& chat = world.ensure<ChatState>();
+        ChatState& chat = world->ensure<ChatState>();
         if (!chat.draft.empty())
         {
             chat.messages.push_back({"You", chat.draft});
@@ -2874,7 +2876,7 @@ int main(int, char *[]) {
         }
     });
 
-    world.observer<UIElementBounds, AddTagOnLeftClick>()
+    world->observer<UIElementBounds, AddTagOnLeftClick>()
     .term_at(1).second<SelectServer>()
     .event<LeftClickEvent>()
     .each([&](flecs::entity e, UIElementBounds& bounds, AddTagOnLeftClick)
@@ -2887,7 +2889,7 @@ int main(int, char *[]) {
         std::cout << "Start chatter server here" << std::endl;
     });
 
-    world.observer<UIElementBounds, AddTagOnLeftClick>()
+    world->observer<UIElementBounds, AddTagOnLeftClick>()
     .term_at(1).second<ShowEditorPanels>()
     .event<LeftClickEvent>()
     .each([&](flecs::entity e, UIElementBounds& bounds, AddTagOnLeftClick)
@@ -2905,40 +2907,40 @@ int main(int, char *[]) {
         });
         if (has_close_child) return;
 
-        auto editor_hover_region = world.entity()
+        auto editor_hover_region = world->entity()
         .is_a(UIElement)
         .child_of(e)
         // .add<DebugRenderBounds>()
         .add<AddTagOnHoverExit, CloseEditorSelector>()
         .add<AddTagOnLeftClick, CloseEditorSelector>();
 
-        auto editor_icon_bkg_square = world.entity()
+        auto editor_icon_bkg_square = world->entity()
         .is_a(UIElement)
         .child_of(editor_hover_region)
         .set<Position, Local>({-1.0f, 10.0f})
         .set<RectRenderable>({32.0f, 12.0f, false, 0x282828FF})
         .set<ZIndex>({7});
 
-        auto editor_type_selector = world.entity()
+        auto editor_type_selector = world->entity()
         .is_a(UIElement)
         .child_of(editor_hover_region)
         // .add<DebugRenderBounds>()
         .set<Position, Local>({-1.0f, 19.0f});
 
-        auto editor_type_selector_square_corner = world.entity()
+        auto editor_type_selector_square_corner = world->entity()
         .is_a(UIElement)
         .child_of(editor_type_selector)
         .set<RectRenderable>({16.0f, 16.0f, false, 0x282828FF})
         .set<ZIndex>({30});
 
-        auto editor_type_selector_bkg = world.entity()
+        auto editor_type_selector_bkg = world->entity()
         .is_a(UIElement)
         .child_of(editor_type_selector)
         .set<RoundedRectRenderable>({196.0f, 256.0f, 4.0f, false, 0x282828FF})
         .set<Expand>({false, 0, 0, 1.0f, true, 0.0f, 0.0f, 1.0f})
         .set<ZIndex>({30});
 
-        auto editor_type_list = world.entity()
+        auto editor_type_list = world->entity()
         .is_a(UIElement)
         .child_of(editor_type_selector)
         .set<VerticalLayoutBox>({0.0f, 2.0f})
@@ -2952,7 +2954,7 @@ int main(int, char *[]) {
             // change the EditorType
             // Remove any existing type scene content
             // and load the new default scene...
-            auto edtior_type_btn = world.entity()
+            auto edtior_type_btn = world->entity()
             .is_a(UIElement)
             .child_of(editor_type_list)
             .set<RoundedRectRenderable>({196.0f-12.0f, 20.0f, 2.0f, false, 0x383838FF})
@@ -2966,7 +2968,7 @@ int main(int, char *[]) {
             .set<ZIndex>({38});
 
 
-            world.entity()
+            world->entity()
             .is_a(UIElement)
             .child_of(edtior_type_btn)
             .set<TextRenderable>({editor_type_name.c_str(), "ATARISTOCRAT", 16.0f, 0xFFFFFFFF})
@@ -2979,13 +2981,13 @@ int main(int, char *[]) {
     });
 
     // Create text entities with different z-indices
-    // auto text1 = world.entity("Text1")
+    // auto text1 = world->entity("Text1")
     //     .is_a(UIElement)
     //     .set<Position, Local>({400.0f, 100.0f})
     //     .set<TextRenderable>({"Behind boxes", "ATARISTOCRAT", 24.0f, 0xFFFFFFFF, NVG_ALIGN_CENTER})
     //     .set<ZIndex>({0});
 
-    auto movementSystem = world.system<Position, Velocity>()
+    auto movementSystem = world->system<Position, Velocity>()
     .term_at(0).second<Local>()
         .each([](flecs::iter& it, size_t i, Position& pos, Velocity& vel) {
             float deltaTime = it.delta_system_time();
@@ -2995,28 +2997,28 @@ int main(int, char *[]) {
         });
 
     // Hierarchical positioning system - computes world positions from local positions
-    auto hierarchicalQuery = world.query_builder<const Position, const Position*, Position>()
+    auto hierarchicalQuery = world->query_builder<const Position, const Position*, Position>()
         .term_at(0).second<Local>()      // Local position
         .term_at(1).second<World>()      // Parent world position
         .term_at(2).second<World>()      // This entity's world position
         .term_at(1).parent().cascade()   // Get parent position in breadth-first order
         .build();
 
-    auto hierarchicalSystem = world.system()
+    auto hierarchicalSystem = world->system()
         .kind(flecs::OnLoad)  // Run after layout systems to compute world positions
         .each([&]() {
             // std::cout << "Update hierarchy" << std::endl;
-            hierarchicalQuery.each([](const Position& local, const Position* parentWorld, Position& world) {
-                world.x = local.x;
-                world.y = local.y;
+            hierarchicalQuery.each([](const Position& local, const Position* parentWorld, Position& worldPos) {
+                worldPos.x = local.x;
+                worldPos.y = local.y;
                 if (parentWorld) {
-                    world.x += parentWorld->x;
-                    world.y += parentWorld->y;
+                    worldPos.x += parentWorld->x;
+                    worldPos.y += parentWorld->y;
                 }
             });
         });
 
-    auto boundsCalculationSystem = world.system<Position, UIElementBounds, UIElementSize>()
+    auto boundsCalculationSystem = world->system<Position, UIElementBounds, UIElementSize>()
         .term_at(0).second<World>()
         .kind(flecs::OnLoad) 
         .each([&](flecs::entity e, Position& worldPos, UIElementBounds& bounds, UIElementSize& size) {
@@ -3037,30 +3039,30 @@ int main(int, char *[]) {
     int editor_padding = 3.0f;
     int editor_edge_hover_dist = 8.0f;
 
-    auto editor_root = world.entity("editor_root")
+    auto editor_root = world->entity("editor_root")
         .set<Position, Local>({0.0f, 28.0f})
         .set<Position, World>({0.0f, 0.0f})
         .set<EditorNodeArea>({800.0f, 600.0f - 28.0f}) // TOOD: Observer to update root to window width/height updates
         .add<EditorRoot>()
         .add(flecs::OrderedChildren);
 
-    auto editor_header = world.entity()
+    auto editor_header = world->entity()
         .is_a(UIElement)
         .set<ImageCreator>({"../assets/ecs_header.png", 1.0f, 1.0f})
         .set<ZIndex>({5});
 
     // Load saved editor config if it exists, otherwise use default layout
-    if (!load_editor_layout(editor_root, world, UIElement)) {
+    if (!load_editor_layout(editor_root, UIElement)) {
         // Default layout
-        split_editor({0.5, PanelSplitType::Horizontal}, editor_root, world, UIElement);
+        split_editor({0.5, PanelSplitType::Horizontal}, editor_root, UIElement);
         auto right_node = editor_root.target<RightNode>();
-        split_editor({0.35, PanelSplitType::Vertical}, right_node, world, UIElement);
+        split_editor({0.35, PanelSplitType::Vertical}, right_node, UIElement);
         auto left_node = editor_root.target<LeftNode>();
-        split_editor({0.25, PanelSplitType::Vertical}, left_node, world, UIElement);
+        split_editor({0.25, PanelSplitType::Vertical}, left_node, UIElement);
     }
 
     float diurnal_pos = 0.0f;
-    world.system<DiurnalHour, QuadraticBezierRenderable>()
+    world->system<DiurnalHour, QuadraticBezierRenderable>()
     .interval(1)
     .run([&diurnal_pos](flecs::iter& it)
     {
@@ -3072,7 +3074,7 @@ int main(int, char *[]) {
         e.set<QuadraticBezierRenderable>(get_hour_segment(hour.segment, (0.5f * M_PI) - (diurnal_pos) * (2.0f * M_PI)));
     });
 
-    world.system<Position, EditorNodeArea, PanelSplit, CursorState>()
+    world->system<Position, EditorNodeArea, PanelSplit, CursorState>()
         .kind(flecs::PreFrame)
         .term_at(0).second<World>()
         .term_at(3).src(glfwStateEntity)
@@ -3091,7 +3093,7 @@ int main(int, char *[]) {
             // std::cout << "Evaluate drag update" << std::endl;
         });
 
-    auto propagateEditorRoot = world.system<Window, EditorNodeArea, EditorRoot>("EditorPropagate")
+    auto propagateEditorRoot = world->system<Window, EditorNodeArea, EditorRoot>("EditorPropagate")
     .term_at(0).src(glfwStateEntity)
     .kind(flecs::PreFrame)
     .run([](flecs::iter& it)
@@ -3103,7 +3105,7 @@ int main(int, char *[]) {
                 node_area[i].width = window[i].width;
                 node_area[i].height = window[i].height-28.0f; // minus the header...
             }
-            flecs::entity editor_root = world.lookup("editor_root");
+            flecs::entity editor_root = world->lookup("editor_root");
 
             std::stack<flecs::entity> editors_to_visit;
             editors_to_visit.push(editor_root);
@@ -3154,7 +3156,7 @@ int main(int, char *[]) {
     });
 
 
-    auto sizeCalculationSystem = world.system<UIElementSize, Graphics>()
+    auto sizeCalculationSystem = world->system<UIElementSize, Graphics>()
         .kind(flecs::PreFrame)
         .each([&](flecs::entity e, UIElementSize& size, Graphics& graphics) {
 
@@ -3194,7 +3196,7 @@ int main(int, char *[]) {
         });
 
     // Update Language Game chat UI each frame
-    world.system<ChatPanel, EditorNodeArea>()
+    world->system<ChatPanel, EditorNodeArea>()
         .kind(flecs::PreFrame)
         .each([&](flecs::entity leaf, ChatPanel& panel, EditorNodeArea&)
         {
@@ -3223,7 +3225,7 @@ int main(int, char *[]) {
             input_rect.height = input_h;
             panel.input_panel.ensure<Position, Local>() = {pad, canvas_h - input_h - pad};
 
-            ChatState& chat = world.ensure<ChatState>();
+            ChatState& chat = world->ensure<ChatState>();
             std::string caret = chat.input_focused ? "|" : "";
             if (auto* input_tr = panel.input_text.try_get_mut<TextRenderable>())
             {
@@ -3235,7 +3237,7 @@ int main(int, char *[]) {
             int total = (int)chat.messages.size();
             int start = std::max(0, total - kMaxMessages);
 
-            flecs::query msg_views = world.query_builder<ChatMessageView, TextRenderable, Position>()
+            flecs::query msg_views = world->query_builder<ChatMessageView, TextRenderable, Position>()
                 .term_at(0).src(panel.messages_panel)
                 .build();
 
@@ -3257,7 +3259,7 @@ int main(int, char *[]) {
             });
         });
 
-    world.system<const UIElementBounds, HorizontalLayoutBox>()
+    world->system<const UIElementBounds, HorizontalLayoutBox>()
     .kind(flecs::PreUpdate)
     .term_at(0).parent() 
     .with<FitChildren>()
@@ -3307,7 +3309,7 @@ int main(int, char *[]) {
         });
     });
 
-    world.system<HorizontalLayoutBox, UIElementSize>("ResetHProgress")
+    world->system<HorizontalLayoutBox, UIElementSize>("ResetHProgress")
         .kind(flecs::PostLoad)
         .each([](flecs::entity e, HorizontalLayoutBox& box, UIElementSize& container_size)
         {
@@ -3344,7 +3346,7 @@ int main(int, char *[]) {
             }
         });
 
-    world.system<VerticalLayoutBox, UIElementSize>("ResetVProgress")
+    world->system<VerticalLayoutBox, UIElementSize>("ResetVProgress")
     .kind(flecs::PostLoad)
     .each([](flecs::entity e, VerticalLayoutBox& box, UIElementSize& container_size) {
         float current_y = 0.0f;
@@ -3388,7 +3390,7 @@ int main(int, char *[]) {
         }
     });
 
-    auto cursorEvents = world.observer<CursorState, EditorRoot>()
+    auto cursorEvents = world->observer<CursorState, EditorRoot>()
         .event<LeftClickEvent>()
         .term_at(1).src(editor_root)
         .each([&UIElement](flecs::iter& it, size_t i, CursorState& cursor_state, EditorRoot& editor_root) {
@@ -3400,7 +3402,7 @@ int main(int, char *[]) {
                 if (point_in_bounds((float)cursor_state.x, (float)cursor_state.y, partition_region.bounds))
                 {
                     in_modify_region = true; 
-                    split_editor({0.05, PanelSplitType::Horizontal}, partition_region.split_target, world, UIElement);
+                    split_editor({0.05, PanelSplitType::Horizontal}, partition_region.split_target, UIElement);
                     partition_region.split_target.add<Dragging>().add<DynamicPartition>();
                 }
             }
@@ -3417,7 +3419,7 @@ int main(int, char *[]) {
             }
         });
 
-    world.system<Position, EditorNodeArea, PanelSplit*, CursorState>()
+    world->system<Position, EditorNodeArea, PanelSplit*, CursorState>()
         .term_at(0).second<World>()
         .term_at(2).optional()
         .term_at(3).src(glfwStateEntity)
@@ -3432,16 +3434,16 @@ int main(int, char *[]) {
                 if (!e.has<DynamicMerge>())
                 {
                     e.add<DynamicMerge>();
-                    merge_editor(e, world, UIElement);
+                    merge_editor(e, UIElement);
                     // TODO: Temporary merger to allow reversal?
-                    merge_editor(e.parent(), world, UIElement);
+                    merge_editor(e.parent(), UIElement);
                 }
             } else
             {
                 if (e.has<DynamicMerge>())
                 {
                     e.remove<DynamicMerge>();
-                    split_editor({0.05, PanelSplitType::Horizontal}, e, world, UIElement);
+                    split_editor({0.05, PanelSplitType::Horizontal}, e, UIElement);
                 } else
                 {
                 // TODO: Consider the case of child panel splits of the same dimension as multiple siblings
@@ -3491,11 +3493,11 @@ int main(int, char *[]) {
             }
         });
 
-    auto query_dragging = world.query_builder<PanelSplit>()
+    auto query_dragging = world->query_builder<PanelSplit>()
     .with<Dragging>()
     .build();
 
-    world.observer<CursorState, EditorRoot>()
+    world->observer<CursorState, EditorRoot>()
         .event<LeftReleaseEvent>()
         .term_at(1).src(editor_root)
         .each([&query_dragging](flecs::entity e, CursorState& cursor_state, EditorRoot& editor_root) {
@@ -3509,12 +3511,12 @@ int main(int, char *[]) {
             });
         });
 
-    auto bubbleUpBoundsQuery = world.query_builder<UIElementBounds, UIElementBounds*, RenderStatus*>()
+    auto bubbleUpBoundsQuery = world->query_builder<UIElementBounds, UIElementBounds*, RenderStatus*>()
         .term_at(1).parent().up()  // Parent UIElementBounds
         .term_at(2).optional()          // Optional RenderStatus
         .build();
 
-    auto bubbleUpBoundsSystem = world.system<UIElementBounds, UIElementBounds*, UIElementSize, RenderStatus*>()
+    auto bubbleUpBoundsSystem = world->system<UIElementBounds, UIElementBounds*, UIElementSize, RenderStatus*>()
         .kind(flecs::PostLoad) 
         .term_at(1).parent().up()
         .term_at(2).optional()
@@ -3547,7 +3549,7 @@ int main(int, char *[]) {
                 }
         });
 
-    world.system<UIElementBounds, UIContainer, RoundedRectRenderable, UIElementSize>()
+    world->system<UIElementBounds, UIContainer, RoundedRectRenderable, UIElementSize>()
     .kind(flecs::PreFrame)
     .each([&](flecs::entity e, UIElementBounds& bounds, UIContainer& container, RoundedRectRenderable& renderable, UIElementSize& size)
     {
@@ -3570,7 +3572,7 @@ int main(int, char *[]) {
         size.height = renderable.height;
     });
 
-    world.system<UIElementBounds, UIContainer, CustomRenderable, UIElementSize>()
+    world->system<UIElementBounds, UIContainer, CustomRenderable, UIElementSize>()
     .kind(flecs::PreFrame)
     .each([&](flecs::entity e, UIElementBounds& bounds, UIContainer& container, CustomRenderable& renderable, UIElementSize& size)
     {
@@ -3588,7 +3590,7 @@ int main(int, char *[]) {
     });
 
 
-    auto bubbleUpBoundsSecondarySystem = world.system<UIElementBounds, UIElementBounds*, RenderStatus*>()
+    auto bubbleUpBoundsSecondarySystem = world->system<UIElementBounds, UIElementBounds*, RenderStatus*>()
         .kind(flecs::PostLoad) 
         .term_at(1).parent().up()
         .term_at(2).optional()
@@ -3615,7 +3617,7 @@ int main(int, char *[]) {
                 }
         });
 
-    world.system<Position, UIElementBounds*, UIElementSize, UIElementBounds, Align, Expand*>()
+    world->system<Position, UIElementBounds*, UIElementSize, UIElementBounds, Align, Expand*>()
     .term_at(0).second<Local>()
     .term_at(1).parent()
     .term_at(5).optional()
@@ -3632,7 +3634,7 @@ int main(int, char *[]) {
         }
     });
 
-    world.system<UIElementBounds*, RectRenderable, Expand>()
+    world->system<UIElementBounds*, RectRenderable, Expand>()
     .term_at(0).parent()
     .kind(flecs::PreUpdate)
     .immediate()
@@ -3647,7 +3649,7 @@ int main(int, char *[]) {
         }
     });
 
-    world.system<UIElementBounds*, RoundedRectRenderable, Expand>()
+    world->system<UIElementBounds*, RoundedRectRenderable, Expand>()
     .term_at(0).parent()
     .kind(flecs::PreUpdate)
     .each([&](flecs::entity e, UIElementBounds* bounds, RoundedRectRenderable& rect, Expand& expand) {
@@ -3661,7 +3663,7 @@ int main(int, char *[]) {
         }
     });
 
-    world.system<UIElementBounds*, LineRenderable, Expand>()
+    world->system<UIElementBounds*, LineRenderable, Expand>()
     .term_at(0).parent()
     .kind(flecs::PreUpdate)
     .each([&](flecs::entity e, UIElementBounds* bounds, LineRenderable& line, Expand& expand) {
@@ -3675,7 +3677,7 @@ int main(int, char *[]) {
         }
     });
 
-world.system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
+world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
     .term_at(0).parent()
     .term_at(3).optional()
     .kind(flecs::PreUpdate)
@@ -3742,7 +3744,7 @@ world.system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
         sprite.height = desired_h;
     });
 
-    auto debugRenderBounds = world.system<RenderQueue, UIElementBounds, DebugRenderBounds>()
+    auto debugRenderBounds = world->system<RenderQueue, UIElementBounds, DebugRenderBounds>()
     .term_at(0).src(renderQueueEntity)
     .each([](flecs::entity e, RenderQueue& render_queue, UIElementBounds& bounds, DebugRenderBounds) 
     {
@@ -3750,23 +3752,23 @@ world.system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
         render_queue.addRectCommand({bounds.xmin, bounds.ymin}, debug_bound, 100);
     });
 
-    auto roundedRectQueueSystem = world.system<Position, RoundedRectRenderable, ZIndex, RenderGradient*>()
+    auto roundedRectQueueSystem = world->system<Position, RoundedRectRenderable, ZIndex, RenderGradient*>()
     .term_at(0).second<World>()
     .term_at(3).optional()
     .kind(flecs::PostUpdate)
         .each([&](flecs::entity e, Position& pos, RoundedRectRenderable& renderable, ZIndex& zIndex, RenderGradient* rg) {
-            RenderQueue& queue = world.ensure<RenderQueue>();
+            RenderQueue& queue = world->ensure<RenderQueue>();
             queue.addRoundedRectCommand(pos, renderable, zIndex.layer, rg, rg ? *rg : RenderGradient{0, 0});
         });
 
 
-    auto rectQueueSystem = world.system<Position, RectRenderable, ZIndex, RenderStatus>()
+    auto rectQueueSystem = world->system<Position, RectRenderable, ZIndex, RenderStatus>()
     .kind(flecs::PostUpdate)
     .term_at(0).second<World>()
         .each([&](flecs::entity e, Position& pos, RectRenderable& renderable, ZIndex& zIndex, RenderStatus& status) {
             if (status.visible)
             {
-                RenderQueue& queue = world.ensure<RenderQueue>();
+                RenderQueue& queue = world->ensure<RenderQueue>();
                 // flecs::entity scissorEntity = flecs::entity::null();
                 if (e.has<ScissorContainer>(flecs::Wildcard))
                 {
@@ -3780,47 +3782,47 @@ world.system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
             }
         });
 
-    auto textQueueSystem = world.system<Position, TextRenderable, ZIndex, RenderGradient*>()
+    auto textQueueSystem = world->system<Position, TextRenderable, ZIndex, RenderGradient*>()
     .kind(flecs::PostUpdate)
     .term_at(0).second<World>()
     .term_at(3).optional()
     .each([&](flecs::entity e, Position& pos, TextRenderable& renderable, ZIndex& zIndex, RenderGradient* rg) {
-        RenderQueue& queue = world.ensure<RenderQueue>();
+        RenderQueue& queue = world->ensure<RenderQueue>();
         queue.addTextCommand(pos, renderable, zIndex.layer, rg, rg ? *rg : RenderGradient{0, 0});
     });
 
-    auto imageQueueSystem = world.system<Position, ImageRenderable, ZIndex, RenderStatus>()
+    auto imageQueueSystem = world->system<Position, ImageRenderable, ZIndex, RenderStatus>()
     .kind(flecs::PostUpdate)
     .term_at(0).second<World>()
     .each([&](flecs::entity e, Position& pos, ImageRenderable& renderable, ZIndex& zIndex, RenderStatus& status) {
-        RenderQueue& queue = world.ensure<RenderQueue>();
+        RenderQueue& queue = world->ensure<RenderQueue>();
         if (status.visible)
         {
             queue.addImageCommand(pos, renderable, zIndex.layer);
         }
     });
 
-    auto lineQueueSystem = world.system<Position, LineRenderable, ZIndex>()
+    auto lineQueueSystem = world->system<Position, LineRenderable, ZIndex>()
     .kind(flecs::PostUpdate)
     .term_at(0).second<World>()
     .each([&](flecs::entity e, Position& pos, LineRenderable& renderable, ZIndex& zIndex) {
-        RenderQueue& queue = world.ensure<RenderQueue>();
+        RenderQueue& queue = world->ensure<RenderQueue>();
         queue.addLineCommand(pos, renderable, zIndex.layer);
     });
 
-    auto quadraticBezierQueueSystem = world.system<Position, QuadraticBezierRenderable, ZIndex>()
+    auto quadraticBezierQueueSystem = world->system<Position, QuadraticBezierRenderable, ZIndex>()
     .kind(flecs::PostUpdate)
     .term_at(0).second<World>()
     .each([&](flecs::entity e, Position& pos, QuadraticBezierRenderable& renderable, ZIndex& zIndex) {
-        RenderQueue& queue = world.ensure<RenderQueue>();
+        RenderQueue& queue = world->ensure<RenderQueue>();
         queue.addQuadraticBezierCommand(pos, renderable, zIndex.layer);
     });
 
-    auto customQueueSystem = world.system<Position, CustomRenderable, ZIndex>()
+    auto customQueueSystem = world->system<Position, CustomRenderable, ZIndex>()
     .kind(flecs::PostUpdate)
     .term_at(0).second<World>()
     .each([&](flecs::entity e, Position& pos, CustomRenderable& renderable, ZIndex& zIndex) {
-        RenderQueue& queue = world.ensure<RenderQueue>();
+        RenderQueue& queue = world->ensure<RenderQueue>();
         if (e.has<ScissorContainer>(flecs::Wildcard))
         {
             flecs::entity scissorEntity = e.target<ScissorContainer>();
@@ -3832,12 +3834,12 @@ world.system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
         }
     });
 
-    world.system<Position, EditorNodeArea, EditorLeafData, EditorRoot>()
+    world->system<Position, EditorNodeArea, EditorLeafData, EditorRoot>()
     .term_at(0).second<World>()
     .term_at(3).src(editor_root)
     .run([](flecs::iter& it)
     {
-        auto editor_root = world.lookup("editor_root").try_get_mut<EditorRoot>();
+        auto editor_root = world->lookup("editor_root").try_get_mut<EditorRoot>();
         editor_root->modify_partition_regions.clear();
         while (it.next()) {
             it.each();
@@ -3849,14 +3851,14 @@ world.system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
 
     int scale_region_dist = 8;
     
-    world.system<Window, CursorState, EditorNodeArea, PanelSplit, Position, EditorRoot>()
+    world->system<Window, CursorState, EditorNodeArea, PanelSplit, Position, EditorRoot>()
     .term_at(0).src(glfwStateEntity)
     .term_at(1).src(glfwStateEntity)
     .term_at(4).second<World>()
     .term_at(5).src(editor_root)
     .run([scale_region_dist](flecs::iter& it)
     {
-        auto editor_root = world.lookup("editor_root").try_get_mut<EditorRoot>();
+        auto editor_root = world->lookup("editor_root").try_get_mut<EditorRoot>();
         editor_root->shift_regions.clear();
         while (it.next()) {
             it.each();
@@ -3869,7 +3871,7 @@ world.system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
         // DEBUG BOUNDS
         // for (EditorShiftRegion& shift_region : editor_root->shift_regions)
         // {
-        //     RenderQueue& queue = world.ensure<RenderQueue>();
+        //     RenderQueue& queue = world->ensure<RenderQueue>();
         //     RectRenderable debug_rect;
         //     debug_rect.width = shift_region.bounds.xmax - shift_region.bounds.xmin; 
         //     debug_rect.height = shift_region.bounds.ymax - shift_region.bounds.ymin;
@@ -3932,15 +3934,15 @@ world.system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
         }
     });
 
-    auto renderExecutionSystem = world.system<RenderQueue, Graphics>()
+    auto renderExecutionSystem = world->system<RenderQueue, Graphics>()
         .kind(flecs::PostUpdate)
         .each([&](flecs::entity e, RenderQueue& queue, Graphics& graphics) {
             queue.sort();            
             // TODO: Apply scissor regions to relevant entity
             for (const auto& cmd : queue.commands) {
-                if (ecs_is_valid(world, cmd.scissorEntity) && ecs_is_alive(world, cmd.scissorEntity))
+                if (ecs_is_valid(*world, cmd.scissorEntity) && ecs_is_alive(*world, cmd.scissorEntity))
                 {
-                    UIElementBounds* scissorBounds = ecs_ensure(world, cmd.scissorEntity, UIElementBounds);
+                    UIElementBounds* scissorBounds = ecs_ensure(*world, cmd.scissorEntity, UIElementBounds);
                     nvgScissor(graphics.vg, scissorBounds->xmin, scissorBounds->ymin, scissorBounds->xmax - scissorBounds->xmin, scissorBounds->ymax - scissorBounds->ymin);
                 }
                 switch (cmd.type) {
@@ -4093,7 +4095,7 @@ world.system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
             queue.clear();
         });
 
-    auto vncInitSystem = world.system<VNCClient>()
+    auto vncInitSystem = world->system<VNCClient>()
         .kind(flecs::PreUpdate)
         .each([](flecs::iter& it, size_t i, VNCClient& vnc) {
             static bool initialized[1] = {false};
@@ -4103,7 +4105,7 @@ world.system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
         });
 
     // Process VNC messages to trigger update callbacks
-    auto vncMessageProcessingSystem = world.system<VNCClient>()
+    auto vncMessageProcessingSystem = world->system<VNCClient>()
         .kind(flecs::OnUpdate)
         .each([](flecs::entity e, VNCClient& vnc) {
             if (!vnc.connected || !vnc.client) return;
@@ -4118,7 +4120,7 @@ world.system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
         });
 
     // VNC mouse tracking system - sends mouse position to active VNC client in interactive mode
-    auto vncMouseTrackingSystem = world.system<Position, ImageRenderable>()
+    auto vncMouseTrackingSystem = world->system<Position, ImageRenderable>()
         .with<IsStreamingFrom>(flecs::Wildcard)
         .term_at(0).second<World>()
         .kind(flecs::PreUpdate)
@@ -4126,7 +4128,7 @@ world.system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
             VNCClient& vnc = e.target<IsStreamingFrom>().ensure<VNCClient>();
             if (!vnc.connected || !vnc.client) return;
             // Get cursor state
-            auto glfw_state = world.lookup("GLFWState");
+            auto glfw_state = world->lookup("GLFWState");
             if (!glfw_state.is_valid()) return;
 
             const CursorState* cursorState = glfw_state.try_get<CursorState>();
@@ -4155,7 +4157,7 @@ world.system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
             }
         });
 
-    auto vncPassthroughIndicatorVisibility = world.system<ImageRenderable>()
+    auto vncPassthroughIndicatorVisibility = world->system<ImageRenderable>()
         .with<IsStreamingFrom>(flecs::Wildcard)
         .kind(flecs::PreUpdate)
         .each([&](flecs::entity e, ImageRenderable& img) {
@@ -4164,7 +4166,7 @@ world.system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
             e.target<ActiveIndicator>().ensure<RenderStatus>().visible = vnc.eventPassthroughEnabled;
         });
 
-    auto vncTextureUpdateSystem = world.system<VNCClient>()
+    auto vncTextureUpdateSystem = world->system<VNCClient>()
         .kind(flecs::OnUpdate)
         .each([](flecs::entity e, VNCClient& vnc) {
             if (!vnc.connected || !vnc.client) {
@@ -4285,7 +4287,7 @@ world.system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
         });
 
     // X11 window outline rendering system - draws X11 window outlines on top of VNC texture
-    auto x11OutlineRenderSystem = world.system<X11Container, Position, ImageRenderable>()
+    auto x11OutlineRenderSystem = world->system<X11Container, Position, ImageRenderable>()
         .term_at(1).second<Local>()
         .kind(flecs::PostUpdate)
         .immediate()
@@ -4309,10 +4311,10 @@ world.system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
             float scale_y = img.height / (float)vnc.height;
 
             Position worldPos = e.get<Position, World>();
-            RenderQueue& queue = world.ensure<RenderQueue>();
+            RenderQueue& queue = world->ensure<RenderQueue>();
 
             // Query all visible windows in this container
-            auto windows = world.query_builder<X11WindowInfo, X11WindowBounds, X11WindowVisibility>()
+            auto windows = world->query_builder<X11WindowInfo, X11WindowBounds, X11WindowVisibility>()
                 .with<X11VisibleWindow>()
                 .with(flecs::ChildOf, e)
                 .build();
@@ -4394,10 +4396,10 @@ world.system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
 
         nvgBeginFrame(vg, winWidth, winHeight, devicePixelRatio);
         
-        world.defer_begin();
+        world->defer_begin();
         glfwPollEvents();
-        world.defer_end();
-        world.progress();
+        world->defer_end();
+        world->progress();
         FrameMark;
         nvgEndFrame(vg);
 
