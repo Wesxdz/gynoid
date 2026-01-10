@@ -320,6 +320,7 @@ struct ServerScript
 
 struct RenderStatus {
     bool visible;
+    // float transparency = 1.0f;
 };
 
 struct HorizontalLayoutBox
@@ -486,7 +487,7 @@ struct TextRenderable {
 struct ImageCreator
 {
     std::string path;
-    float scaleX, scaleY;
+    float scaleX, scaleY = 1.0;
 };
 
 struct ImageRenderable
@@ -538,6 +539,9 @@ struct ServerDescription
 struct ShowServerHUDOverlay {};
 struct HideServerHUDOverlay {};
 
+struct HighlightBFOInheritanceHierarchy {};
+struct ResetBFOSprites {};
+
 struct CloseEditorSelector {};
 struct SetMenuHighlightColor {};
 struct SetMenuStandardColor {};
@@ -578,6 +582,8 @@ enum class EditorType
     PeachCore,
     VNCStream,
     Healthbar,
+    // Respawn,
+    // Genome,
     Embodiment,
     LanguageGame,
     Vision,
@@ -585,6 +591,7 @@ enum class EditorType
     Memory,
     Bookshelf,
     Episodic,
+    BFO,
     // Bookshelf,
     // MelSpectrogram,
     // VNCStream,
@@ -603,6 +610,9 @@ enum class EditorType
     // ComputeProvisioning,
     // Backup
 };
+
+struct ParentClass {};
+struct BFOSprite {};
 
 // Node representing the editor area...
 struct EditorNodeArea
@@ -908,9 +918,64 @@ flecs::entity create_popup(flecs::entity parent)
     return ui_popup;
 }
 
+struct RenderCommand {
+    Position pos;
+    std::variant<RoundedRectRenderable, RectRenderable, TextRenderable, ImageRenderable, LineRenderable, QuadraticBezierRenderable, CustomRenderable> renderData;
+    RenderType type;
+    int zIndex;
+
+    ecs_entity_t scissorEntity;
+    
+    bool useGradient;
+    RenderGradient gradient;
+
+    bool operator<(const RenderCommand& other) const {
+        return zIndex < other.zIndex;
+    }
+};
+
+
+void draw_double_arrow(NVGcontext* vg, const RenderCommand* cmd, const CustomRenderable& data) 
+{
+    float x = cmd->pos.x; 
+    float y = cmd->pos.y;
+    
+    float leftArrowStartX = x + data.height/2.0f;
+    float rightArrowStartX = x + data.width-data.height/2.0f;
+    float midY = y + data.height / 2.0f;
+
+    nvgBeginPath(vg);
+    
+    nvgMoveTo(vg, leftArrowStartX, y); 
+    nvgLineTo(vg, x, midY); 
+    nvgLineTo(vg, leftArrowStartX, y+data.height); 
+    nvgLineTo(vg, rightArrowStartX, y+data.height); 
+    nvgLineTo(vg, x+data.width, midY); 
+    nvgLineTo(vg, rightArrowStartX, y); 
+    
+    nvgClosePath(vg);
+
+    // Convert uint32_t color to NVGcolor (assuming ARGB or RGBA)
+    // This example assumes RGBA: 0xRRGGBBAA
+    unsigned char r = (data.color >> 24) & 0xFF;
+    unsigned char g = (data.color >> 16) & 0xFF;
+    unsigned char b = (data.color >> 8) & 0xFF;
+    unsigned char a = (data.color) & 0xFF;
+    NVGcolor color = nvgRGBA(r, g, b, a);
+
+    if (data.stroke) {
+        nvgStrokeColor(vg, color);
+        nvgStrokeWidth(vg, 1.0f);
+        nvgStroke(vg);
+    } else {
+        nvgFillColor(vg, color);
+        nvgFill(vg);
+    }
+}
+
 flecs::entity create_badge(flecs::entity parent, flecs::entity UIElement, 
                            const char* text, uint32_t base_color, 
-                           bool is_capsule = false) {
+                           bool is_capsule = false, bool is_double_arrow = false, int bind_to_entity = -1) {
     
     // --- 1. Color Logic (matching comp_gen.py) ---
     uint32_t dark = base_color;
@@ -930,36 +995,76 @@ flecs::entity create_badge(flecs::entity parent, flecs::entity UIElement,
     }
 
     // --- 3. Create Entities ---
-    
-    // Main Background
-    // Note: Assuming RoundedRectRenderable supports a flag or type for Arrow shapes
-    auto badge = world.entity()
-        .is_a(UIElement)
-        .child_of(parent)
-        .set<RoundedRectRenderable>({100.0f, badge_height, corner_radius, false, 0x000000FF})
-        .set<RenderGradient>({dark, very_dark}) // Vertical gradient
-        .set<UIContainer>({6, 3})
-        .set<ZIndex>({20});
 
-    // Outline Overlay
-    world.entity()
+    flecs::entity badge = flecs::entity::null();
+
+    int xPad = 6.0f;
+
+    if (is_double_arrow)
+    {
+        xPad += 25.0f/2;
+        badge = world.entity()
+            .is_a(UIElement)
+            .child_of(parent)
+            .set<CustomRenderable>({100.0f, 25.0f, true, outline_color, draw_double_arrow})
+            .set<RenderGradient>({dark, very_dark}) // Vertical gradient
+            .set<UIContainer>({xPad, 3})
+            .set<ZIndex>({20});
+
+    } else
+    {        
+        badge = world.entity()
+            .is_a(UIElement)
+            .child_of(parent)
+            .set<RoundedRectRenderable>({100.0f, badge_height, corner_radius, false, 0x000000FF})
+            .set<RenderGradient>({dark, very_dark}) // Vertical gradient
+            .set<UIContainer>({xPad, 3})
+            .set<ZIndex>({20});
+    
+        // Outline Overlay
+        world.entity()
+            .is_a(UIElement)
+            .child_of(badge)
+            .set<Expand>({true, 0, 0, 1.0f, true, 0, 0, 1.0f})
+            .set<RoundedRectRenderable>({100.0f, badge_height, corner_radius, true, outline_color})
+            .set<ZIndex>({22});
+    }
+
+    flecs::entity badge_text_parent = badge;
+    if (bind_to_entity >= 0)
+    {
+        auto badge_content = world.entity()
         .is_a(UIElement)
-        .child_of(badge)
-        .set<Expand>({true, 0, 0, 1.0f, true, 0, 0, 1.0f})
-        .set<RoundedRectRenderable>({100.0f, badge_height, corner_radius, true, outline_color})
-        .set<ZIndex>({22});
+        .set<HorizontalLayoutBox>({0.0f, 0.0f})
+        .set<Position, Local>({xPad, 0.0f}) // reduce Y spacing for MNIST
+        // .add<DebugRenderBounds>()
+        .child_of(badge);
+        
+        badge_text_parent = badge_content;
+    }
 
     // Text with Gradient
     world.entity()
         .is_a(UIElement)
-        .child_of(badge)
-        .set<Position, Local>({6.0f, 6.0f})
+        .child_of(badge_text_parent)
+        .set<Position, Local>({xPad, 6.0f})
         .set<TextRenderable>({text, "Inter", 16.0f, white, 1.2f})
         .set<RenderGradient>({white, light})   // Apply gradient to text
         .set<ZIndex>({25});
 
+    if (bind_to_entity >= 0)
+    {
+        world.entity()
+        .is_a(UIElement)
+        .child_of(badge_text_parent)
+        .set<ImageCreator>({"../assets/mnist/set_0/0.png", 0.9f, 0.9f})
+        .set<ZIndex>({25});
+
+        badge.set<UIContainer>({xPad, 0});
+    }
     return badge;
 }
+
 
 void create_editor(flecs::entity leaf, EditorNodeArea& node_area, flecs::world world, flecs::entity UIElement)
 {
@@ -1066,6 +1171,7 @@ std::vector<std::string> editor_types =
     "Memory",
     "Bookshelf",
     "Episodic",
+    "BFO",
 };
 
 struct VNCData
@@ -1110,24 +1216,6 @@ VNCData get_vnc_source(flecs::world& world, const std::string& host, int port) {
 struct ScissorContainer {};
 // TODO: Make it transitive
 
-
-struct RenderCommand {
-    Position pos;
-    std::variant<RoundedRectRenderable, RectRenderable, TextRenderable, ImageRenderable, LineRenderable, QuadraticBezierRenderable, CustomRenderable> renderData;
-    RenderType type;
-    int zIndex;
-
-    ecs_entity_t scissorEntity;
-    
-    bool useGradient;
-    RenderGradient gradient;
-
-    bool operator<(const RenderCommand& other) const {
-        return zIndex < other.zIndex;
-    }
-};
-
-
 void draw_diamond(NVGcontext* vg, const RenderCommand* cmd, const CustomRenderable& data) {
     // Assuming (x, y) is the top-left of the bounding box
     float x = cmd->pos.x; 
@@ -1167,6 +1255,121 @@ void draw_diamond(NVGcontext* vg, const RenderCommand* cmd, const CustomRenderab
     }
 }
 
+std::unordered_map<std::string, Position> load_layout(const std::string& path) {
+    std::unordered_map<std::string, Position> coords;
+    std::ifstream file(path);
+    std::string name, sx, sy;
+
+    // Assumes format: Name [TAB] X [TAB] Y
+    while (std::getline(file, name, '\t') && 
+           std::getline(file, sx, '\t')   && 
+           std::getline(file, sy)) {
+        try {
+            // Store directly as your Position type
+            coords[name] = { std::stof(sx), std::stof(sy) };
+            std::cout << name << " at " << std::stof(sx) << std::endl;
+        } catch (...) { continue; } 
+    }
+    return coords;
+}
+
+// --- Entity Creation ---
+flecs::entity create_ontology_sprite(flecs::world& world, 
+                                     const std::string& sprite_path, 
+                                     flecs::entity parent, 
+                                     flecs::entity UIElement, 
+                                     Position pos) 
+{  
+    return world.entity()
+        .is_a(UIElement)
+        .child_of(parent)
+        .set<Position, Local>(pos)
+        .set<ImageCreator>({"../assets/bfo/" + sprite_path + ".png", 1.0f, 1.0f})
+        .add<BFOSprite>()
+        .add<AddTagOnHoverEnter, HighlightBFOInheritanceHierarchy>()
+        .add<AddTagOnHoverExit, ResetBFOSprites>()
+        .set<ZIndex>({50});
+}
+
+// --- Main Setup Logic ---
+void setup_bfo_hierarchy(flecs::world& ecs, flecs::entity bfo_editor, flecs::entity UIElement) {
+    // 1. Load layout coordinates from your Krita export
+    auto layout_map = load_layout("../assets/config/bfo_layout.txt");
+
+    // 2. Define the BFO hierarchy: { Child -> Parent }
+    std::vector<std::pair<std::string, std::string>> hierarchy = {
+        {"continuant", "entity"},
+        {"occurrent", "entity"},
+        
+        // Occurrent branch
+        {"process", "occurrent"},
+        {"process_boundary", "occurrent"},
+        {"spatiotemporal_region", "occurrent"},
+        {"temporal_interval", "occurrent"},
+        
+        // Continuant branch
+        {"independent_continuant", "continuant"},
+        {"specifically_dependent_continuant", "continuant"},
+        {"generically_dependent_continuant", "continuant"},
+        
+        {"quality", "specifically_dependent_continuant"},
+        {"realizable_entity", "specifically_dependent_continuant"},
+
+        {"role", "realizable_entity"},
+        {"disposition", "realizable_entity"},
+        {"function", "realizable_entity"},
+
+        // Independent Continuant branch
+        {"material_entity", "independent_continuant"},
+        {"immaterial_entity", "independent_continuant"},
+        
+        // Material Entity branch
+        {"object", "material_entity"},
+        {"object_aggregate", "material_entity"},
+        {"fiat_object_part", "material_entity"},
+        
+        // Immaterial Entity branch
+        {"site", "immaterial_entity"},
+        {"spatial_region", "immaterial_entity"},
+        {"continuant_fiat_boundary", "immaterial_entity"}
+    };
+
+    std::unordered_map<std::string, flecs::entity> entities;
+
+    // 3. Helper lambda to resolve position and create entity
+    auto create_with_coords = [&](const std::string& name, flecs::entity p) -> flecs::entity {
+        Position pos = {0.0f, 0.0f};
+
+        // Krita often exports layers with the extension in the name (e.g. "entity.png")
+        if (layout_map.count(name)) {
+            pos = layout_map[name];
+        } else if (layout_map.count(name + ".png")) {
+            pos = layout_map[name + ".png"];
+        }
+
+        return create_ontology_sprite(ecs, name, p, UIElement, pos);
+    };
+
+    // 4. Create the root 'entity'
+    entities["entity"] = create_with_coords("entity", bfo_editor);
+
+    // 5. Build the tree
+    for (const auto& [child_name, parent_name] : hierarchy) {
+        // Ensure parent exists in the entities map
+        if (entities.find(parent_name) == entities.end()) {
+            entities[parent_name] = create_with_coords(parent_name, bfo_editor);
+        }
+
+        // Create child and create a Flecs relationship to the parent
+        flecs::entity child = create_with_coords(child_name, bfo_editor);
+        entities[parent_name].add<ParentClass>(child);
+        
+        entities[child_name] = child;
+    }
+
+    std::cout << "BFO Hierarchy initialized with " << entities.size() << " sprites." << std::endl;
+}
+
 // Factory function to populate editor content, whether the panel is initialized or changed
 void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::entity UIElement)
 {
@@ -1190,7 +1393,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         .add<ServerDescription>()
         .child_of(leaf.target<EditorCanvas>());
 
-        std::vector<std::string> server_icons = {"peach_core", "aeri_memory", "flecs", "x11", "parakeet", "chatterbox", "doctr", "huggingface", "dino2", "autodistill", "yolo", "alpaca", "modal"};
+        std::vector<std::string> server_icons = {"aeri_memory", "flecs", "x11", "parakeet", "chatterbox", "doctr", "huggingface", "dino2", "autodistill", "yolo", "alpaca", "modal"};
         // std::vector<std::string> server_icons = {"peach_core"};
 
         for (const auto& icon : server_icons)
@@ -1294,14 +1497,21 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
     }
     else if (editor_type == EditorType::Embodiment)
     {
-        world.entity()
+        auto profile = world.entity()
         .is_a(UIElement)
         .child_of(leaf.target<EditorCanvas>())
-        .set<ImageCreator>({"../assets/blur.jpeg", 1.0f, 1.0f})
+        .set<ImageCreator>({"../assets/heonae_profile.png", 1.0f, 1.0f})
         .set<Expand>({true, 0.0f, 0.0f, 1.0f, false, 0.0f, 0.0f, 1.0f})
         .set<Align>({-0.5f, -0.5f, 0.5f, 0.5f})
         .set<Constrain>({true, true})
         .set<ZIndex>({10});
+
+        world.entity()
+        .is_a(UIElement)
+        .set<ImageCreator>({"../assets/mnist_version.png", 1.0f, 1.0f})
+        // .set<Align>({-0.5f, -0.5f, 1.0f, 0.0f})
+        .set<ZIndex>({15})
+        .child_of(profile);
 
         auto badges = world.entity()
         .is_a(UIElement)
@@ -1335,7 +1545,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         auto messages_panel = world.entity()
             .is_a(UIElement)
             .child_of(chat_root)
-            .set<RoundedRectRenderable>({100.0f, 100.0f, 4.0f, false, 0x121212FF})
+            .set<RoundedRectRenderable>({100.0f, 100.0f, 4.0f, false, 0x050505FF})
             // TODO: Expand to fill remaining space in VerticalLayout...
             // .set<Expand>({true, 8.0f, 8.0f, 1.0f, true, 8.0f, 36.0f, })
             .set<ZIndex>({10});
@@ -1367,28 +1577,31 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
             .is_a(UIElement)
             .child_of(chat_root)
             .add(flecs::OrderedChildren)
-            .set<VerticalLayoutBox>({0.0f, 0.0f, 1.0f});
+            .set<Position, Local>({12.0f, 16.0f})
+            .set<VerticalLayoutBox>({0.0f, 4.0f, 1.0f});
 
         auto msg_container = world.entity()
         .is_a(UIElement)
         .set<UIContainer>({4, 4})
         .child_of(message_list);
 
-        auto badges = world.entity()
+        auto meta_input = world.entity()
         .is_a(UIElement)
         .set<HorizontalLayoutBox>({0.0f, 2.0f})
         .add(flecs::OrderedChildren)
         // .add<DebugRenderBounds>()
-        .child_of(msg_container);
-        
-        create_badge(badges, UIElement, "Wesley", 0xf5a652ff);
+        .child_of(message_list);
 
-        world.entity()
+        auto black_bkg = world.entity()
         .is_a(UIElement)
-        .child_of(badges)
-        .set<Position, Local>({0.0f, 5.0f})
-        .set<TextRenderable>({" types", "Inter", 16.0f, 0xFFFFFFFF})
-        .set<ZIndex>({20});   
+        .set<ZIndex>({8})
+        .set<Expand>({true, 0.0f, 0.0f, 1.0f, true, 0.0f, 0.0f, 1.0f})
+        .set<RectRenderable>({0.0f, 0.0f, false, 0x000000FF})
+        .child_of(leaf.target<EditorCanvas>());
+        
+        create_badge(meta_input, UIElement, "Wesley", 0xf5a652ff, false, false, true);
+
+        create_badge(meta_input, UIElement, "types", 0xa34d1aff, false, true);
 
 
 
@@ -1534,6 +1747,14 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         VNCData data = get_vnc_source(world, vnc_host, port);
         // const VNCClient* vncClient = vncStreamSource.try_get<VNCClient>();
 
+        flecs::entity vnc_active_outline_indicator = world.entity()
+        .is_a(UIElement)
+        .set<ZIndex>({100})
+        .set<RectRenderable>({100, 1, true, 0x00ff00ff})
+        .set<Align>({0.0f, -1.0f, 0.0f, 1.0f})
+        .set<Expand>({true, 0.0f, 0.0f, 1.0f, false, 0, 0, 0.0f})
+        .child_of(leaf.target<EditorCanvas>());
+
         flecs::entity vnc_entity = world.entity()
         .is_a(UIElement)
         .add<IsStreamingFrom>(data.vnc_stream)
@@ -1610,6 +1831,33 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
             .set<Expand>({true, 24*1.5f, 0, 0.2f, false, 0, 0, 0})
             .set<ZIndex>({24});
         }
+    } else if (editor_type == EditorType::BFO)
+    {
+        auto bfo_editor = world.entity()
+        .is_a(UIElement)
+        // .add<HorizontalLayoutBox>()
+        // .add(flecs::OrderedChildren)
+        .set<RectRenderable>({156.0f, 195.0f, false, 0x000000FF})
+        .set<ZIndex>({30})
+        .child_of(leaf.target<EditorCanvas>());
+
+        auto bfo_editor_outline = world.entity()
+        .is_a(UIElement)
+        .set<RectRenderable>({156.0f, 195.0f, true, 0xc92b23FF})
+        .set<ZIndex>({32})
+        .child_of(leaf.target<EditorCanvas>());
+    
+        setup_bfo_hierarchy(world, bfo_editor, UIElement);
+        
+
+        // std::vector<std::string> bfo_categories = {"entity", "continuant", "occurrent", "process_boundary", "process", "spatiotemporal_region", "temporal_interval", "independent_continuant", "material"entity, "fiat_object_part", "specifically_dependent_continuant", "generically_dependent_continuant", "object_aggregate", "object", "site", "spatial_region", "immaterial_entity"};
+    } else if (editor_type == EditorType::Void)
+    {
+        auto test = world.entity()
+        .is_a(UIElement)
+        .set<CustomRenderable>({100.0f, 25.0f, true, 0xFFFFFFFF, draw_double_arrow}) // Support custom arrow badge
+        .set<ZIndex>({30})
+        .child_of(leaf.target<EditorCanvas>());
     }
     else
     {
@@ -1898,93 +2146,134 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
 
 static void char_callback(GLFWwindow* window, unsigned int codepoint)
 {
+    // Multiple chat query... only one active
     ChatState* chat = world.try_get_mut<ChatState>();
-    if (!chat || !chat->input_focused) return;
-    if (codepoint >= 32 && codepoint < 127)
+    if (chat && chat->input_focused)
     {
-        chat->draft.push_back(static_cast<char>(codepoint));
+        if (codepoint >= 32 && codepoint < 127)
+        {
+            chat->draft.push_back(static_cast<char>(codepoint));
+        }
+    } else // TODO: Check if VNCClient panel is active like mouse over...
+    {
+        // auto query = world.query<VNCClient>();
+        // query.each([&](flecs::entity e, VNCClient& vnc) {
+        //     if (vnc.connected && vnc.client) {
+        //         // Send as keysym (Unicode codepoint)
+        //         SendKeyEvent(vnc.client, codepoint, TRUE);
+        //         SendKeyEvent(vnc.client, codepoint, FALSE);
+        //     }
+        // });
     }
 
-    auto query = world.query<VNCClient>();
-    query.each([&](flecs::entity e, VNCClient& vnc) {
-        if (vnc.connected && vnc.client) {
-            // Send as keysym (Unicode codepoint)
-            SendKeyEvent(vnc.client, codepoint, TRUE);
-            SendKeyEvent(vnc.client, codepoint, FALSE);
-        }
-    });
 }
 
-// GLFW to X11 keysym mapping for VNC input
-rfbKeySym glfw_key_to_rfb_keysym(int key) {
+rfbKeySym glfw_key_to_rfb_keysym(int key, int mods) {
+    // 1. Handle non-printable / special keys first
     switch (key) {
-        case GLFW_KEY_BACKSPACE: return XK_BackSpace;
-        case GLFW_KEY_TAB: return XK_Tab;
-        case GLFW_KEY_ENTER: return XK_Return;
-        case GLFW_KEY_PAUSE: return XK_Pause;
-        case GLFW_KEY_ESCAPE: return XK_Escape;
-        case GLFW_KEY_DELETE: return XK_Delete;
-        case GLFW_KEY_KP_0: return XK_KP_0;
-        case GLFW_KEY_KP_1: return XK_KP_1;
-        case GLFW_KEY_KP_2: return XK_KP_2;
-        case GLFW_KEY_KP_3: return XK_KP_3;
-        case GLFW_KEY_KP_4: return XK_KP_4;
-        case GLFW_KEY_KP_5: return XK_KP_5;
-        case GLFW_KEY_KP_6: return XK_KP_6;
-        case GLFW_KEY_KP_7: return XK_KP_7;
-        case GLFW_KEY_KP_8: return XK_KP_8;
-        case GLFW_KEY_KP_9: return XK_KP_9;
-        case GLFW_KEY_KP_DECIMAL: return XK_KP_Decimal;
-        case GLFW_KEY_KP_DIVIDE: return XK_KP_Divide;
-        case GLFW_KEY_KP_MULTIPLY: return XK_KP_Multiply;
-        case GLFW_KEY_KP_SUBTRACT: return XK_KP_Subtract;
-        case GLFW_KEY_KP_ADD: return XK_KP_Add;
-        case GLFW_KEY_KP_ENTER: return XK_KP_Enter;
-        case GLFW_KEY_KP_EQUAL: return XK_KP_Equal;
-        case GLFW_KEY_UP: return XK_Up;
-        case GLFW_KEY_DOWN: return XK_Down;
-        case GLFW_KEY_RIGHT: return XK_Right;
-        case GLFW_KEY_LEFT: return XK_Left;
-        case GLFW_KEY_INSERT: return XK_Insert;
-        case GLFW_KEY_HOME: return XK_Home;
-        case GLFW_KEY_END: return XK_End;
-        case GLFW_KEY_PAGE_UP: return XK_Page_Up;
-        case GLFW_KEY_PAGE_DOWN: return XK_Page_Down;
-        case GLFW_KEY_F1: return XK_F1;
-        case GLFW_KEY_F2: return XK_F2;
-        case GLFW_KEY_F3: return XK_F3;
-        case GLFW_KEY_F4: return XK_F4;
-        case GLFW_KEY_F5: return XK_F5;
-        case GLFW_KEY_F6: return XK_F6;
-        case GLFW_KEY_F7: return XK_F7;
-        case GLFW_KEY_F8: return XK_F8;
-        case GLFW_KEY_F9: return XK_F9;
-        case GLFW_KEY_F10: return XK_F10;
-        case GLFW_KEY_F11: return XK_F11;
-        case GLFW_KEY_F12: return XK_F12;
-        case GLFW_KEY_F13: return XK_F13;
-        case GLFW_KEY_F14: return XK_F14;
-        case GLFW_KEY_F15: return XK_F15;
-        case GLFW_KEY_NUM_LOCK: return XK_Num_Lock;
-        case GLFW_KEY_CAPS_LOCK: return XK_Caps_Lock;
-        case GLFW_KEY_SCROLL_LOCK: return XK_Scroll_Lock;
-        case GLFW_KEY_RIGHT_SHIFT: return XK_Shift_R;
-        case GLFW_KEY_LEFT_SHIFT: return XK_Shift_L;
-        case GLFW_KEY_RIGHT_CONTROL: return XK_Control_R;
+        case GLFW_KEY_BACKSPACE:    return XK_BackSpace;
+        case GLFW_KEY_TAB:          return XK_Tab;
+        case GLFW_KEY_ENTER:        return XK_Return;
+        case GLFW_KEY_PAUSE:        return XK_Pause;
+        case GLFW_KEY_ESCAPE:       return XK_Escape;
+        case GLFW_KEY_DELETE:       return XK_Delete;
+        case GLFW_KEY_KP_0:         return XK_KP_0;
+        case GLFW_KEY_KP_1:         return XK_KP_1;
+        case GLFW_KEY_KP_2:         return XK_KP_2;
+        case GLFW_KEY_KP_3:         return XK_KP_3;
+        case GLFW_KEY_KP_4:         return XK_KP_4;
+        case GLFW_KEY_KP_5:         return XK_KP_5;
+        case GLFW_KEY_KP_6:         return XK_KP_6;
+        case GLFW_KEY_KP_7:         return XK_KP_7;
+        case GLFW_KEY_KP_8:         return XK_KP_8;
+        case GLFW_KEY_KP_9:         return XK_KP_9;
+        case GLFW_KEY_KP_DECIMAL:   return XK_KP_Decimal;
+        case GLFW_KEY_KP_DIVIDE:    return XK_KP_Divide;
+        case GLFW_KEY_KP_MULTIPLY:  return XK_KP_Multiply;
+        case GLFW_KEY_KP_SUBTRACT:  return XK_KP_Subtract;
+        case GLFW_KEY_KP_ADD:       return XK_KP_Add;
+        case GLFW_KEY_KP_ENTER:     return XK_KP_Enter;
+        case GLFW_KEY_KP_EQUAL:     return XK_KP_Equal;
+        case GLFW_KEY_UP:           return XK_Up;
+        case GLFW_KEY_DOWN:         return XK_Down;
+        case GLFW_KEY_RIGHT:        return XK_Right;
+        case GLFW_KEY_LEFT:         return XK_Left;
+        case GLFW_KEY_INSERT:       return XK_Insert;
+        case GLFW_KEY_HOME:         return XK_Home;
+        case GLFW_KEY_END:          return XK_End;
+        case GLFW_KEY_PAGE_UP:      return XK_Page_Up;
+        case GLFW_KEY_PAGE_DOWN:    return XK_Page_Down;
+        case GLFW_KEY_F1:           return XK_F1;
+        case GLFW_KEY_F2:           return XK_F2;
+        case GLFW_KEY_F3:           return XK_F3;
+        case GLFW_KEY_F4:           return XK_F4;
+        case GLFW_KEY_F5:           return XK_F5;
+        case GLFW_KEY_F6:           return XK_F6;
+        case GLFW_KEY_F7:           return XK_F7;
+        case GLFW_KEY_F8:           return XK_F8;
+        case GLFW_KEY_F9:           return XK_F9;
+        case GLFW_KEY_F10:          return XK_F10;
+        case GLFW_KEY_F11:          return XK_F11;
+        case GLFW_KEY_F12:          return XK_F12;
+        case GLFW_KEY_NUM_LOCK:     return XK_Num_Lock;
+        case GLFW_KEY_CAPS_LOCK:    return XK_Caps_Lock;
+        case GLFW_KEY_SCROLL_LOCK:  return XK_Scroll_Lock;
+        case GLFW_KEY_RIGHT_SHIFT:  return XK_Shift_R;
+        case GLFW_KEY_LEFT_SHIFT:   return XK_Shift_L;
+        case GLFW_KEY_RIGHT_CONTROL:return XK_Control_R;
         case GLFW_KEY_LEFT_CONTROL: return XK_Control_L;
-        case GLFW_KEY_RIGHT_ALT: return XK_Alt_R;
-        case GLFW_KEY_LEFT_ALT: return XK_Alt_L;
-        case GLFW_KEY_RIGHT_SUPER: return XK_Super_R;
-        case GLFW_KEY_LEFT_SUPER: return XK_Super_L;
-        case GLFW_KEY_MENU: return XK_Menu;
+        case GLFW_KEY_RIGHT_ALT:    return XK_Alt_R;
+        case GLFW_KEY_LEFT_ALT:     return XK_Alt_L;
+        case GLFW_KEY_RIGHT_SUPER:  return XK_Super_R;
+        case GLFW_KEY_LEFT_SUPER:   return XK_Super_L;
+        case GLFW_KEY_MENU:         return XK_Menu;
         case GLFW_KEY_PRINT_SCREEN: return XK_Print;
-        default:
-            // For regular character keys
-            if (key >= GLFW_KEY_SPACE && key <= GLFW_KEY_GRAVE_ACCENT) {
-                return key;
-            }
-            return 0;
     }
+
+    // 2. Handle Letters (A-Z) with Shift/Caps awareness
+    if (key >= GLFW_KEY_A && key <= GLFW_KEY_Z) {
+        bool shift = (mods & GLFW_MOD_SHIFT) != 0;
+        bool caps = (mods & GLFW_MOD_CAPS_LOCK) != 0;
+        // If Shift and CapsLock are both on, they cancel out for letters
+        return (shift != caps) ? key : (key + 32); 
+    }
+
+    // 3. Handle Numbers and Symbols with Shift awareness
+    if (mods & GLFW_MOD_SHIFT) {
+        switch (key) {
+            case GLFW_KEY_1: return XK_exclam;
+            case GLFW_KEY_2: return XK_at;
+            case GLFW_KEY_3: return XK_numbersign;
+            case GLFW_KEY_4: return XK_dollar;
+            case GLFW_KEY_5: return XK_percent;
+            case GLFW_KEY_6: return XK_asciicircum;
+            case GLFW_KEY_7: return XK_ampersand;
+            case GLFW_KEY_8: return XK_asterisk;
+            case GLFW_KEY_9: return XK_parenleft;
+            case GLFW_KEY_0: return XK_parenright;
+            case GLFW_KEY_MINUS: return XK_underscore;
+            case GLFW_KEY_EQUAL: return XK_plus;
+            case GLFW_KEY_LEFT_BRACKET:  return XK_braceleft;
+            case GLFW_KEY_RIGHT_BRACKET: return XK_braceright;
+            case GLFW_KEY_BACKSLASH:     return XK_bar;
+            case GLFW_KEY_SEMICOLON:     return XK_colon;
+            case GLFW_KEY_APOSTROPHE:    return XK_quotedbl;
+            case GLFW_KEY_COMMA:         return XK_less;
+            case GLFW_KEY_PERIOD:        return XK_greater;
+            case GLFW_KEY_SLASH:         return XK_question;
+            case GLFW_KEY_GRAVE_ACCENT:  return XK_asciitilde;
+        }
+    } else {
+        // Not shifted, just return the character key as is
+        // (GLFW keys like GLFW_KEY_COMMA are already equal to the ASCII code for ',')
+        if (key >= GLFW_KEY_SPACE && key <= GLFW_KEY_GRAVE_ACCENT) {
+            // Special check: GLFW uses uppercase for letters in this range.
+            // But we already handled letters above.
+            return key;
+        }
+    }
+
+    return 0;
 }
 
 // Editor config serialization
@@ -2129,16 +2418,16 @@ bool load_editor_layout(flecs::entity editor_root, flecs::world& world, flecs::e
 
 static void key_callback(GLFWwindow* window, int key, int scancode, int action, int mods)
 {
-    if (action != GLFW_PRESS && action != GLFW_REPEAT) return;
-
-    if (key == GLFW_KEY_S && mods & GLFW_MOD_CONTROL)
+    if (action == GLFW_PRESS)
     {
-        flecs::entity editor_root = world.lookup("editor_root");
-        if (editor_root.is_valid()) {
-            save_editor_layout(editor_root);
+        if (key == GLFW_KEY_S && mods & GLFW_MOD_CONTROL)
+        {
+            flecs::entity editor_root = world.lookup("editor_root");
+            if (editor_root.is_valid()) {
+                save_editor_layout(editor_root);
+            }
+            return;
         }
-        return;
-    }
 
     // Retrieve the singleton ChatState
     ChatState* chat = world.try_get_mut<ChatState>();
@@ -2170,13 +2459,15 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                     auto example_message_bkg = world.entity()
                         .is_a(UIElement)
                         .child_of(chat_panel.message_list) // Attached to the ChatPanel found via query
-                        .set<RoundedRectRenderable>({100.0f, 16.0f, 2.0f, true, 0x121212FF})
-                        .set<Expand>({true, 4.0f, 4.0f, 1.0f, false, 0, 0, 0})
+                        .set<RoundedRectRenderable>({100.0f, 16.0f, 2.0f, false, 0x121212FF})
+                        // .set<Expand>({true, 4.0f, 4.0f, 1.0f, false, 0, 0, 0})
+                        .set<UIContainer>({8, 6})
                         // .add<DebugRenderBounds>()
-                        .set<ZIndex>({10});
-                    
-                    auto message_content = world.entity()
+                        .set<ZIndex>({15});
+                        
+                        auto message_content = world.entity()
                         .is_a(UIElement)
+                        .set<Position, Local>({8, 8})
                         .child_of(example_message_bkg)
                         // .add<DebugRenderBounds>()
                         .add<VerticalLayoutBox>();
@@ -2186,30 +2477,28 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                         .is_a(UIElement)
                         .child_of(message_content)
                         .set<TextRenderable>({chat->draft.c_str(), "Inter", 16.0f, 0xFFFFFFFF})
-                        .set<ZIndex>({12});
+                        .set<ZIndex>({17});
                 });
 
             chat->draft.clear();
         }
     }
-    } else // TODO: Check for focused VNC Stream...
-    {
-        auto query = world.query<VNCClient>();
-        query.each([&](flecs::entity e, VNCClient& vnc) {
-            if (vnc.connected && vnc.client) {
-                rfbKeySym keysym = glfw_key_to_rfb_keysym(key);
-                // Only send special keys (not printable characters which are handled by char_callback)
-                // Skip F1 (used for mode toggle), F2 (used for VNC visibility toggle), and regular character keys
-                if (keysym != 0 && key != GLFW_KEY_F1 && key != GLFW_KEY_F2) {
-                    // Only send if it's NOT a regular character key (space to grave accent range)
-                    // These will be handled by char_callback to avoid double input
-                    if (key < GLFW_KEY_SPACE || key > GLFW_KEY_GRAVE_ACCENT) {
-                        SendKeyEvent(vnc.client, keysym, action != GLFW_RELEASE);
-                    }
-                }
-            }
-        });
+    } 
     }
+    // TODO: Check for focused VNC Stream...
+    auto query = world.query<VNCClient>();
+    query.each([&](flecs::entity e, VNCClient& vnc) {
+        if (vnc.connected && vnc.client) {
+            rfbKeySym keysym = glfw_key_to_rfb_keysym(key, mods);
+
+            if (action == GLFW_PRESS) {
+                SendKeyEvent(vnc.client, keysym, TRUE);
+            } 
+            else if (action == GLFW_RELEASE) {
+                SendKeyEvent(vnc.client, keysym, FALSE);
+            }
+        }
+    });
 }
 
 float point_distance_to_edge(Position p, Position a, Position b)
@@ -2268,7 +2557,7 @@ int main(int, char *[]) {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_COMPAT_PROFILE);
     
-    GLFWwindow* window = glfwCreateWindow(800, 600, "ECS Graphstar", NULL, NULL);
+    GLFWwindow* window = glfwCreateWindow(1200, 800, "Thornfield", NULL, NULL);
     if (window == NULL) {
         std::cerr << "Failed to create GLFW window" << std::endl;
         glfwTerminate();
@@ -2332,6 +2621,9 @@ int main(int, char *[]) {
     world.component<Align>();
     world.component<Expand>();
     world.component<Constrain>();
+    world.component<BFOSprite>();
+
+    world.component<ParentClass>().add(flecs::Transitive);
 
     world.component<HorizontalLayoutBox>();
     world.component<VerticalLayoutBox>();
@@ -2428,6 +2720,40 @@ int main(int, char *[]) {
             overlay.set<ServerDescription>({0});
         }
         e.set<ZIndex>({10});
+    });
+
+    world.observer<UIElementBounds, AddTagOnHoverEnter>()
+    .term_at(1).second<HighlightBFOInheritanceHierarchy>()
+    .event<HoverEnterEvent>()
+    .each([&](flecs::entity e, UIElementBounds& bounds, AddTagOnHoverEnter)
+    {
+        auto bfo_sprite_query = world.query_builder<ZIndex>()
+        .with<BFOSprite>()
+        .without<ParentClass>(e)
+        .build();
+
+        bfo_sprite_query.each([e](flecs::entity non_parent, ZIndex& z_index)
+        {
+            if (non_parent != e)
+            {
+                z_index.layer = 0;    
+            }
+        });
+    });
+
+    world.observer<UIElementBounds, AddTagOnHoverExit>()
+    .term_at(1).second<ResetBFOSprites>()
+    .event<HoverExitEvent>()
+    .each([&](flecs::entity e, UIElementBounds& bounds, AddTagOnHoverExit)
+    {
+        auto bfo_sprite_query = world.query_builder<ZIndex>()
+        .with<BFOSprite>()
+        .build();
+
+        bfo_sprite_query.each([](flecs::entity non_parent, ZIndex& z_index)
+        {
+            z_index.layer = 50;
+        });
     });
 
     world.system<ServerDescription, ZIndex>()
@@ -3204,6 +3530,24 @@ int main(int, char *[]) {
         size.height = renderable.height;
     });
 
+    world.system<UIElementBounds, UIContainer, CustomRenderable, UIElementSize>()
+    .kind(flecs::PreFrame)
+    .each([&](flecs::entity e, UIElementBounds& bounds, UIContainer& container, CustomRenderable& renderable, UIElementSize& size)
+    {
+        UIElementBounds children_aabb = {0, 0, 0, 0};
+        bool first = true;
+        calculate_recursive_bounds(e, children_aabb, first);
+        if (!first) {
+            bounds = children_aabb;
+        }
+        renderable.width = (bounds.xmax - bounds.xmin) + (container.pad_horizontal * 2);
+        renderable.height = (bounds.ymax - bounds.ymin) + (container.pad_vertical * 2);
+        
+        size.width = renderable.width;
+        size.height = renderable.height;
+    });
+
+
     auto bubbleUpBoundsSecondarySystem = world.system<UIElementBounds, UIElementBounds*, RenderStatus*>()
         .kind(flecs::PostLoad) 
         .term_at(1).parent().up()
@@ -3431,7 +3775,15 @@ world.system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
     .term_at(0).second<World>()
     .each([&](flecs::entity e, Position& pos, CustomRenderable& renderable, ZIndex& zIndex) {
         RenderQueue& queue = world.ensure<RenderQueue>();
-        queue.addCustomCommand(pos, renderable, zIndex.layer);
+        if (e.has<ScissorContainer>(flecs::Wildcard))
+        {
+            flecs::entity scissorEntity = e.target<ScissorContainer>();
+            queue.commands.push_back({pos, renderable, RenderType::CustomRenderable, zIndex.layer, scissorEntity});
+            // TODO: Pushback target UIElementBounds as the scissorRegion of RenderCommand
+        } else
+        {
+            queue.commands.push_back({pos, renderable, RenderType::CustomRenderable, zIndex.layer, 0});
+        }
     });
 
     world.system<Position, EditorNodeArea, EditorLeafData, EditorRoot>()
