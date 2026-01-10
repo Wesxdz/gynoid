@@ -127,6 +127,7 @@ TextSize measureText(NVGcontext* vg,
 }
 
 static const char* VNC_SURFACE_TAG = "vnc_surface";
+static const char* VNC_CLIENT_TAG = "vnc_client";
 static struct timeval g_last_screenshot_time;
 
 // Vision processing job queue
@@ -819,18 +820,14 @@ static rfbBool vnc_resize_callback(rfbClient* client) {
 
 static void vnc_update_callback(rfbClient* client, int x, int y, int w, int h) {
     // Mark texture region for update in ECS - find the texture for this specific client
-    auto query = world->query<VNCClient>();
-    int updateCount = 0;
-    query.each([&](flecs::entity e, VNCClient& vnc) {
-        if (vnc.client == client) {
-            // Add the dirty rectangle to the update queue
-            std::lock_guard<std::mutex> lock(*vnc.surfaceMutex);
-            vnc.dirtyRects.push_back({x, y, w, h});
-            vnc.needsUpdate = true;
-            updateCount++;
-            LOG_TRACE(LogCategory::VNC_CLIENT, "Added dirty rect total rects: {}", vnc.dirtyRects.size());
-        }
-    });
+    // This callback runs on LibVNC's internal thread, so use lock-free queue
+    VNCClient* vnc = (VNCClient*)rfbClientGetClientData(client, (void*)VNC_CLIENT_TAG);
+    if (vnc) {
+        // Push to lock-free queue instead of holding mutex during ECS query
+        vnc->dirtyRectQueue->push({x, y, w, h});
+        vnc->needsUpdate.store(true, std::memory_order_release);
+        LOG_TRACE(LogCategory::VNC_CLIENT, "VNC callback added dirty rect: ({},{}) {}x{}", x, y, w, h);
+    }
 }
 
 
@@ -865,6 +862,116 @@ rfbClient* connectToTurboVNC(const char* host, int port) {
     std::cout << "[VNC] Size: " << client->width << "x" << client->height << std::endl;
 
     return client;
+}
+
+// VNC async connection function - runs on network thread
+void vnc_connect_async(VNCClient* vnc) {
+    vnc->connectionState = VNCClient::CONNECTING;
+
+    LOG_INFO(LogCategory::VNC_CLIENT, "Connecting to {}:{}...", vnc->host, vnc->port);
+
+    rfbClient* client = rfbGetClient(8, 3, 4);
+    client->MallocFrameBuffer = vnc_resize_callback;
+    client->canHandleNewFBSize = TRUE;
+    client->GotFrameBufferUpdate = vnc_update_callback;
+
+    client->appData.encodingsString = "tight copyrect";
+    client->appData.compressLevel = 0;
+    client->appData.qualityLevel = 10;
+    client->appData.enableJPEG = FALSE;
+
+    client->serverHost = strdup(vnc->host.c_str());
+    client->serverPort = vnc->port;
+
+    if (!rfbInitClient(client, NULL, NULL)) {
+        std::lock_guard<std::mutex> lock(vnc->errorMutex);
+        vnc->errorMessage = "Failed to initialize VNC client";
+        vnc->connectionState = VNCClient::ERROR;
+        LOG_ERROR(LogCategory::VNC_CLIENT, "{}", vnc->errorMessage);
+        return;
+    }
+
+    vnc->client = client;
+    vnc->connected = true;
+    vnc->connectionState = VNCClient::CONNECTED;
+
+    // Store VNCClient pointer in rfbClient for callbacks
+    rfbClientSetClientData(client, (void*)VNC_CLIENT_TAG, vnc);
+
+    SDL_Surface* surface = (SDL_Surface*)rfbClientGetClientData(client, (void*)VNC_SURFACE_TAG);
+    vnc->surface = surface;
+    vnc->width = client->width;
+    vnc->height = client->height;
+
+    LOG_INFO(LogCategory::VNC_CLIENT, "Connected to {} - {}x{}",
+        vnc->toString(), vnc->width, vnc->height);
+}
+
+// VNC message processing thread - handles all network I/O
+void vnc_message_thread(VNCClient* vnc) {
+    LOG_INFO(LogCategory::VNC_CLIENT, "VNC thread started for {}", vnc->toString());
+
+    // First connect, then run message loop
+    vnc_connect_async(vnc);
+
+    vnc->threadRunning = true;
+
+    // Main message loop
+    while (!vnc->threadShouldStop) {
+        // 1. Process pending input events (send to VNC server)
+        {
+            std::unique_lock<std::mutex> lock(vnc->inputQueueMutex);
+            vnc->inputQueueCV.wait_for(lock, std::chrono::milliseconds(10),
+                [vnc]() { return !vnc->inputQueue.empty() || vnc->threadShouldStop; });
+
+            while (!vnc->inputQueue.empty()) {
+                auto event = vnc->inputQueue.front();
+                vnc->inputQueue.pop_front();
+                lock.unlock();
+
+                // Send outside lock to avoid blocking input submission
+                if (event.type == InputEvent::POINTER) {
+                    SendPointerEvent(vnc->client,
+                        event.data.pointer.x,
+                        event.data.pointer.y,
+                        event.data.pointer.buttonMask);
+                } else if (event.type == InputEvent::KEY) {
+                    SendKeyEvent(vnc->client,
+                        event.data.key.keysym,
+                        event.data.key.down);
+                }
+
+                lock.lock();
+            }
+        }
+
+        // 2. Process VNC server messages (non-blocking check)
+        if (vnc->connected && vnc->client) {
+            // WaitForMessage with 0 timeout = non-blocking check
+            while (WaitForMessage(vnc->client, 0) > 0) {
+                if (!HandleRFBServerMessage(vnc->client)) {
+                    LOG_ERROR(LogCategory::VNC_CLIENT, "VNC message handling failed for {}",
+                        vnc->toString());
+                    vnc->connected = false;
+                    vnc->connectionState = VNCClient::DISCONNECTING;
+                    break;
+                }
+            }
+        } else {
+            // No active connection, sleep to avoid busy-wait
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+
+        // 3. Check if connection is still alive
+        if (vnc->connected && vnc->client && vnc->client->sock < 0) {
+            LOG_WARN(LogCategory::VNC_CLIENT, "VNC socket closed for {}", vnc->toString());
+            vnc->connected = false;
+            vnc->connectionState = VNCClient::ERROR;
+        }
+    }
+
+    vnc->threadRunning = false;
+    LOG_INFO(LogCategory::VNC_CLIENT, "VNC thread stopped for {}", vnc->toString());
 }
 
 // End VNC Stream
@@ -1184,40 +1291,54 @@ std::vector<std::string> editor_types =
 struct VNCData
 {
     flecs::entity vnc_stream;
-    VNCClient client;
+    VNCClient* client;  // Pointer to avoid copying non-copyable VNCClient
 };
 
 VNCData get_vnc_source(const std::string& host, int port) {
     std::string addr = host + ":" + std::to_string(port);
-    
+
     // 1. Check if we already have this connection
     auto existing = world->lookup(addr.c_str());
     if (existing && existing.has<VNCClient>()) {
         existing.ensure<VNCClient>().reference_count++;
-        return {existing, existing.ensure<VNCClient>()};
+        return {existing, &existing.ensure<VNCClient>()};
     }
 
-    // 2. Otherwise, create a new one
-    rfbClient* client = connectToTurboVNC(host.c_str(), port);
-    // if (!client) return flecs::entity::null();
+    // 2. Create VNCClient with async connection setup
+    VNCClient client_data;
+    client_data.host = host;
+    client_data.port = port;
+    client_data.reference_count = 1;
+    client_data.surfaceMutex = std::make_shared<std::mutex>();
+    client_data.dirtyRectQueue = std::make_shared<DirtyRectQueue>();
+    client_data.connectionState = VNCClient::CONNECTING;
 
-    SDL_Surface* surface = (SDL_Surface*)rfbClientGetClientData(client, (void*)VNC_SURFACE_TAG);
-
-    // Create OpenGL texture for VNC framebuffer
-    GLuint vncTexture;
-    glGenTextures(1, &vncTexture);
-    glBindTexture(GL_TEXTURE_2D, vncTexture);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, client->width, client->height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    // Create OpenGL texture (will be resized when connected)
+    glGenTextures(1, &client_data.vncTexture);
+    glBindTexture(GL_TEXTURE_2D, client_data.vncTexture);
+    // Allocate empty texture initially (will resize when connected)
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1920, 1080, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 
-    int nvgVNCHandle = nvglCreateImageFromHandleGL2(world->try_get<Graphics>()->vg, vncTexture, client->width, client->height, 0);
-    
-    // Create an entity to hold the shared VNC state
-    VNCClient client_data = {client, surface, vncTexture, nvgVNCHandle, true, false, host, port, client->width, client->height, 1, std::make_shared<std::mutex>()};
-    flecs::entity created = world->entity(addr.c_str())
-        .set<VNCClient>(client_data);
-    return {created, client_data};
+    // Create PBO for async texture upload
+    glGenBuffers(1, &client_data.pbo);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, client_data.pbo);
+    glBufferData(GL_PIXEL_UNPACK_BUFFER, 1920 * 1080 * 4, nullptr, GL_STREAM_DRAW);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+
+    client_data.nvgHandle = nvglCreateImageFromHandleGL2(world->try_get<Graphics>()->vg,
+        client_data.vncTexture, 1920, 1080, 0);
+
+    // Create entity BEFORE starting thread (move client_data)
+    flecs::entity created = world->entity(addr.c_str()).set<VNCClient>(std::move(client_data));
+
+    // Start network thread AFTER entity is created
+    VNCClient& vnc_ref = created.ensure<VNCClient>();
+    vnc_ref.threadShouldStop = false;
+    vnc_ref.messageThread = std::thread(vnc_message_thread, &vnc_ref);
+
+    return {created, &vnc_ref};
 }
 
 struct ScissorContainer {};
@@ -1765,7 +1886,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         .is_a(UIElement)
         .add<ActiveIndicator>(vnc_active_outline_indicator)
         .add<IsStreamingFrom>(data.vnc_stream)
-        .set<ImageRenderable>({data.client.nvgHandle, 1.0f, 1.0f, (float)data.client.width, (float)data.client.height})
+        .set<ImageRenderable>({data.client->nvgHandle, 1.0f, 1.0f, (float)data.client->width, (float)data.client->height})
         .set<ZIndex>({9})
         .set<Expand>({true, 0.0f, 0.0f, 1.0f, false, 0, 0, 0})
         .set<Constrain>({true, true})
@@ -2493,16 +2614,22 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
     } 
     }
     // TODO: Check for focused VNC Stream...
-    auto query = world->query<VNCClient>();
-    query.each([&](flecs::entity e, VNCClient& vnc) {
+    // Use static cached query to avoid creating new query on every key press
+    static auto vnc_query = world->query<VNCClient>();
+    vnc_query.each([&](flecs::entity e, VNCClient& vnc) {
         if (vnc.connected && vnc.client && vnc.eventPassthroughEnabled) {
             rfbKeySym keysym = glfw_key_to_rfb_keysym(key, mods);
 
-            if (action == GLFW_PRESS) {
-                SendKeyEvent(vnc.client, keysym, TRUE);
-            } 
-            else if (action == GLFW_RELEASE) {
-                SendKeyEvent(vnc.client, keysym, FALSE);
+            // Queue keyboard event instead of sending directly
+            InputEvent event;
+            event.type = InputEvent::KEY;
+            event.data.key.keysym = keysym;
+            event.data.key.down = (action == GLFW_PRESS) ? TRUE : FALSE;
+
+            if (action == GLFW_PRESS || action == GLFW_RELEASE) {
+                std::lock_guard<std::mutex> lock(vnc.inputQueueMutex);
+                vnc.inputQueue.push_back(event);
+                vnc.inputQueueCV.notify_one();
             }
         }
     });
@@ -2526,12 +2653,9 @@ float point_distance_to_edge(Position p, Position a, Position b)
     return Vector2Distance(p, closest_point);
 }
 
-// Per-thread stack to ensure zones are closed in the correct order
 thread_local std::stack<TracyCZoneCtx> zone_stack;
 
 void trace_push(const char *file, size_t line, const char *name) {
-    // ___tracy_alloc_srcloc_name signature:
-    // (line, source, sourceSz, function, functionSz, name, nameSz, color)
     uint64_t srcloc = ___tracy_alloc_srcloc_name(
         (uint32_t)line,
         file, strlen(file),       // Source file
@@ -4098,28 +4222,15 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
     auto vncInitSystem = world->system<VNCClient>()
         .kind(flecs::PreUpdate)
         .each([](flecs::iter& it, size_t i, VNCClient& vnc) {
-            static bool initialized[1] = {false};
             if (!vnc.initialized && vnc.connected && vnc.client) {
                 SendFramebufferUpdateRequest(vnc.client, 0, 0, vnc.client->width, vnc.client->height, FALSE);
-            }
-        });
-
-    // Process VNC messages to trigger update callbacks
-    auto vncMessageProcessingSystem = world->system<VNCClient>()
-        .kind(flecs::OnUpdate)
-        .each([](flecs::entity e, VNCClient& vnc) {
-            if (!vnc.connected || !vnc.client) return;
-
-            // DRAIN the message queue
-            while (WaitForMessage(vnc.client, 0) > 0) { 
-                if (!HandleRFBServerMessage(vnc.client)) {
-                    vnc.connected = false;
-                    break;
-                }
+                vnc.initialized = true;  // Mark as initialized to avoid repeated requests
+                LOG_INFO(LogCategory::VNC_CLIENT, "Sent initial framebuffer update request for {}", vnc.toString());
             }
         });
 
     // VNC mouse tracking system - sends mouse position to active VNC client in interactive mode
+    // Note: Message processing now handled by vnc_message_thread() on network thread
     auto vncMouseTrackingSystem = world->system<Position, ImageRenderable>()
         .with<IsStreamingFrom>(flecs::Wildcard)
         .term_at(0).second<World>()
@@ -4152,8 +4263,18 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
 
             if (!mouseOutOfBounds)
             {
-                // Send pointer event with current button mask (preserves button state during drags)
-                SendPointerEvent(vnc.client, vnc_x, vnc_y, g_vncButtonMask);
+                // Queue input event instead of sending directly
+                InputEvent event;
+                event.type = InputEvent::POINTER;
+                event.data.pointer.x = vnc_x;
+                event.data.pointer.y = vnc_y;
+                event.data.pointer.buttonMask = g_vncButtonMask;
+
+                {
+                    std::lock_guard<std::mutex> lock(vnc.inputQueueMutex);
+                    vnc.inputQueue.push_back(event);
+                }
+                vnc.inputQueueCV.notify_one();
             }
         });
 
@@ -4170,11 +4291,17 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
         .kind(flecs::OnUpdate)
         .each([](flecs::entity e, VNCClient& vnc) {
             if (!vnc.connected || !vnc.client) {
-                static bool warned = false;
-                LOG_DEBUG(LogCategory::VNC_CLIENT, "Client not connected or null");
                 return;
             }
             if (!vnc.needsUpdate) return;
+
+            // Swap dirty rect queue (fast, non-blocking)
+            auto newRects = vnc.dirtyRectQueue->swap();
+            if (newRects.empty()) {
+                vnc.needsUpdate = false;
+                return;
+            }
+
             std::lock_guard<std::mutex> lock(*vnc.surfaceMutex);
             
             LOG_TRACE(LogCategory::VNC_CLIENT, "Updating OpenGL texture {} for quadrant {}", vnc.vncTexture, vnc.toString());
@@ -4199,90 +4326,169 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
                 LOG_TRACE(LogCategory::VNC_CLIENT, "Submitted vision processing job for quadrant {}", vnc.toString());
 
 
-                LOG_TRACE(LogCategory::VNC_CLIENT, "Processing {} dirty rectangles", vnc.dirtyRects.size());
+                LOG_TRACE(LogCategory::VNC_CLIENT, "Processing {} dirty rectangles", newRects.size());
                 LOG_TRACE(LogCategory::VNC_CLIENT, "Surface info: {}x{}, format: {}", surface->w, surface->h, SDL_GetPixelFormatName(surface->format->format));
 
-                // Update OpenGL texture from SDL surface pixels
-                glBindTexture(GL_TEXTURE_2D, vnc.vncTexture);
+                // Bind PBO for async texture upload
+                glBindBuffer(GL_PIXEL_UNPACK_BUFFER, vnc.pbo);
 
-                // Set pixel unpack alignment to handle pitch correctly
+                // Resize PBO if needed (connection established and size changed)
+                size_t requiredSize = surface->pitch * surface->h;
+                GLint currentSize = 0;
+                glGetBufferParameteriv(GL_PIXEL_UNPACK_BUFFER, GL_BUFFER_SIZE, &currentSize);
+                if (currentSize < (GLint)requiredSize) {
+                    glBufferData(GL_PIXEL_UNPACK_BUFFER, requiredSize, nullptr, GL_STREAM_DRAW);
+                }
+
+                // Determine pixel format
                 int bytesPerPixel = surface->format->BytesPerPixel;
-                int expectedPitch = surface->w * bytesPerPixel;
-
-                // CRITICAL: When updating partial rects, GL_UNPACK_ROW_LENGTH tells OpenGL
-                // how many pixels are in a row of the SOURCE data (the surface)
-                // This must be set to surface->pitch / bytesPerPixel regardless of whether
-                // we're updating the full surface or a partial rect
-                int rowLengthPixels = surface->pitch / bytesPerPixel;
-
-                LOG_TRACE(LogCategory::VNC_CLIENT, "Surface pitch: {}, bytes per pixel: {}", surface->pitch, surface->format->BytesPerPixel);
-
-                // Always set row length for partial updates
-                glPixelStorei(GL_UNPACK_ROW_LENGTH, rowLengthPixels);
-                glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-
-                // Determine the correct pixel format based on SDL surface format
                 GLenum format = GL_BGRA;
                 if (surface->format->Rmask == 0xFF) {
                     format = GL_RGBA;
                 }
 
-                LOG_TRACE(LogCategory::VNC_CLIENT, "Using OpenGL format: {}", (format == GL_BGRA ? "BGRA" : "RGBA"));
+                // Map PBO for writing
+                void* pboMem = glMapBuffer(GL_PIXEL_UNPACK_BUFFER, GL_WRITE_ONLY);
+                if (!pboMem) {
+                    LOG_ERROR(LogCategory::VNC_CLIENT, "Failed to map PBO");
+                    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+                    vnc.needsUpdate = false;
+                    return;
+                }
 
-                // Process each dirty rectangle
-                for (const auto& rectIn : vnc.dirtyRects) {
-                    // Clamp rect to surface/texture bounds to be safe
+                uint8_t* pboBytes = static_cast<uint8_t*>(pboMem);
+                uint8_t* surfaceBytes = static_cast<uint8_t*>(surface->pixels);
+
+                // Copy only dirty rectangles to PBO with alpha correction
+                for (const auto& rectIn : newRects) {
+                    // Clamp rect to surface bounds
                     int rx = std::max(0, rectIn.x);
                     int ry = std::max(0, rectIn.y);
                     int rw = std::min(rectIn.w, surface->w - rx);
                     int rh = std::min(rectIn.h, surface->h - ry);
                     if (rw <= 0 || rh <= 0) continue;
 
-                    // Pointer to top-left of the dirty region
-                    uint8_t* regionStart = // NOTE: Changed to non-const for modification
-                        static_cast<uint8_t*>(surface->pixels) + ry * surface->pitch + rx * 4;
-
-                    // --- CRITICAL ADDITION: Force full alpha for the dirty rectangle ---
-                    // This assumes a 32-bit format (bpp=4) where the alpha channel is the
-                    // last byte of the 4-byte pixel (e.g., RGBA or BGRA).
-                    // If the format is different, the offset (bpp - 1) needs adjustment.
+                    // Copy this dirty rect to PBO with alpha correction
                     for (int y = 0; y < rh; ++y) {
-                        uint8_t* rowStart = regionStart + y * surface->pitch;
+                        int srcY = ry + y;
+                        uint8_t* srcRow = surfaceBytes + srcY * surface->pitch + rx * 4;
+                        uint8_t* dstRow = pboBytes + srcY * surface->pitch + rx * 4;
+
                         for (int x = 0; x < rw; ++x) {
-                            // Set the alpha component (last byte) to 0xFF (fully opaque)
-                            rowStart[x * 4 + (4 - 1)] = 0xFF;
+                            int idx = x * 4;
+                            dstRow[idx + 0] = srcRow[idx + 0];  // R or B
+                            dstRow[idx + 1] = srcRow[idx + 1];  // G
+                            dstRow[idx + 2] = srcRow[idx + 2];  // B or R
+                            dstRow[idx + 3] = 0xFF;              // A (force opaque)
                         }
                     }
-                    // ------------------------------------------------------------------
+                }
 
-                    // Critical change: we keep GL_UNPACK_ROW_LENGTH set so GL steps by `pitch` each row.
-                    glTexSubImage2D(GL_TEXTURE_2D, 0, rx, ry, rw, rh, format, GL_UNSIGNED_BYTE, regionStart);
+                glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
+
+                // Update OpenGL texture from PBO
+                glBindTexture(GL_TEXTURE_2D, vnc.vncTexture);
+
+                int rowLengthPixels = surface->pitch / bytesPerPixel;
+                glPixelStorei(GL_UNPACK_ROW_LENGTH, rowLengthPixels);
+                glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+
+                LOG_TRACE(LogCategory::VNC_CLIENT, "Using OpenGL format: {}", (format == GL_BGRA ? "BGRA" : "RGBA"));
+
+                // Upload each dirty rectangle from PBO to texture
+                for (const auto& rectIn : newRects) {
+                    int rx = std::max(0, rectIn.x);
+                    int ry = std::max(0, rectIn.y);
+                    int rw = std::min(rectIn.w, surface->w - rx);
+                    int rh = std::min(rectIn.h, surface->h - ry);
+                    if (rw <= 0 || rh <= 0) continue;
+
+                    // Upload from PBO (GPU-side transfer, non-blocking)
+                    size_t offset = ry * surface->pitch + rx * 4;
+                    glTexSubImage2D(GL_TEXTURE_2D, 0, rx, ry, rw, rh, format, GL_UNSIGNED_BYTE, (void*)offset);
                 }
 
                 // Reset to defaults
                 glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
                 glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
 
+                // Unbind PBO
+                glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+
                 LOG_TRACE(LogCategory::VNC_CLIENT, "All rects updated successfully");
 
-                // Save screenshot every second
-                struct timeval current_time;
-                gettimeofday(&current_time, NULL);
-                long elapsed_ms = (current_time.tv_sec - g_last_screenshot_time.tv_sec) * 1000 +
-                                  (current_time.tv_usec - g_last_screenshot_time.tv_usec) / 1000;
-
-                // if (elapsed_ms >= 1000) {
-                //     save_vnc_screenshot(surface, vnc.quadrant);
-                //     g_last_screenshot_time = current_time;
-                // }
-
-                // Clear dirty rects and mark as updated
-                vnc.dirtyRects.clear();
+                // Mark as updated
                 vnc.needsUpdate = false;
 
-                std::cout << "Updated VNC texture " << std::endl;
+                std::cout << "Updated VNC texture (async PBO)" << std::endl;
             } else {
                 LOG_ERROR(LogCategory::VNC_CLIENT, "Surface or pixels is null");
+            }
+        });
+
+    // VNC cleanup system - handles thread lifecycle and resource cleanup
+    auto vncCleanupSystem = world->system<VNCClient>()
+        .kind(flecs::OnUpdate)
+        .each([](flecs::entity e, VNCClient& vnc) {
+            // Handle connection state transitions
+            switch (vnc.connectionState.load()) {
+                case VNCClient::CONNECTING:
+                    // Connection in progress, handled by network thread
+                    break;
+
+                case VNCClient::CONNECTED:
+                    // Normal operation
+                    break;
+
+                case VNCClient::ERROR:
+                case VNCClient::DISCONNECTING:
+                    // Stop thread and cleanup if it's still running
+                    if (vnc.threadRunning) {
+                        LOG_INFO(LogCategory::VNC_CLIENT, "Stopping VNC thread for {}", vnc.toString());
+                        vnc.threadShouldStop = true;
+                        vnc.inputQueueCV.notify_one();
+
+                        // Wait for thread to finish
+                        if (vnc.messageThread.joinable()) {
+                            vnc.messageThread.join();
+                        }
+
+                        vnc.connectionState = VNCClient::DISCONNECTED;
+                    }
+                    break;
+
+                case VNCClient::DISCONNECTED:
+                    // Ready for reconnection or final cleanup
+                    // If reference count is 0, entity should be destroyed
+                    if (vnc.reference_count <= 0) {
+                        LOG_INFO(LogCategory::VNC_CLIENT, "Cleaning up VNC client {}", vnc.toString());
+
+                        // Cleanup OpenGL resources (MUST be on main thread)
+                        if (vnc.pbo) {
+                            glDeleteBuffers(1, &vnc.pbo);
+                            vnc.pbo = 0;
+                        }
+                        if (vnc.vncTexture) {
+                            glDeleteTextures(1, &vnc.vncTexture);
+                            vnc.vncTexture = 0;
+                        }
+
+                        // Cleanup VNC client
+                        if (vnc.client) {
+                            rfbClientCleanup(vnc.client);
+                            vnc.client = nullptr;
+                        }
+
+                        // Cleanup SDL surface
+                        if (vnc.surface) {
+                            SDL_FreeSurface(vnc.surface);
+                            vnc.surface = nullptr;
+                        }
+
+                        // Entity can now be safely removed
+                        e.destruct();
+                    }
+                    break;
             }
         });
 
