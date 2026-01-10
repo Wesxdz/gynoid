@@ -14,7 +14,6 @@
 #include <GLFW/glfw3native.h>
 #include <flecs.h>
 
-
 #include <nanovg.h>
 #define NANOVG_GL3_IMPLEMENTATION
 #include <nanovg_gl.h>
@@ -49,6 +48,10 @@
 
 #include "spatial_index.h"
 #include "query_server.h"
+
+#include <tracy/Tracy.hpp>
+#include <tracy/TracyC.h>
+#include <stack>
 
 struct TextSize { float w, h; };
 
@@ -2524,7 +2527,38 @@ float point_distance_to_edge(Position p, Position a, Position b)
     return Vector2Distance(p, closest_point);
 }
 
+// Per-thread stack to ensure zones are closed in the correct order
+thread_local std::stack<TracyCZoneCtx> zone_stack;
+
+void trace_push(const char *file, size_t line, const char *name) {
+    // ___tracy_alloc_srcloc_name signature:
+    // (line, source, sourceSz, function, functionSz, name, nameSz, color)
+    uint64_t srcloc = ___tracy_alloc_srcloc_name(
+        (uint32_t)line,
+        file, strlen(file),       // Source file
+        name, strlen(name),       // Function name
+        name, strlen(name),       // Zone name
+        0                         // Color
+    );
+
+    TracyCZoneCtx ctx = ___tracy_emit_zone_begin_alloc(srcloc, 1);
+    zone_stack.push(ctx);
+}
+
+void trace_pop(const char *file, size_t line, const char *name) {
+    if (!zone_stack.empty()) {
+        TracyCZoneEnd(zone_stack.top());
+        zone_stack.pop();
+    }
+}
+
 int main(int, char *[]) {
+
+    ecs_os_set_api_defaults();
+    ecs_os_api_t os_api = ecs_os_get_api();
+    os_api.perf_trace_push_ = trace_push;
+    os_api.perf_trace_pop_ = trace_pop;
+    ecs_os_set_api(&os_api);
 
     // Initialize spatial index manager
     spatial::SpatialIndexManager spatial_manager(&world);
@@ -2986,6 +3020,7 @@ int main(int, char *[]) {
         .term_at(0).second<World>()
         .kind(flecs::OnLoad) 
         .each([&](flecs::entity e, Position& worldPos, UIElementBounds& bounds, UIElementSize& size) {
+            ZoneScoped;
             // Reset bounds to invalid state at start of each frame
             bounds.xmin = worldPos.x;
             bounds.ymin = worldPos.y;
@@ -4363,7 +4398,7 @@ world.system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
         glfwPollEvents();
         world.defer_end();
         world.progress();
-
+        FrameMark;
         nvgEndFrame(vg);
 
         glfwSwapBuffers(window);
