@@ -79,6 +79,10 @@ struct VNCClient {
     // PBO for async texture upload
     GLuint pbo = 0;                                 // Pixel Buffer Object
 
+    // Frame capture for periodic PNG saving
+    double lastCaptureTime = 0.0;                   // Last time a frame was captured
+    int framesCaptured = 0;                         // Number of frames captured since start
+
     // Connection state machine
     enum ConnectionState {
         DISCONNECTED,
@@ -113,6 +117,8 @@ struct VNCClient {
           inputQueueMutex(), inputQueueCV(),
           dirtyRectQueue(std::move(other.dirtyRectQueue)),
           pbo(other.pbo),
+          lastCaptureTime(other.lastCaptureTime),
+          framesCaptured(other.framesCaptured),
           connectionState(other.connectionState.load()),
           errorMessage(std::move(other.errorMessage)),
           errorMutex()
@@ -146,6 +152,8 @@ struct VNCClient {
             inputQueue = std::move(other.inputQueue);
             dirtyRectQueue = std::move(other.dirtyRectQueue);
             pbo = other.pbo;
+            lastCaptureTime = other.lastCaptureTime;
+            framesCaptured = other.framesCaptured;
             connectionState.store(other.connectionState.load());
             errorMessage = std::move(other.errorMessage);
 

@@ -300,10 +300,10 @@ static void melSpecUpdateSystem(flecs::entity e, MelSpecRender& melSpec) {
     try_accept_connection(&g_micState);
     try_accept_connection(&g_sysAudioState);
 
-    if (update_count % 300 == 0) {
-        printf("[UPDATE] Frame %d: mic_fd=%d, sys_fd=%d\n",
-               update_count, g_micState.socket_fd, g_sysAudioState.socket_fd);
-    }
+    // if (update_count % 300 == 0) {
+    //     printf("[UPDATE] Frame %d: mic_fd=%d, sys_fd=%d\n",
+    //            update_count, g_micState.socket_fd, g_sysAudioState.socket_fd);
+    // }
 
     // Update textures from IPC
     update_from_ipc(&g_micState);

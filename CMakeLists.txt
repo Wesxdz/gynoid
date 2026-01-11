@@ -19,6 +19,7 @@ include_directories("src")
 include_directories("deps/mel_spec/src")
 include_directories("deps/mel_spec/deps/glad/include")
 include_directories("deps/spdlog/include")
+include_directories("deps/mel_spec/deps/fpng/src")
 
 add_definitions(-DTRACY_ENABLE)
 add_subdirectory("deps/tracy-0.13.1")
@@ -77,6 +78,14 @@ add_library(nanovg STATIC
 target_include_directories(nanovg PUBLIC deps/nanovg/src)
 target_compile_definitions(nanovg PUBLIC NANOVG_GL2_IMPLEMENTATION)
 
+# fpng
+add_library(fpng STATIC
+    deps/mel_spec/deps/fpng/src/fpng.cpp
+)
+target_include_directories(fpng PUBLIC deps/mel_spec/deps/fpng/src)
+set_target_properties(fpng PROPERTIES CXX_STANDARD 11)
+target_compile_options(fpng PRIVATE -msse4.1 -mpclmul)
+
 find_package(SDL2 REQUIRED)
 find_package(SDL2_image REQUIRED)
 find_package(OpenCV REQUIRED)
@@ -102,7 +111,7 @@ target_link_libraries(query_server flecs spatialindex lmdb pthread)
 set_property(TARGET query_server PROPERTY CXX_STANDARD 17)
 # ----
 
-target_link_libraries(${PROJECT_NAME} flecs glfw glad nanovg X11 Xi Xtst SDL2 SDL2_image ${OpenCV_LIBS} query_server Tracy::TracyClient libssh2::libssh2)
+target_link_libraries(${PROJECT_NAME} flecs glfw glad nanovg fpng X11 Xi Xtst SDL2 SDL2_image ${OpenCV_LIBS} query_server Tracy::TracyClient libssh2::libssh2)
 
 # Add audio stream client executable
 add_executable(audio_stream_client src/audio_stream_client.c)

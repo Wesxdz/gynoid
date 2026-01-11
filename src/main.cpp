@@ -32,6 +32,9 @@
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_image.h>
 
+// fpng for fast PNG encoding
+#include <fpng.h>
+
 // For multithreaded screenshot saving
 #include <thread>
 #include <queue>
@@ -703,10 +706,13 @@ struct ProportionalConstraint {
     float max_height;
 };
 
+// This needs to be refactored to be a direct enum relationship in flecs once you grow up and become a competent person
 struct EditorLeafData
 {
     EditorType editor_type;
 };
+
+struct SpaceframeChannel{};
 
 enum class PanelSplitType
 {
@@ -1432,7 +1438,7 @@ flecs::entity create_badge(flecs::entity parent, flecs::entity UIElement,
         world->entity()
         .is_a(UIElement)
         .child_of(badge_text_parent)
-        .set<ImageCreator>({"../assets/mnist/set_0/0.png", 0.9f, 0.9f})
+        .set<ImageCreator>({"../assets/mnist/set_0/" + std::to_string(bind_to_entity) + ".png", 0.9f, 0.9f})
         .set<ZIndex>({25});
 
         badge.set<UIContainer>({xPad, 0});
@@ -1988,7 +1994,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         .set<RectRenderable>({0.0f, 0.0f, false, 0x000000FF})
         .child_of(leaf.target<EditorCanvas>());
         
-        create_badge(meta_input, UIElement, "Wesley", 0xf5a652ff, false, false, true);
+        create_badge(meta_input, UIElement, "Wesley", 0xf5a652ff, false, false, 0);
 
         create_badge(meta_input, UIElement, "types", 0xa34d1aff, false, true);
 
@@ -2186,6 +2192,17 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         .add(flecs::OrderedChildren)
         .add<ScissorContainer>(leaf.target<EditorCanvas>())
         .child_of(leaf.target<EditorCanvas>());
+
+        auto frameChannel = world->entity()
+        .is_a(UIElement)
+        .add<FitChildren>()
+        .set<Expand>({true, 0, 0, 1, true, 0, 0, 0.5})
+        .add<HorizontalLayoutBox>()
+        .add(flecs::OrderedChildren)
+        .add<ScissorContainer>(leaf.target<EditorCanvas>())
+        .child_of(leaf.target<EditorCanvas>());
+
+        leaf.target<EditorCanvas>().add<SpaceframeChannel>(frameChannel);
 
         // TODO: Implement scissors/vertical scrollbar
 
@@ -2961,7 +2978,6 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                         .set<UIContainer>({8, 6})
                         // .add<DebugRenderBounds>()
                         .set<ZIndex>({15});
-
                         
                         auto message_content = world->entity()
                         .is_a(UIElement)
@@ -2985,6 +3001,18 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                     .child_of(messageBox)
                     .set<ZIndex>({20})
                     .set<ImageCreator>({"../assets/bfo/generically_dependent_continuant.png", 1.0f, 1.0f});
+
+                    auto meta_response = world->entity()
+                    .is_a(UIElement)
+                    .set<HorizontalLayoutBox>({0.0f, 2.0f})
+                    .add(flecs::OrderedChildren)
+                    // .add<DebugRenderBounds>()
+                    .child_of(chat_panel.message_list);
+
+                    create_badge(meta_response, UIElement, "Heonae", 0xc72783ff, false, false, 1);
+
+                    create_badge(meta_response, UIElement, "understands", 0xc72783ff, false, true);
+
                 });
 
             chat->draft.clear();
@@ -3096,6 +3124,9 @@ int main(int, char *[]) {
         std::cerr << "Failed to initialize GLFW" << std::endl;
         return -1;
     }
+
+    // Initialize fpng for fast PNG encoding
+    fpng::fpng_init();
 
     // Initialize libssh2
     int rc = libssh2_init(0);
@@ -4782,7 +4813,7 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
 
     auto vncTextureUpdateSystem = world->system<VNCClient>()
         .kind(flecs::OnUpdate)
-        .each([](flecs::entity e, VNCClient& vnc) {
+        .each([&](flecs::entity e, VNCClient& vnc) {
             if (!vnc.connected || !vnc.client) {
                 return;
             }
@@ -4924,6 +4955,78 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
                 }
 
                 std::cout << "Updated VNC texture (async PBO)" << std::endl;
+
+                // Periodic PNG capture every 3 seconds
+                double currentTime = glfwGetTime();
+                if (currentTime - vnc.lastCaptureTime >= 3.0) {
+                    // Prepare RGBA data buffer for fpng (fpng expects RGBA format)
+                    std::vector<uint8_t> rgbaData(surface->w * surface->h * 4);
+
+                    // Convert surface data to RGBA format
+                    uint8_t* src = static_cast<uint8_t*>(surface->pixels);
+                    uint8_t* dst = rgbaData.data();
+
+                    bool isBGRA = (surface->format->Rmask != 0xFF);
+
+                    for (int y = 0; y < surface->h; ++y) {
+                        for (int x = 0; x < surface->w; ++x) {
+                            int srcIdx = y * surface->pitch + x * 4;
+                            int dstIdx = (y * surface->w + x) * 4;
+
+                            if (isBGRA) {
+                                // BGRA -> RGBA
+                                dst[dstIdx + 0] = src[srcIdx + 2];  // R
+                                dst[dstIdx + 1] = src[srcIdx + 1];  // G
+                                dst[dstIdx + 2] = src[srcIdx + 0];  // B
+                                dst[dstIdx + 3] = 0xFF;             // A
+                            } else {
+                                // Already RGBA, just copy with opaque alpha
+                                dst[dstIdx + 0] = src[srcIdx + 0];  // R
+                                dst[dstIdx + 1] = src[srcIdx + 1];  // G
+                                dst[dstIdx + 2] = src[srcIdx + 2];  // B
+                                dst[dstIdx + 3] = 0xFF;             // A
+                            }
+                        }
+                    }
+
+                    // Generate filename
+                    std::string frame_filename = "frame_" + std::to_string(vnc.framesCaptured) + ".png";
+
+                    // Save PNG using fpng
+                    // TODO: Save at smaller resolution? (Probably)
+                    if (fpng::fpng_encode_image_to_file(frame_filename.c_str(), rgbaData.data(),
+                                                         surface->w, surface->h, 4, 0)) {
+                        std::cout << "[VNC CAPTURE] Saved " << frame_filename << std::endl;
+                        vnc.framesCaptured++;
+                        vnc.lastCaptureTime = currentTime;
+
+                        // TODO: Now, we should load this as a 'Spaceframe' in the Episodic panel
+
+                        // TODO: Find Episodic memory panel...
+                        flecs::query q_editor_panels = world->query_builder<EditorLeafData>()
+                        .build();
+
+                        q_editor_panels.each([&](flecs::entity leaf, EditorLeafData& leaf_data) 
+                        {
+                            if (leaf_data.editor_type == EditorType::Episodic)
+                            {
+                                // TODO: Check for rows that are designed for framespace render
+                                auto messageBfoSprite = world->entity()
+                                .is_a(UIElement)
+                                // .set<ProportionalConstraint>({800.0f, 200.0f})
+                                // hmmm....
+                                .set<ImageCreator>({"../build/" + frame_filename, 1.0f, 1.0f})
+                                .set<ZIndex>({30})
+                                 .set<Constrain>({true, true})
+                                 .set<Expand>({false, 4.0f, 4.0f, 1.0f, true, 0.0f, 0.0f, 1.0f, true})
+                                .child_of(leaf.target<EditorCanvas>().target<SpaceframeChannel>());
+                            }
+                        });
+
+                    } else {
+                        std::cerr << "[VNC CAPTURE ERROR] Failed to save " << frame_filename << std::endl;
+                    }
+                }
             } else {
                 LOG_ERROR(LogCategory::VNC_CLIENT, "Surface or pixels is null");
             }
