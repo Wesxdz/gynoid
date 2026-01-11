@@ -25,7 +25,6 @@
 #include <ctime>
 #include <chrono>
 
-
 // LibVNC
 #include <rfb/rfbclient.h>
 
@@ -52,6 +51,8 @@
 #include <tracy/Tracy.hpp>
 #include <tracy/TracyC.h>
 #include <stack>
+
+#include <libssh2.h>
 
 struct TextSize { float w, h; };
 
@@ -975,6 +976,267 @@ void vnc_message_thread(VNCClient* vnc) {
 }
 
 // End VNC Stream
+
+// ============================================================================
+// SFTP File Transfer
+// ============================================================================
+
+#include "sftp_client.h"
+#include <libssh2.h>
+#include <libssh2_sftp.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+// SFTP connection function - establishes SSH and SFTP session
+bool sftp_connect(SFTPClient* sftp) {
+    LOG_INFO(LogCategory::SFTP, "Connecting to {}:{} (ptr: {})", sftp->host, sftp->port, (void*)sftp);
+
+    sftp->conn_state = SFTPClient::CONNECTING;
+
+    // 1. Create socket and connect to host:port
+    LOG_INFO(LogCategory::SFTP, "Creating socket...");
+    sftp->sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sftp->sock < 0) {
+        sftp->conn_state = SFTPClient::ERROR;
+        LOG_ERROR(LogCategory::SFTP, "Failed to create socket");
+        return false;
+    }
+    LOG_INFO(LogCategory::SFTP, "Socket created: {}", sftp->sock);
+
+    struct sockaddr_in sin;
+    sin.sin_family = AF_INET;
+    sin.sin_port = htons(sftp->port);
+    sin.sin_addr.s_addr = inet_addr(sftp->host.c_str());
+
+    LOG_INFO(LogCategory::SFTP, "Connecting socket to {}:{}...", sftp->host, sftp->port);
+    if (connect(sftp->sock, (struct sockaddr*)&sin, sizeof(struct sockaddr_in)) != 0) {
+        sftp->conn_state = SFTPClient::ERROR;
+        LOG_ERROR(LogCategory::SFTP, "Failed to connect to {}:{} - {}", sftp->host, sftp->port, strerror(errno));
+        close(sftp->sock);
+        sftp->sock = -1;
+        return false;
+    }
+    LOG_INFO(LogCategory::SFTP, "Socket connected successfully");
+
+    // 2. Initialize libssh2 session
+    LOG_INFO(LogCategory::SFTP, "Initializing SSH session...");
+    sftp->session = libssh2_session_init();
+    if (!sftp->session) {
+        sftp->conn_state = SFTPClient::ERROR;
+        LOG_ERROR(LogCategory::SFTP, "Failed to initialize SSH session");
+        close(sftp->sock);
+        sftp->sock = -1;
+        return false;
+    }
+    LOG_INFO(LogCategory::SFTP, "SSH session initialized");
+
+    // Set blocking mode
+    LOG_INFO(LogCategory::SFTP, "Setting blocking mode...");
+    libssh2_session_set_blocking(sftp->session, 1);
+
+    // 3. Perform SSH handshake
+    LOG_INFO(LogCategory::SFTP, "Starting SSH handshake...");
+    int rc = libssh2_session_handshake(sftp->session, sftp->sock);
+    if (rc) {
+        sftp->conn_state = SFTPClient::ERROR;
+        LOG_ERROR(LogCategory::SFTP, "SSH handshake failed (error {})", rc);
+        libssh2_session_free(sftp->session);
+        sftp->session = nullptr;
+        close(sftp->sock);
+        sftp->sock = -1;
+        return false;
+    }
+    LOG_INFO(LogCategory::SFTP, "SSH handshake completed");
+
+    const char * fingerprint = libssh2_hostkey_hash(sftp->session, LIBSSH2_HOSTKEY_HASH_SHA1);
+
+    fprintf(stderr, "Fingerprint: ");
+    for(int i = 0; i < 20; i++) 
+    {
+        fprintf(stderr, "%02X ", (unsigned char)fingerprint[i]);
+    }
+    fprintf(stderr, "\n");
+
+    // 4. Authenticate using password
+    LOG_INFO(LogCategory::SFTP, "Authenticating user: {}", sftp->username);
+    rc = libssh2_userauth_password(sftp->session,
+        sftp->username.c_str(),
+        sftp->password.c_str());
+
+    if (rc) {
+        sftp->conn_state = SFTPClient::ERROR;
+        LOG_ERROR(LogCategory::SFTP, "SSH password authentication failed (user: {}, error: {})", sftp->username, rc);
+        libssh2_session_disconnect(sftp->session, "Auth failed");
+        libssh2_session_free(sftp->session);
+        sftp->session = nullptr;
+        close(sftp->sock);
+        sftp->sock = -1;
+        return false;
+    }
+    LOG_INFO(LogCategory::SFTP, "Authentication successful");
+
+    // 5. Initialize SFTP subsystem
+    sftp->sftp_session = libssh2_sftp_init(sftp->session);
+    if (!sftp->sftp_session) {
+        sftp->conn_state = SFTPClient::ERROR;
+        LOG_ERROR(LogCategory::SFTP, "Failed to initialize SFTP session");
+        libssh2_session_disconnect(sftp->session, "SFTP init failed");
+        libssh2_session_free(sftp->session);
+        sftp->session = nullptr;
+        close(sftp->sock);
+        sftp->sock = -1;
+        return false;
+    }
+
+    sftp->conn_state = SFTPClient::CONNECTED;
+    LOG_INFO(LogCategory::SFTP, "SFTP connected successfully to {}@{}", sftp->username, sftp->host);
+
+    return true;
+}
+
+// SFTP worker thread - processes file transfer queue
+void sftp_worker_thread(SFTPClient* sftp) {
+    LOG_INFO(LogCategory::SFTP, "SFTP thread started for {} (ptr: {})", sftp->host, (void*)sftp);
+
+    sftp->thread_running = true;
+
+    while (!sftp->thread_should_stop) {
+        // 1. Wait for transfer request (with timeout)
+        FileTransferRequest request;
+        {
+            std::unique_lock<std::mutex> lock(sftp->queue_mutex);
+            sftp->queue_cv.wait_for(lock, std::chrono::milliseconds(100),
+                [sftp]() { return !sftp->transfer_queue.empty() || sftp->thread_should_stop; });
+
+            if (sftp->transfer_queue.empty()) continue;
+            request = sftp->transfer_queue.front();
+            sftp->transfer_queue.pop_front();
+        }
+
+        // 2. Ensure connection (lazy connect)
+        if (sftp->conn_state != SFTPClient::CONNECTED) {
+            if (!sftp_connect(sftp)) {
+                // Update progress with error
+                std::lock_guard<std::mutex> plock(sftp->progress_mutex);
+                sftp->current_progress.state = FileTransferProgress::FAILED;
+                sftp->current_progress.error_message = "Connection failed (see logs)";
+                continue;
+            }
+        }
+
+        LOG_INFO(LogCategory::SFTP, "Transferring: {} -> {}", request.local_path, request.remote_path);
+
+        // 3. Open local file
+        FILE* local_file = fopen(request.local_path.c_str(), "rb");
+        if (!local_file) {
+            std::string error = "Cannot open local file: " + request.local_path;
+            LOG_ERROR(LogCategory::SFTP, "{}", error);
+            std::lock_guard<std::mutex> lock(sftp->progress_mutex);
+            sftp->current_progress.state = FileTransferProgress::FAILED;
+            sftp->current_progress.error_message = error;
+            continue;
+        }
+
+        // 4. Open remote file via SFTP
+        LIBSSH2_SFTP_HANDLE* sftp_handle = libssh2_sftp_open(
+            sftp->sftp_session, request.remote_path.c_str(),
+            LIBSSH2_FXF_WRITE | LIBSSH2_FXF_CREAT | LIBSSH2_FXF_TRUNC,
+            LIBSSH2_SFTP_S_IRUSR | LIBSSH2_SFTP_S_IWUSR | LIBSSH2_SFTP_S_IRGRP | LIBSSH2_SFTP_S_IROTH);
+
+        if (!sftp_handle) {
+            unsigned long sftp_err = libssh2_sftp_last_error(sftp->sftp_session);
+            std::string error = "Cannot open remote file (SFTP error " + std::to_string(sftp_err) + "): " + request.remote_path;
+            LOG_ERROR(LogCategory::SFTP, "{}", error);
+            fclose(local_file);
+            std::lock_guard<std::mutex> lock(sftp->progress_mutex);
+            sftp->current_progress.state = FileTransferProgress::FAILED;
+            sftp->current_progress.error_message = error;
+            continue;
+        }
+
+        // 5. Transfer file in chunks, updating progress
+        {
+            std::lock_guard<std::mutex> lock(sftp->progress_mutex);
+            sftp->current_progress.state = FileTransferProgress::TRANSFERRING;
+            sftp->current_progress.bytes_transferred = 0;
+        }
+
+        char buffer[32768];
+        size_t total_written = 0;
+        bool transfer_failed = false;
+
+        while (!feof(local_file) && !sftp->thread_should_stop) {
+            size_t nread = fread(buffer, 1, sizeof(buffer), local_file);
+            if (nread <= 0) break;
+
+            // Write to SFTP
+            char* ptr = buffer;
+            size_t remaining = nread;
+            while (remaining > 0) {
+                ssize_t nwritten = libssh2_sftp_write(sftp_handle, ptr, remaining);
+                if (nwritten < 0) {
+                    std::string error = "SFTP write failed (error " + std::to_string(nwritten) + ")";
+                    LOG_ERROR(LogCategory::SFTP, "{}", error);
+                    std::lock_guard<std::mutex> lock(sftp->progress_mutex);
+                    sftp->current_progress.state = FileTransferProgress::FAILED;
+                    sftp->current_progress.error_message = error;
+                    transfer_failed = true;
+                    break;
+                }
+                ptr += nwritten;
+                remaining -= nwritten;
+                total_written += nwritten;
+
+                // Update progress (thread-safe)
+                {
+                    std::lock_guard<std::mutex> lock(sftp->progress_mutex);
+                    sftp->current_progress.bytes_transferred = total_written;
+                    sftp->current_progress.progress_percent =
+                        (float)total_written / request.file_size * 100.0f;
+                }
+            }
+
+            if (transfer_failed) break;
+        }
+
+        // 6. Close handles
+        libssh2_sftp_close(sftp_handle);
+        fclose(local_file);
+
+        // 7. Mark completed or failed
+        if (!transfer_failed && !sftp->thread_should_stop) {
+            std::lock_guard<std::mutex> lock(sftp->progress_mutex);
+            sftp->current_progress.state = FileTransferProgress::COMPLETED;
+            sftp->current_progress.completion_time = std::chrono::steady_clock::now();
+            sftp->current_progress.progress_percent = 100.0f;
+            LOG_INFO(LogCategory::SFTP, "Transfer completed: {} ({} bytes)",
+                request.remote_path, total_written);
+        }
+    }
+
+    // Cleanup connection
+    if (sftp->sftp_session) {
+        libssh2_sftp_shutdown(sftp->sftp_session);
+        sftp->sftp_session = nullptr;
+    }
+    if (sftp->session) {
+        libssh2_session_disconnect(sftp->session, "Shutdown");
+        libssh2_session_free(sftp->session);
+        sftp->session = nullptr;
+    }
+    if (sftp->sock >= 0) {
+        close(sftp->sock);
+        sftp->sock = -1;
+    }
+
+    sftp->thread_running = false;
+    LOG_INFO(LogCategory::SFTP, "SFTP thread stopped for {}", sftp->host);
+}
+
+// End SFTP File Transfer
 
 #include <algorithm>
 
@@ -2198,6 +2460,108 @@ static void cursor_position_callback(GLFWwindow* window, double xpos, double ypo
     cursor_state.y = ypos;
 }
 
+void drop_callback(GLFWwindow* window, int count, const char** paths)
+{
+    // 1. Get cursor state
+    flecs::entity glfw_state = world->lookup("GLFWState");
+    if (!glfw_state.is_valid()) {
+        LOG_WARN(LogCategory::SFTP, "File drop ignored - no GLFWState entity");
+        return;
+    }
+
+    const CursorState* cursorState = glfw_state.try_get<CursorState>();
+    if (!cursorState) {
+        LOG_WARN(LogCategory::SFTP, "File drop ignored - no cursor state");
+        return;
+    }
+
+    // 2. Find VNC panel under mouse
+    flecs::entity target_vnc_entity = flecs::entity::null();
+
+    auto vnc_query = world->query_builder<Position, ImageRenderable>()
+        .with<IsStreamingFrom>(flecs::Wildcard)
+        .term_at(0).second<World>()
+        .build();
+
+    vnc_query.each([&](flecs::entity e, Position& pos, ImageRenderable& img) {
+        flecs::entity vnc_entity = e.target<IsStreamingFrom>();
+        const VNCClient* vnc = vnc_entity.try_get<VNCClient>();
+
+        if (vnc && vnc->eventPassthroughEnabled && vnc->connected) {
+            target_vnc_entity = vnc_entity;
+        }
+    });
+
+    if (!target_vnc_entity.is_valid()) {
+        LOG_INFO(LogCategory::SFTP, "File drop ignored - no VNC panel under mouse");
+        return;
+    }
+
+    // 3. Get/create SFTPClient component
+    SFTPClient& sftp = target_vnc_entity.ensure<SFTPClient>();
+
+    // 4. Initialize worker thread if first time
+    if (!sftp.thread_running) {
+        const VNCClient* vnc = target_vnc_entity.try_get<VNCClient>();
+        if (!vnc) {
+            LOG_ERROR(LogCategory::SFTP, "VNC entity has no VNCClient component");
+            return;
+        }
+
+        sftp.host = vnc->host;
+        sftp.port = 23;
+        sftp.username = "grok";
+        sftp.password = "GrokValentine42!";
+        sftp.thread_should_stop = false;
+
+        LOG_INFO(LogCategory::SFTP, "Starting SFTP worker thread for {} (SFTPClient at {})", sftp.host, (void*)&sftp);
+        sftp.worker_thread = std::thread(sftp_worker_thread, &sftp);
+
+        LOG_INFO(LogCategory::SFTP, "Started SFTP worker thread for {}", sftp.host);
+    }
+
+    // 5. Queue file transfers
+    for (int i = 0; i < count; i++) {
+        std::string local_path = paths[i];
+        std::string filename = local_path.substr(local_path.find_last_of("/\\") + 1);
+        std::string remote_path = "/home/grok/Downloads/" + filename;
+
+        // Get file size
+        struct stat st;
+        if (stat(local_path.c_str(), &st) != 0) {
+            LOG_ERROR(LogCategory::SFTP, "Cannot stat file: {}", local_path);
+            continue;
+        }
+
+        FileTransferRequest request;
+        request.local_path = local_path;
+        request.remote_path = remote_path;
+        request.file_size = st.st_size;
+
+        {
+            std::lock_guard<std::mutex> lock(sftp.queue_mutex);
+            sftp.transfer_queue.push_back(request);
+
+            // Initialize progress for first file
+            if (sftp.transfer_queue.size() == 1) {
+                std::lock_guard<std::mutex> plock(sftp.progress_mutex);
+                sftp.current_progress.filename = filename;
+                sftp.current_progress.total_bytes = st.st_size;
+                sftp.current_progress.bytes_transferred = 0;
+                sftp.current_progress.progress_percent = 0.0f;
+                sftp.current_progress.state = FileTransferProgress::IDLE;
+            }
+        }
+        sftp.queue_cv.notify_one();
+
+        LOG_INFO(LogCategory::SFTP, "Queued file transfer: {} -> {} ({} bytes)",
+                 local_path, remote_path, st.st_size);
+    }
+
+    // 6. Add tag for rendering system
+    target_vnc_entity.add<HasSFTPTransfer>();
+}
+
 // Track mouse button state for VNC
 static int g_vncButtonMask = 0;
 
@@ -2583,19 +2947,26 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                     
                     auto UIElement = world->lookup("UIElement");
                     
+                    auto messageBox = world->entity()
+                    .is_a(UIElement)
+                    .child_of(chat_panel.message_list)
+                    .add<HorizontalLayoutBox>();
+
                     // Create the background bubble
                     auto example_message_bkg = world->entity()
                         .is_a(UIElement)
-                        .child_of(chat_panel.message_list) // Attached to the ChatPanel found via query
+                        .child_of(messageBox) // Attached to the ChatPanel found via query
                         .set<RoundedRectRenderable>({100.0f, 16.0f, 2.0f, false, 0x121212FF})
                         // .set<Expand>({true, 4.0f, 4.0f, 1.0f, false, 0, 0, 0})
                         .set<UIContainer>({8, 6})
                         // .add<DebugRenderBounds>()
                         .set<ZIndex>({15});
+
                         
                         auto message_content = world->entity()
                         .is_a(UIElement)
                         .set<Position, Local>({8, 8})
+                        // .child_of(example_message_bkg)
                         .child_of(example_message_bkg)
                         // .add<DebugRenderBounds>()
                         .add<VerticalLayoutBox>();
@@ -2606,6 +2977,14 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                         .child_of(message_content)
                         .set<TextRenderable>({chat->draft.c_str(), "Inter", 16.0f, 0xFFFFFFFF})
                         .set<ZIndex>({17});
+
+                    // I put it outside the message since it is a meta annotation
+                    // This might only need to be visible during certain 'entity binding' interface modes...
+                    auto messageBfoSprite = world->entity()
+                    .is_a(UIElement)
+                    .child_of(messageBox)
+                    .set<ZIndex>({20})
+                    .set<ImageCreator>({"../assets/bfo/generically_dependent_continuant.png", 1.0f, 1.0f});
                 });
 
             chat->draft.clear();
@@ -2717,7 +3096,14 @@ int main(int, char *[]) {
         std::cerr << "Failed to initialize GLFW" << std::endl;
         return -1;
     }
-    
+
+    // Initialize libssh2
+    int rc = libssh2_init(0);
+    if (rc) {
+        std::cerr << "libssh2 initialization failed (" << rc << ")" << std::endl;
+        return -1;
+    }
+
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_COMPAT_PROFILE);
@@ -2737,6 +3123,7 @@ int main(int, char *[]) {
     glfwSetWindowSizeCallback(window, window_size_callback);
     glfwSetCharCallback(window, char_callback);
     glfwSetKeyCallback(window, key_callback);
+    glfwSetDropCallback(window, drop_callback);
 
     if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
         std::cerr << "Failed to initialize GLAD" << std::endl;
@@ -2802,6 +3189,12 @@ int main(int, char *[]) {
     world->component<FocusChatInput>();
     world->component<SendChatMessage>();
     world->set<ChatState>({std::vector<ChatMessage>{}, "", false});
+
+    // SFTP components
+    world->component<SFTPClient>();
+    world->component<FileTransferProgress>();
+    world->component<FileTransferRequest>();
+    world->component<HasSFTPTransfer>();
 
     world->component<DragContext>().add(flecs::Singleton);
     world->set<DragContext>({false, flecs::entity::null(), PanelSplitType::Horizontal, 0.0f});
@@ -4287,6 +4680,106 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
             e.target<ActiveIndicator>().ensure<RenderStatus>().visible = vnc.eventPassthroughEnabled;
         });
 
+    // SFTP progress indicator rendering system
+    auto sftpProgressRenderSystem = world->system<Position, ImageRenderable>()
+        .with<IsStreamingFrom>(flecs::Wildcard)
+        .term_at(0).second<World>()
+        .kind(flecs::PostUpdate)
+        .each([&](flecs::entity e, Position& pos, ImageRenderable& img) {
+            flecs::entity vnc_entity = e.target<IsStreamingFrom>();
+
+            // Check if this VNC has an active SFTP transfer
+            if (!vnc_entity.has<HasSFTPTransfer>()) return;
+
+            const SFTPClient* sftp = vnc_entity.try_get<SFTPClient>();
+            if (!sftp) return;
+
+            // Read progress (thread-safe)
+            FileTransferProgress progress;
+            {
+                std::lock_guard<std::mutex> lock(sftp->progress_mutex);
+                progress = sftp->current_progress;
+            }
+
+            // Skip if idle or hide after 2 seconds of completion
+            if (progress.state == FileTransferProgress::IDLE) return;
+
+            if (progress.state == FileTransferProgress::COMPLETED) {
+                auto elapsed = std::chrono::steady_clock::now() - progress.completion_time;
+                if (elapsed > std::chrono::seconds(2)) {
+                    vnc_entity.remove<HasSFTPTransfer>();
+                    return;
+                }
+            }
+
+            // Calculate position (bottom-right of VNC panel)
+            float indicator_width = 300.0f;
+            float indicator_height = 60.0f;
+            float indicator_x = pos.x + img.width - indicator_width - 20.0f;
+            float indicator_y = pos.y + img.height - indicator_height - 20.0f;
+
+            // Add to render queue
+            RenderQueue& queue = world->ensure<RenderQueue>();
+
+            // Background
+            queue.addRoundedRectCommand(
+                {indicator_x, indicator_y},
+                {indicator_width, indicator_height, 8.0f, false, 0x000000AA},
+                1500  // High Z-index
+            );
+
+            // Progress bar background
+            float bar_x = indicator_x + 10.0f;
+            float bar_y = indicator_y + 35.0f;
+            float bar_width = indicator_width - 20.0f;
+            float bar_height = 15.0f;
+
+            queue.addRoundedRectCommand(
+                {bar_x, bar_y},
+                {bar_width, bar_height, 4.0f, false, 0x333333FF},
+                1501
+            );
+
+            // Progress bar fill
+            if (progress.progress_percent > 0) {
+                float fill_width = bar_width * (progress.progress_percent / 100.0f);
+                uint32_t fill_color = progress.state == FileTransferProgress::FAILED ?
+                    0xFF0000FF : 0x00AA00FF;  // Red for error, green for success
+
+                queue.addRoundedRectCommand(
+                    {bar_x, bar_y},
+                    {fill_width, bar_height, 4.0f, false, fill_color},
+                    1502
+                );
+            }
+
+            // Filename text
+            queue.addTextCommand(
+                {indicator_x + 10.0f, indicator_y + 15.0f},
+                {progress.filename, "sans-bold", 14.0f, 0xFFFFFFFF, 1.0f},
+                1503
+            );
+
+            // Progress percentage text
+            char percent_str[32];
+            snprintf(percent_str, sizeof(percent_str), "%.1f%%", progress.progress_percent);
+
+            queue.addTextCommand(
+                {bar_x + bar_width - 50.0f, bar_y + 12.0f},
+                {std::string(percent_str), "sans", 12.0f, 0xFFFFFFFF, 1.0f},
+                1503
+            );
+
+            // Error message if failed
+            if (progress.state == FileTransferProgress::FAILED && !progress.error_message.empty()) {
+                queue.addTextCommand(
+                    {indicator_x + 10.0f, indicator_y + 45.0f},
+                    {progress.error_message, "sans", 11.0f, 0xFF0000FF, 1.0f},
+                    1503
+                );
+            }
+        });
+
     auto vncTextureUpdateSystem = world->system<VNCClient>()
         .kind(flecs::OnUpdate)
         .each([](flecs::entity e, VNCClient& vnc) {
@@ -4623,6 +5116,21 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
     }
 
     nvgDeleteGL2(vg);
+
+    // Cleanup SFTP threads before shutdown
+    auto sftp_cleanup = world->query<SFTPClient>();
+    sftp_cleanup.each([](flecs::entity e, SFTPClient& sftp) {
+        if (sftp.thread_running) {
+            sftp.thread_should_stop = true;
+            sftp.queue_cv.notify_all();
+            if (sftp.worker_thread.joinable()) {
+                sftp.worker_thread.join();
+            }
+        }
+    });
+
+    libssh2_exit();
+
     glfwTerminate();
     return 0;
 }

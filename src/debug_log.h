@@ -20,7 +20,8 @@ enum class LogCategory {
     RENDER_QUEUE,
     INPUT,
     SYSTEM,
-    NETWORK
+    NETWORK,
+    SFTP
 };
 
 // Category-based logger manager using spdlog
@@ -43,6 +44,7 @@ private:
         category_names[LogCategory::INPUT] = "INPUT";
         category_names[LogCategory::SYSTEM] = "SYSTEM";
         category_names[LogCategory::NETWORK] = "NETWORK";
+        category_names[LogCategory::SFTP] = "SFTP";
 
         // Create console sink with colors
         auto console_sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
@@ -54,11 +56,9 @@ private:
             loggers[pair.first] = logger;
 
             // Default: only enable important categories
-            if (pair.first == LogCategory::X11_OUTLINE ||
-                pair.first == LogCategory::BLENDER_PANEL) {
-                logger->set_level(spdlog::level::debug);  // Show DEBUG logs for OCR
-            } else if (pair.first == LogCategory::X11_OUTLINE ||
-                       pair.first == LogCategory::SYSTEM) {
+            if (false) {
+                logger->set_level(spdlog::level::debug);
+            } else if (pair.first == LogCategory::SFTP) {
                 logger->set_level(spdlog::level::info);
             } else {
                 logger->set_level(spdlog::level::off);

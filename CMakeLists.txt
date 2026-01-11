@@ -82,6 +82,10 @@ find_package(SDL2_image REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(LibVNCServer)
 
+# add_subdirectory("deps/libssh2-1.11.1")
+find_package(libssh2 REQUIRED CONFIG)
+# include_directories("deps/libssh2-1.11.1/include")
+
 # PYTHON QUERY SERVER ----
 # Add spatialindex library
 include_directories("deps/spatialindex-src-2.1.0/include")
@@ -98,7 +102,7 @@ target_link_libraries(query_server flecs spatialindex lmdb pthread)
 set_property(TARGET query_server PROPERTY CXX_STANDARD 17)
 # ----
 
-target_link_libraries(${PROJECT_NAME} flecs glfw glad nanovg X11 Xi Xtst SDL2 SDL2_image ${OpenCV_LIBS} query_server Tracy::TracyClient)
+target_link_libraries(${PROJECT_NAME} flecs glfw glad nanovg X11 Xi Xtst SDL2 SDL2_image ${OpenCV_LIBS} query_server Tracy::TracyClient libssh2::libssh2)
 
 # Add audio stream client executable
 add_executable(audio_stream_client src/audio_stream_client.c)
