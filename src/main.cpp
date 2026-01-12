@@ -343,11 +343,20 @@ struct FitChildren
     float scale_factor;
 };
 
-struct VerticalLayoutBox 
+struct VerticalLayoutBox
 {
   float y_progress;
   float padding;
   float move_dir = 1; // Down
+};
+
+struct FlowLayoutBox
+{
+  float x_progress;
+  float y_progress;
+  float padding = 0.0f;
+  float line_height = 0.0f;
+  float line_spacing = 0.0f;
 };
 
 struct RenderGradient
@@ -1994,10 +2003,11 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
 
         auto message_list = world->entity()
             .is_a(UIElement)
-            .child_of(chat_root)
+            .child_of(messages_panel)
             .add(flecs::OrderedChildren)
             .set<Position, Local>({12.0f, 16.0f})
-            .set<VerticalLayoutBox>({0.0f, 4.0f, 1.0f});
+            .set<VerticalLayoutBox>({0.0f, 4.0f, 1.0f})
+            .set<Expand>({true, 0.0f, 0.0f, 1.0f, false, 0.0f, 0.0f, 0.0f});
 
         auto msg_container = world->entity()
         .is_a(UIElement)
@@ -3089,7 +3099,8 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
 
                     auto meta_response_data = world->entity()
                     .is_a(UIElement)
-                    .set<HorizontalLayoutBox>({0.0f, 2.0f})
+                    .set<FlowLayoutBox>({0.0f, 0.0f, 2.0f, 0.0f, 2.0f})
+                    .set<Expand>({true, 0, 0, 1, false, 0, 0, 0})
                     .add(flecs::OrderedChildren)
                     .child_of(chat_panel.message_list);
 
@@ -3315,7 +3326,8 @@ int main(int, char *[]) {
 
     world->component<HorizontalLayoutBox>();
     world->component<VerticalLayoutBox>();
-    
+    world->component<FlowLayoutBox>();
+
     world->component<DiurnalHour>();
 
     world->component<ChatMessage>();
@@ -4083,6 +4095,123 @@ int main(int, char *[]) {
         }
     });
 
+    world->system<FlowLayoutBox, UIElementSize, const UIElementBounds*, UIElementBounds*>("ResetFlowProgress")
+        .kind(flecs::PreUpdate)
+        .term_at(2).parent()
+        .term_at(3).optional()
+        .each([](flecs::entity e, FlowLayoutBox& box, UIElementSize& container_size, const UIElementBounds* parent_bounds, UIElementBounds* own_bounds)
+        {
+            if (!parent_bounds) return;
+
+            box.x_progress = 0.0f;
+            box.y_progress = 0.0f;
+            box.line_height = 0.0f;
+
+            // Determine the available width for wrapping
+            // Use parent bounds as the constraint for wrapping
+            float container_width = parent_bounds->xmax - parent_bounds->xmin;
+            float max_width = 0.0f;
+
+            // First pass: collect children info and determine line breaks
+            struct ChildInfo {
+                flecs::entity entity;
+                float width;
+                float height;
+            };
+            std::vector<std::vector<ChildInfo>> lines;
+            std::vector<ChildInfo> current_line;
+            float current_line_width = 0.0f;
+            float current_line_height = 0.0f;
+
+            e.children([&](flecs::entity child) {
+                const UIElementSize* child_size = child.try_get<UIElementSize>();
+                if (!child_size) return;
+
+                float child_width = child_size->width;
+                float child_height = child_size->height;
+
+                // Check if adding this child would exceed container width
+                float needed_width = current_line_width + child_width;
+                if (!current_line.empty()) {
+                    needed_width += box.padding; // Add padding between items
+                }
+
+                // If this item doesn't fit and we have items on the line, start a new line
+                if (!current_line.empty() && needed_width > container_width) {
+                    lines.push_back(current_line);
+                    current_line.clear();
+                    current_line_width = 0.0f;
+                    current_line_height = 0.0f;
+                }
+
+                // Add child to current line
+                current_line.push_back({child, child_width, child_height});
+                if (!current_line.empty() && current_line.size() > 1) {
+                    current_line_width += box.padding;
+                }
+                current_line_width += child_width;
+                current_line_height = std::max(current_line_height, child_height);
+            });
+
+            // Don't forget the last line
+            if (!current_line.empty()) {
+                lines.push_back(current_line);
+            }
+
+            // Second pass: position children with vertical centering
+            box.y_progress = 0.0f;
+            for (const auto& line : lines) {
+                // Find max height for this line
+                float line_height = 0.0f;
+                for (const auto& child_info : line) {
+                    line_height = std::max(line_height, child_info.height);
+                }
+
+                // Position children on this line with vertical centering
+                box.x_progress = 0.0f;
+                for (const auto& child_info : line) {
+                    Position& pos = child_info.entity.ensure<Position, Local>();
+                    pos.x = box.x_progress;
+
+                    // Vertically center the child within the line
+                    float y_offset = (line_height - child_info.height) * 0.5f;
+                    pos.y = box.y_progress + y_offset;
+
+                    box.x_progress += child_info.width + box.padding;
+                }
+
+                max_width = std::max(max_width, box.x_progress - box.padding);
+                box.y_progress += line_height + box.line_spacing;
+            }
+
+            // Update container size
+            const Expand* expand = e.try_get<Expand>();
+            if (!expand || !expand->x_enabled) {
+                container_size.width = max_width;
+            }
+            if (!expand || !expand->y_enabled) {
+                // Remove the last line spacing
+                float total_height = box.y_progress;
+                if (!lines.empty()) {
+                    total_height -= box.line_spacing;
+                }
+                container_size.height = total_height;
+            }
+
+            // Immediately recalculate bounds if available
+            if (own_bounds) {
+                const Position& world_pos = e.get<Position, World>();
+                own_bounds->xmin = world_pos.x;
+                own_bounds->ymin = world_pos.y;
+                if (!expand || !expand->x_enabled) {
+                    own_bounds->xmax = world_pos.x + container_size.width;
+                }
+                if (!expand || !expand->y_enabled) {
+                    own_bounds->ymax = world_pos.y + container_size.height;
+                }
+            }
+        });
+
     auto cursorEvents = world->observer<CursorState, EditorRoot>()
         .event<LeftClickEvent>()
         .term_at(1).src(editor_root)
@@ -4315,13 +4444,13 @@ int main(int, char *[]) {
     .term_at(1).parent()
     .term_at(5).optional()
     .kind(flecs::PreFrame)
-    .each([&](flecs::entity e, Position& pos, UIElementBounds* parent_bounds, UIElementSize& ui_size, UIElementBounds& bounds, Align& align, Expand* expand) 
+    .each([&](flecs::entity e, Position& pos, UIElementBounds* parent_bounds, UIElementSize& ui_size, UIElementBounds& bounds, Align& align, Expand* expand)
     {
-        if (!e.parent().has<HorizontalLayoutBox>())
+        if (!e.parent().has<HorizontalLayoutBox>() && !e.parent().has<FlowLayoutBox>())
         {
             pos.x = align.horizontal * (parent_bounds->xmax - parent_bounds->xmin) + ui_size.width * align.self_horizontal + (expand ? expand->pad_left : 0);
         }
-        if (!e.parent().has<VerticalLayoutBox>())
+        if (!e.parent().has<VerticalLayoutBox>() && !e.parent().has<FlowLayoutBox>())
         {
             pos.y = align.vertical * (parent_bounds->ymax - parent_bounds->ymin) + ui_size.height * align.self_vertical;
         }
