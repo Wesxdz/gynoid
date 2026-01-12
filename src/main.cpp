@@ -338,7 +338,10 @@ struct HorizontalLayoutBox
   float move_dir = 1; // Right
 };
 
-struct FitChildren {};
+struct FitChildren 
+{
+    float scale_factor;
+};
 
 struct VerticalLayoutBox 
 {
@@ -701,6 +704,7 @@ struct Constrain
     bool fit_y; // Scale y to fit within bounds (maintain ratio)
 };
 
+// What the actual fuck is this?
 struct ProportionalConstraint {
     float max_width;
     float max_height;
@@ -712,7 +716,16 @@ struct EditorLeafData
     EditorType editor_type;
 };
 
-struct SpaceframeChannel{};
+struct FilmstripChannel{};
+// Determine how to chunk and choose which frames to display
+
+struct FilmstripData
+{
+    // TODO: This should probably be a dynamic value based on container width...
+    int frame_limit;
+    // Should they be stored as entities or paths?
+    std::vector<flecs::entity> frames;
+};
 
 enum class PanelSplitType
 {
@@ -1793,37 +1806,19 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
 
         for (const auto& icon : server_icons)
         {
-            flecs::entity server_icon;
-
-            if (icon == "chatterbox")
-            { 
-                server_icon = world->entity()
-                .is_a(UIElement)
-                .add<ServerHUDOverlay>(panel_overlay)
-                .add<AddTagOnHoverEnter, ShowServerHUDOverlay>()
-                .add<AddTagOnHoverExit, HideServerHUDOverlay>()
-                .child_of(server_hud)
-                .set<ImageCreator>({"../assets/server_hud/" + icon + ".png", 1.0f, 1.0f})
-                .set<ZIndex>({10})
-                .set<ServerScript>({"chatterbox", "chatterbox", "../chatter_server"})
-                .set<Constrain>({true, true}) 
-                .set<Expand>({false, 4.0f, 4.0f, 1.0f, true, 0.0f, 0.0f, 1.0f, true})
-                .add(ServerStatus::Offline)
-
-                .add<AddTagOnLeftClick, SelectServer>(); 
-            } else
-            {
-                server_icon = world->entity()
-                .is_a(UIElement)
-                .add<ServerHUDOverlay>(panel_overlay)
-                .add<AddTagOnHoverEnter, ShowServerHUDOverlay>()
-                .add<AddTagOnHoverExit, HideServerHUDOverlay>()
-                .child_of(server_hud)
-                .set<Constrain>({true, true}) 
-                .set<Expand>({false, 4.0f, 4.0f, 1.0f, true, 0.0f, 0.0f, 1.0f, true})
-                .set<ImageCreator>({"../assets/server_hud/" + icon + ".png", 1.0f, 1.0f})
-                .set<ZIndex>({10});
-            }
+            // .set<ServerScript>({"chatterbox", "chatterbox", "../chatter_server"})
+            // .add(ServerStatus::Offline)
+            // .add<AddTagOnLeftClick, SelectServer>(); 
+            flecs::entity server_icon = world->entity()
+            .is_a(UIElement)
+            .add<ServerHUDOverlay>(panel_overlay)
+            .add<AddTagOnHoverEnter, ShowServerHUDOverlay>()
+            .add<AddTagOnHoverExit, HideServerHUDOverlay>()
+            .child_of(server_hud)
+            .set<Constrain>({true, true}) 
+            .set<Expand>({false, 4.0f, 4.0f, 1.0f, true, 0.0f, 0.0f, 1.0f, true})
+            .set<ImageCreator>({"../assets/server_hud/" + icon + ".png", 1.0f, 1.0f})
+            .set<ZIndex>({10});
             // TODO: Server dot should only exist if the server is active...
             world->entity()
             .is_a(UIElement)
@@ -2195,18 +2190,20 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
 
         auto frameChannel = world->entity()
         .is_a(UIElement)
+        .set<FilmstripData>({7, {}})
         .add<FitChildren>()
-        .set<Expand>({true, 0, 0, 1, true, 0, 0, 0.5})
+        .set<Expand>({true, 0, 0, 1, true, 0, 0, 1.0})
         .add<HorizontalLayoutBox>()
+        .add<DebugRenderBounds>()
         .add(flecs::OrderedChildren)
         .add<ScissorContainer>(leaf.target<EditorCanvas>())
         .child_of(leaf.target<EditorCanvas>());
 
-        leaf.target<EditorCanvas>().add<SpaceframeChannel>(frameChannel);
+        leaf.target<EditorCanvas>().add<FilmstripChannel>(frameChannel);
 
         // TODO: Implement scissors/vertical scrollbar
 
-        for (size_t i = 0; i < 6; i++)
+        for (size_t i = 0; i < 12; i++)
         {
             world->entity()
                 .is_a(UIElement)
@@ -2217,7 +2214,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
                 .set<ZIndex>({20});
         }
             
-        for (size_t i = 0; i < 2; i++)
+        for (size_t i = 0; i < 4; i++)
         {
             world->entity()
             .is_a(UIElement)
@@ -3807,11 +3804,11 @@ int main(int, char *[]) {
             });
         });
 
-    world->system<const UIElementBounds, HorizontalLayoutBox>()
+    world->system<const UIElementBounds, HorizontalLayoutBox, FitChildren, Graphics>()
     .kind(flecs::PreUpdate)
     .term_at(0).parent() 
     .with<FitChildren>()
-    .each([](flecs::entity e, const UIElementBounds& container_bounds, HorizontalLayoutBox& box) {
+    .each([](flecs::entity e, const UIElementBounds& container_bounds, HorizontalLayoutBox& box, FitChildren& fit, Graphics& graphics) {
         float container_w = container_bounds.xmax - container_bounds.xmin;
         float container_h = container_bounds.ymax - container_bounds.ymin;
         
@@ -3821,8 +3818,11 @@ int main(int, char *[]) {
         // Pass 1: Sum up current natural widths
         e.children([&](flecs::entity child) {
             const ImageRenderable* img = child.try_get<ImageRenderable>();
-            if (img && img->width > 0) {
-                total_intrinsic_w += img->width;
+            if (img) 
+            {
+                int w, h;
+                nvgImageSize(graphics.vg, img->imageHandle, &w, &h);
+                total_intrinsic_w += w;
                 child_count++;
             }
         });
@@ -3834,27 +3834,64 @@ int main(int, char *[]) {
         float available_w = container_w - total_padding;
         
         // This is our ideal horizontal scale factor
-        float scale_factor = available_w / total_intrinsic_w;
+        fit.scale_factor = available_w / total_intrinsic_w;
 
         // Pass 3: Distribute Constraints with Y-Limit
-        e.children([&](flecs::entity child) {
-            const ImageRenderable* img = child.try_get<ImageRenderable>();
-            if (img) {
-                float aspect = img->width / img->height;
-                float target_w = img->width * scale_factor;
-                float target_h = target_w / aspect;
+        // e.children([&](flecs::entity child) {
+        //     if (child.has<ImageRenderable>()) {
+        //         ImageRenderable img = child.ensure<ImageRenderable>();
+        //         int w, h;
+        //         nvgImageSize(graphics.vg, img.imageHandle, &w, &h);
+        //         float aspect = w / h;
+        //         float target_w = w * fit.scale_factor;
+        //         float target_h = target_w / aspect;
 
-                // --- THE Y-OVERFLOW FIX ---
-                // If the target width makes the book too tall, 
-                // clamp based on container height instead.
-                if (target_h > container_h) {
-                    target_h = container_h;
-                    target_w = target_h * aspect;
-                }
+        //         // --- THE Y-OVERFLOW FIX ---
+        //         // If the target width makes the book too tall, 
+        //         // clamp based on container height instead.
+        //         if (target_h > container_h) {
+        //             target_h = container_h;
+        //             target_w = target_h * aspect;
+        //         }
+        //         img.width = target_w;
+        //         img.height = target_h;
 
-                child.set<ProportionalConstraint>({ target_w, target_h });
-            }
-        });
+        //         child.set<ProportionalConstraint>({ target_w, target_h });
+        //     }
+        // });
+    });
+
+    world->system<const UIElementBounds, HorizontalLayoutBox, FitChildren, ImageRenderable, Graphics>()
+    .kind(flecs::PreUpdate)
+    .term_at(0).parent()
+    .term_at(1).parent()
+    .term_at(2).parent()
+    .immediate()
+    .each([](flecs::entity e, const UIElementBounds& container_bounds, HorizontalLayoutBox& box, FitChildren& fit, ImageRenderable& img, Graphics& graphics)
+    {
+        float container_w = container_bounds.xmax - container_bounds.xmin;
+        float container_h = container_bounds.ymax - container_bounds.ymin;
+
+        int w, h;
+        nvgImageSize(graphics.vg, img.imageHandle, &w, &h);
+
+        // 1. Fix: Cast to float to avoid integer division
+        float aspect = (float)w / (float)h; 
+
+        // 2. Calculate initial dimensions
+        float target_w = (float)w * fit.scale_factor;
+        float target_h = (float)h * fit.scale_factor; // Direct calculation is more robust
+
+        // --- THE Y-OVERFLOW FIX ---
+        if (target_h > container_h) {
+            target_h = container_h;
+            target_w = target_h * aspect; // Aspect is now a correct float
+        }
+
+        img.width = target_w;
+        img.height = target_h;
+
+        e.set<ProportionalConstraint>({ target_w, target_h });
     });
 
     world->system<HorizontalLayoutBox, UIElementSize>("ResetHProgress")
@@ -4225,6 +4262,12 @@ int main(int, char *[]) {
         }
     });
 
+    // world->system<ImageRenderable, ProportionalConstraint, Graphics>()
+    // {
+
+    // }
+
+    // What the fuck is this stupid fucking system?
 world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
     .term_at(0).parent()
     .term_at(3).optional()
@@ -4811,6 +4854,23 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
             }
         });
 
+    auto spaceframeSelector = world->system<FilmstripData>()
+    .kind(flecs::PreFrame)
+    .immediate()
+    .each([&](flecs::entity e, FilmstripData& data)
+    {
+        e.children([&](flecs::entity child)
+        {
+            child.remove(flecs::ChildOf, e);
+            child.ensure<RenderStatus>().visible = false;
+        });
+        for (int i = std::max(0, (int)data.frames.size() - data.frame_limit); i < data.frames.size(); i++)
+        {
+            data.frames[i].child_of(e);
+            data.frames[i].ensure<RenderStatus>().visible = true;
+        }
+    });
+
     auto vncTextureUpdateSystem = world->system<VNCClient>()
         .kind(flecs::OnUpdate)
         .each([&](flecs::entity e, VNCClient& vnc) {
@@ -5011,15 +5071,16 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
                             if (leaf_data.editor_type == EditorType::Episodic)
                             {
                                 // TODO: Check for rows that are designed for framespace render
-                                auto messageBfoSprite = world->entity()
+                                auto frame = world->entity()
                                 .is_a(UIElement)
                                 // .set<ProportionalConstraint>({800.0f, 200.0f})
                                 // hmmm....
                                 .set<ImageCreator>({"../build/" + frame_filename, 1.0f, 1.0f})
-                                .set<ZIndex>({30})
-                                 .set<Constrain>({true, true})
-                                 .set<Expand>({false, 4.0f, 4.0f, 1.0f, true, 0.0f, 0.0f, 1.0f, true})
-                                .child_of(leaf.target<EditorCanvas>().target<SpaceframeChannel>());
+                                .set<ZIndex>({30});
+                                //  .set<Constrain>({true, true})
+                                //  .set<Expand>({false, 4.0f, 4.0f, 1.0f, true, 0.0f, 0.0f, 1.0f, true})
+                                // .child_of(leaf.target<EditorCanvas>().target<FilmstripChannel>());
+                                leaf.target<EditorCanvas>().target<FilmstripChannel>().ensure<FilmstripData>().frames.push_back(frame);
                             }
                         });
 
