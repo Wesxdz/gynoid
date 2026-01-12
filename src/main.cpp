@@ -604,6 +604,8 @@ struct TriangleParticle {
     float collisionTime;  // When this particle reaches its target
     float u, v;  // UV coordinates (don't animate)
     float elapsedTime;  // Current time
+    float hitTime;  // Time when particle first hit/locked (for glow effect)
+    float baryX, baryY, baryZ;  // Barycentric coordinates for edge detection
     int vertexIndex;  // Which vertex in the buffer
     bool locked;  // Has reached target
 };
@@ -3274,8 +3276,12 @@ const char* vertexShaderSource = R"(
 #version 330 core
 layout (location = 0) in vec3 aPos;
 layout (location = 1) in vec2 aTexCoord;
+layout (location = 2) in vec3 aBary;
+layout (location = 3) in float aGlow;
 
 out vec2 TexCoord;
+out vec3 Bary;
+out float Glow;
 
 uniform mat4 model;
 uniform mat4 view;
@@ -3285,6 +3291,8 @@ void main()
 {
     gl_Position = projection * view * model * vec4(aPos, 1.0);
     TexCoord = aTexCoord;
+    Bary = aBary;
+    Glow = aGlow;
 }
 )";
 
@@ -3293,12 +3301,31 @@ const char* fragmentShaderSource = R"(
 out vec4 FragColor;
 
 in vec2 TexCoord;
+in vec3 Bary;
+in float Glow;
 
 uniform sampler2D uiTexture;
 
 void main()
 {
-    FragColor = texture(uiTexture, TexCoord);
+    vec4 texColor = texture(uiTexture, TexCoord);
+
+    // Calculate edge factor using barycentric coordinates
+    // Edges are where any barycentric coordinate is close to 0
+    float edgeWidth = 0.12;  // Width of the edge glow (soft gradient)
+    float minBary = min(min(Bary.x, Bary.y), Bary.z);
+
+    // Smooth edge detection with soft gradient falloff
+    float edgeFactor = 1.0 - smoothstep(0.0, edgeWidth, minBary);
+
+    // Apply soft gradient glow on edges
+    // Glow color: faint warm yellow
+    vec3 glowColor = vec3(1.0, 0.9, 0.4);
+
+    // Combine texture with faint edge glow (0.5 multiplier for subtlety)
+    vec3 finalColor = texColor.rgb + glowColor * edgeFactor * Glow * 0.5;
+
+    FragColor = vec4(finalColor, texColor.a);
 }
 )";
 
@@ -3420,26 +3447,38 @@ void generateTriangularGrid(std::vector<float>& vertices, std::vector<unsigned i
             float v1 = (y1 + height * 0.5f) / height;
             float v2 = (y2 + height * 0.5f) / height;
 
-            // Vertex 0
+            // Vertex 0 (barycentric: 1,0,0)
             vertices.push_back(x0);
             vertices.push_back(y0);
             vertices.push_back(0.0f);  // Flat on Z=0
             vertices.push_back(u0);
             vertices.push_back(v0);
+            vertices.push_back(1.0f);  // baryX
+            vertices.push_back(0.0f);  // baryY
+            vertices.push_back(0.0f);  // baryZ
+            vertices.push_back(0.0f);  // glow
 
-            // Vertex 1
+            // Vertex 1 (barycentric: 0,1,0)
             vertices.push_back(x1);
             vertices.push_back(y1);
             vertices.push_back(0.0f);
             vertices.push_back(u1);
             vertices.push_back(v1);
+            vertices.push_back(0.0f);  // baryX
+            vertices.push_back(1.0f);  // baryY
+            vertices.push_back(0.0f);  // baryZ
+            vertices.push_back(0.0f);  // glow
 
-            // Vertex 2
+            // Vertex 2 (barycentric: 0,0,1)
             vertices.push_back(x2);
             vertices.push_back(y2);
             vertices.push_back(0.0f);
             vertices.push_back(u2);
             vertices.push_back(v2);
+            vertices.push_back(0.0f);  // baryX
+            vertices.push_back(0.0f);  // baryY
+            vertices.push_back(1.0f);  // baryZ
+            vertices.push_back(0.0f);  // glow
 
             // Single triangle face
             indices.push_back(vertexIndex);
@@ -3486,7 +3525,7 @@ void initializeParticles(Graphics& graphics, const std::vector<float>& targetVer
     std::uniform_real_distribution<float> outerCollisionTimeDist(4.0f, 7.0f);  // Outer grid delayed
 
     // Calculate giant triangle bounds (same as in generateTriangularGrid)
-    float triWidth = width / 40;  // Match subdivisions
+    float triWidth = width / 80;  // Match subdivisions
     float triHeight = triWidth * 0.866025f;
     float triSize = std::min(width, height) * 0.8f;
     float bottomY = -triSize * 0.4f;
@@ -3500,8 +3539,8 @@ void initializeParticles(Graphics& graphics, const std::vector<float>& targetVer
     graphics.particles.clear();
     graphics.gridVertices = targetVertices;
 
-    // Each vertex has 5 floats: x, y, z, u, v
-    int numVertices = targetVertices.size() / 5;
+    // Each vertex has 9 floats: x, y, z, u, v, baryX, baryY, baryZ, glow
+    int numVertices = targetVertices.size() / 9;
     // 3 vertices per triangle
     int numTriangles = numVertices / 3;
 
@@ -3510,9 +3549,9 @@ void initializeParticles(Graphics& graphics, const std::vector<float>& targetVer
         float centroidX = 0, centroidY = 0, centroidZ = 0;
         for (int v = 0; v < 3; v++) {
             int i = t * 3 + v;
-            centroidX += targetVertices[i * 5 + 0];
-            centroidY += targetVertices[i * 5 + 1];
-            centroidZ += targetVertices[i * 5 + 2];
+            centroidX += targetVertices[i * 9 + 0];
+            centroidY += targetVertices[i * 9 + 1];
+            centroidZ += targetVertices[i * 9 + 2];
         }
         centroidX /= 3.0f;
         centroidY /= 3.0f;
@@ -3552,9 +3591,9 @@ void initializeParticles(Graphics& graphics, const std::vector<float>& targetVer
             TriangleParticle p;
 
             // Target position from grid (where it will collide)
-            p.targetX = targetVertices[i * 5 + 0];
-            p.targetY = targetVertices[i * 5 + 1];
-            p.targetZ = targetVertices[i * 5 + 2];
+            p.targetX = targetVertices[i * 9 + 0];
+            p.targetY = targetVertices[i * 9 + 1];
+            p.targetZ = targetVertices[i * 9 + 2];
 
             // Local offset from centroid (maintains triangle shape)
             float localX = p.targetX - centroidX;
@@ -3578,10 +3617,16 @@ void initializeParticles(Graphics& graphics, const std::vector<float>& targetVer
             p.collisionTime = collisionTime;
 
             // UVs don't animate
-            p.u = targetVertices[i * 5 + 3];
-            p.v = targetVertices[i * 5 + 4];
+            p.u = targetVertices[i * 9 + 3];
+            p.v = targetVertices[i * 9 + 4];
+
+            // Barycentric coordinates (from grid generation)
+            p.baryX = targetVertices[i * 9 + 5];
+            p.baryY = targetVertices[i * 9 + 6];
+            p.baryZ = targetVertices[i * 9 + 7];
 
             p.elapsedTime = 0.0f;
+            p.hitTime = -1.0f;  // Not hit yet
             p.vertexIndex = i;
             p.locked = false;
 
@@ -3596,13 +3641,27 @@ void updateParticles(Graphics& graphics, float deltaTime) {
         p.elapsedTime += deltaTime;
 
         float x, y, z;
+        float glow = 0.0f;
 
         if (p.locked || p.elapsedTime >= p.collisionTime) {
             // Collision happened - locked at target position
             x = p.targetX;
             y = p.targetY;
             z = p.targetZ;
+
+            // Track first hit time for glow effect
+            if (!p.locked) {
+                p.hitTime = p.elapsedTime;
+            }
             p.locked = true;
+
+            // Compute glow: starts at 1.0 on hit, fades out over ~0.8 seconds
+            float timeSinceHit = p.elapsedTime - p.hitTime;
+            float glowDuration = 0.8f;
+            if (timeSinceHit < glowDuration) {
+                // Smooth fade out with exponential decay for soft look
+                glow = exp(-3.0f * timeSinceHit / glowDuration);
+            }
         } else {
             // Flying towards collision point along velocity trajectory
             float timeToCollision = p.collisionTime - p.elapsedTime;
@@ -3620,12 +3679,13 @@ void updateParticles(Graphics& graphics, float deltaTime) {
             z = centroidZ + p.localZ * localBlend;
         }
 
-        // Update in grid vertices buffer (5 floats per vertex)
-        int offset = p.vertexIndex * 5;
+        // Update in grid vertices buffer (9 floats per vertex: x,y,z, u,v, baryX,baryY,baryZ, glow)
+        int offset = p.vertexIndex * 9;
         graphics.gridVertices[offset + 0] = x;
         graphics.gridVertices[offset + 1] = y;
         graphics.gridVertices[offset + 2] = z;
-        // UV stays the same
+        // UV (3,4) and barycentric (5,6,7) stay the same
+        graphics.gridVertices[offset + 8] = glow;
     }
 }
 
@@ -3868,11 +3928,11 @@ void initialize3DRendering(Graphics& graphics, int width, int height) {
     float planeHeight = 2.0f;
 
     float vertices[] = {
-        // positions          // texture coords (flipped V to correct upside-down rendering)
-        -planeWidth/2, -planeHeight/2, 0.0f,   0.0f, 0.0f,  // bottom left
-         planeWidth/2, -planeHeight/2, 0.0f,   1.0f, 0.0f,  // bottom right
-         planeWidth/2,  planeHeight/2, 0.0f,   1.0f, 1.0f,  // top right
-        -planeWidth/2,  planeHeight/2, 0.0f,   0.0f, 1.0f   // top left
+        // positions                              // tex     // bary (unused)   // glow
+        -planeWidth/2, -planeHeight/2, 0.0f,   0.0f, 0.0f,   0.33f, 0.33f, 0.34f, 0.0f,  // bottom left
+         planeWidth/2, -planeHeight/2, 0.0f,   1.0f, 0.0f,   0.33f, 0.33f, 0.34f, 0.0f,  // bottom right
+         planeWidth/2,  planeHeight/2, 0.0f,   1.0f, 1.0f,   0.33f, 0.33f, 0.34f, 0.0f,  // top right
+        -planeWidth/2,  planeHeight/2, 0.0f,   0.0f, 1.0f,   0.33f, 0.33f, 0.34f, 0.0f   // top left
     };
 
     unsigned int indices[] = {
@@ -3892,13 +3952,21 @@ void initialize3DRendering(Graphics& graphics, int width, int height) {
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, graphics.planeEBO);
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(indices), indices, GL_STATIC_DRAW);
 
-    // Position attribute
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)0);
+    // Position attribute (location 0)
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 9 * sizeof(float), (void*)0);
     glEnableVertexAttribArray(0);
 
-    // Texture coord attribute
-    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)(3 * sizeof(float)));
+    // Texture coord attribute (location 1)
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 9 * sizeof(float), (void*)(3 * sizeof(float)));
     glEnableVertexAttribArray(1);
+
+    // Barycentric coords attribute (location 2)
+    glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, 9 * sizeof(float), (void*)(5 * sizeof(float)));
+    glEnableVertexAttribArray(2);
+
+    // Glow factor attribute (location 3)
+    glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, 9 * sizeof(float), (void*)(8 * sizeof(float)));
+    glEnableVertexAttribArray(3);
 
     glBindVertexArray(0);
 
@@ -3926,13 +3994,21 @@ void initialize3DRendering(Graphics& graphics, int width, int height) {
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, graphics.gridEBO);
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, gridIndices.size() * sizeof(unsigned int), gridIndices.data(), GL_STATIC_DRAW);
 
-    // Position attribute
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)0);
+    // Position attribute (location 0)
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 9 * sizeof(float), (void*)0);
     glEnableVertexAttribArray(0);
 
-    // Texture coord attribute
-    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)(3 * sizeof(float)));
+    // Texture coord attribute (location 1)
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 9 * sizeof(float), (void*)(3 * sizeof(float)));
     glEnableVertexAttribArray(1);
+
+    // Barycentric coords attribute (location 2)
+    glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, 9 * sizeof(float), (void*)(5 * sizeof(float)));
+    glEnableVertexAttribArray(2);
+
+    // Glow factor attribute (location 3)
+    glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, 9 * sizeof(float), (void*)(8 * sizeof(float)));
+    glEnableVertexAttribArray(3);
 
     glBindVertexArray(0);
 
