@@ -333,7 +333,8 @@ void MelSpecRenderModule(flecs::world& world) {
     printf("MelSpecRenderModule: Graphics context found, proceeding...\n");
 
     // Calculate texture dimensions
-    int rollingFrames = (int)((5.0f * 22050) / 256);  // ~431 frames
+    // int rollingFrames = (int)((5.0f * 22050) / 256);  // ~431 frames
+    int rollingFrames = (int)((24.0f * 22050) / 256);  // ~431 frames
     int texWidth = rollingFrames;
     int texHeight = 128;  // N_MELS
 

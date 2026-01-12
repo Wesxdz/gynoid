@@ -499,6 +499,7 @@ struct ImageCreator
 {
     std::string path;
     float scaleX, scaleY = 1.0;
+    NVGcolor tint = nvgRGBA(255, 255, 255, 255);
 };
 
 struct ImageRenderable
@@ -507,6 +508,7 @@ struct ImageRenderable
     float scaleX, scaleY;
 
     float width, height;
+    NVGcolor tint = nvgRGBA(255, 255, 255, 255);
 };
 
 struct ZIndex {
@@ -1369,7 +1371,7 @@ void draw_double_arrow(NVGcontext* vg, const RenderCommand* cmd, const CustomRen
 
 flecs::entity create_badge(flecs::entity parent, flecs::entity UIElement, 
                            const char* text, uint32_t base_color, 
-                           bool is_capsule = false, bool is_double_arrow = false, int bind_to_entity = -1) {
+                           bool is_capsule = false, bool is_double_arrow = false, std::string postfix_symbol = "", std::string prefix_symbol = "", uint32_t prefix_tint = 0) {
     
     // --- 1. Color Logic (matching comp_gen.py) ---
     uint32_t dark = base_color;
@@ -1425,16 +1427,35 @@ flecs::entity create_badge(flecs::entity parent, flecs::entity UIElement,
     }
 
     flecs::entity badge_text_parent = badge;
-    if (bind_to_entity >= 0)
+    if (postfix_symbol.length() > 0)
     {
         auto badge_content = world->entity()
         .is_a(UIElement)
         .set<HorizontalLayoutBox>({0.0f, 0.0f})
         .set<Position, Local>({xPad, 0.0f}) // reduce Y spacing for MNIST
+        .add(flecs::OrderedChildren)
         // .add<DebugRenderBounds>()
         .child_of(badge);
         
         badge_text_parent = badge_content;
+    }
+
+    if (prefix_symbol.length() > 0)
+    {
+        uint32_t light_src = scale_color(prefix_tint, 1.3f);
+        unsigned char r = (light_src >> 24) & 0xFF;
+        unsigned char g = (light_src >> 16) & 0xFF;
+        unsigned char b = (light_src >> 8) & 0xFF;
+        unsigned char a = (light_src) & 0xFF;
+        NVGcolor color = nvgRGBA(r, g, b, a);
+
+        world->entity()
+        .is_a(UIElement)
+        .child_of(badge_text_parent)
+        .set<ImageCreator>({"../assets/mnist/set_0/" + prefix_symbol + ".png", 0.9f, 0.9f, nvgRGBA(r, g, b, a)})
+        .set<ZIndex>({25});
+
+        badge.set<UIContainer>({xPad, 0});
     }
 
     // Text with Gradient
@@ -1446,16 +1467,24 @@ flecs::entity create_badge(flecs::entity parent, flecs::entity UIElement,
         .set<RenderGradient>({white, light})   // Apply gradient to text
         .set<ZIndex>({25});
 
-    if (bind_to_entity >= 0)
+    if (postfix_symbol.length() > 0)
     {
+
+        unsigned char r = (light >> 24) & 0xFF;
+        unsigned char g = (light >> 16) & 0xFF;
+        unsigned char b = (light >> 8) & 0xFF;
+        unsigned char a = (light) & 0xFF;
+        NVGcolor color = nvgRGBA(r, g, b, a);
+
         world->entity()
         .is_a(UIElement)
         .child_of(badge_text_parent)
-        .set<ImageCreator>({"../assets/mnist/set_0/" + std::to_string(bind_to_entity) + ".png", 0.9f, 0.9f})
+        .set<ImageCreator>({"../assets/mnist/set_0/" + postfix_symbol + ".png", 0.9f, 0.9f, nvgRGBA(r, g, b, a)})
         .set<ZIndex>({25});
 
         badge.set<UIContainer>({xPad, 0});
     }
+
     return badge;
 }
 
@@ -1989,7 +2018,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         .set<RectRenderable>({0.0f, 0.0f, false, 0x000000FF})
         .child_of(leaf.target<EditorCanvas>());
         
-        create_badge(meta_input, UIElement, "Wesley", 0xf5a652ff, false, false, 0);
+        create_badge(meta_input, UIElement, "Wesley", 0xf5a652ff, false, false, "0");
 
         create_badge(meta_input, UIElement, "types", 0xa34d1aff, false, true);
 
@@ -2161,6 +2190,20 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
 
     } else if(editor_type == EditorType::Episodic)
     {
+
+        auto badges = world->entity()
+        .is_a(UIElement)
+        .set<HorizontalLayoutBox>({0.0f, 2.0f})
+        .set<Position, Local>({48.0f, 0.0f})
+        .child_of(leaf.target<EditorHeader>());
+
+        auto messageBfoSprite = world->entity()
+        .is_a(UIElement)
+        .child_of(badges)
+        .set<ZIndex>({20})
+        .set<ImageCreator>({"../assets/bfo/temporal_interval.png", 1.0f, 1.0f});
+        create_badge(badges, UIElement, "24 seconds", 0xf039e0ff, true);
+
         // Modulus rows
 
         // TODO: Fractal granularity navigation
@@ -2194,12 +2237,46 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         .add<FitChildren>()
         .set<Expand>({true, 0, 0, 1, true, 0, 0, 1.0})
         .add<HorizontalLayoutBox>()
-        .add<DebugRenderBounds>()
+        // .add<DebugRenderBounds>()
         .add(flecs::OrderedChildren)
         .add<ScissorContainer>(leaf.target<EditorCanvas>())
         .child_of(leaf.target<EditorCanvas>());
 
         leaf.target<EditorCanvas>().add<FilmstripChannel>(frameChannel);
+
+        // Mel spectrogram channel (24 seconds of system audio)
+        auto melSpecChannel = world->entity()
+        .is_a(UIElement)
+        .set<Expand>({true, 0, 0, 1, false, 0, 0, 0})
+        .add<HorizontalLayoutBox>()
+        .add(flecs::OrderedChildren)
+        .add<ScissorContainer>(leaf.target<EditorCanvas>())
+        .child_of(leaf.target<EditorCanvas>());
+
+        // Look up the system audio mel spec renderer
+        auto sysAudioRenderer = world->lookup("SystemAudioRenderer");
+        std::cout << "[Episodic] SystemAudioRenderer lookup: " << (sysAudioRenderer ? "found" : "NOT FOUND") << std::endl;
+        if (sysAudioRenderer && sysAudioRenderer.has<MelSpecRender>())
+        {
+            auto melSpec = sysAudioRenderer.get<MelSpecRender>();
+            std::cout << "[Episodic] MelSpec texture handle: " << melSpec.nvgTextureHandle
+                      << " size: " << melSpec.width << "x" << melSpec.height << std::endl;
+
+            // Create mel spec display element
+            world->entity()
+                .is_a(UIElement)
+                .child_of(melSpecChannel)
+                .set<ImageRenderable>({melSpec.nvgTextureHandle, 1.0f, 1.0f, (float)melSpec.width, (float)melSpec.height})
+                .set<Expand>({true, 0.0f, 0.0f, 1.0f, false, 0.0f, 0.0f, 0.0f})
+                .set<Constrain>({true, true})
+                .set<Position, Local>({0.0f, 164.0f})
+                .set<ZIndex>({18});
+            std::cout << "[Episodic] Created mel spec display in channel" << std::endl;
+        }
+        else
+        {
+            std::cout << "[Episodic] SystemAudioRenderer not found or missing MelSpecRender component!" << std::endl;
+        }
 
         // TODO: Implement scissors/vertical scrollbar
 
@@ -2211,7 +2288,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
                 .set<RectRenderable>({10.0f, 24.0f, false, i % 2 == 0 ? 0x222327FF : 0x121212FF })
                 .set<Expand>({true, 0, 0, 1, false, 0, 0, 0})
                 .add<ScissorContainer>(leaf.target<EditorCanvas>())
-                .set<ZIndex>({20});
+                .set<ZIndex>({12});
         }
             
         for (size_t i = 0; i < 4; i++)
@@ -2220,7 +2297,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
             .is_a(UIElement)
             .set<Align>({0.0f, 0.0f, 0.8f, 0.0f})
             .set<CustomRenderable>({24*3, 24*3, false, i % 2 == 1 ? 0x222327FF : 0x121212FF, draw_diamond})
-            .set<ZIndex>({25})
+            .set<ZIndex>({14})
             .add<ScissorContainer>(leaf.target<EditorCanvas>())
             .child_of(channels_2);
             // .child_of(leaf.target<EditorCanvas>());
@@ -2233,7 +2310,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
             .set<RectRenderable>({10.0f, 24.0f*3, false, i % 2 == 1 ? 0x222327FF : 0x121212FF })
             .add<ScissorContainer>(leaf.target<EditorCanvas>())
             .set<Expand>({true, 24*1.5f, 0, 0.2f, false, 0, 0, 0})
-            .set<ZIndex>({24});
+            .set<ZIndex>({14});
         }
     } else if (editor_type == EditorType::BFO)
     {
@@ -3003,12 +3080,43 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                     .is_a(UIElement)
                     .set<HorizontalLayoutBox>({0.0f, 2.0f})
                     .add(flecs::OrderedChildren)
-                    // .add<DebugRenderBounds>()
                     .child_of(chat_panel.message_list);
 
-                    create_badge(meta_response, UIElement, "Heonae", 0xc72783ff, false, false, 1);
+                    create_badge(meta_response, UIElement, "Heonae", 0xc72783ff, false, false, "1");
 
                     create_badge(meta_response, UIElement, "understands", 0xc72783ff, false, true);
+                    
+
+                    auto meta_response_data = world->entity()
+                    .is_a(UIElement)
+                    .set<HorizontalLayoutBox>({0.0f, 2.0f})
+                    .add(flecs::OrderedChildren)
+                    .child_of(chat_panel.message_list);
+
+                    auto continue_text = world->entity()
+                    .is_a(UIElement)
+                    .child_of(meta_response_data)
+                    .set<TextRenderable>({"A", "Inter", 16.0f, 0xFFFFFFFF})
+                    .set<ZIndex>({17});
+                    
+                    create_badge(meta_response_data, UIElement, "goblin", 0x39aa28ff, false, false, "2");
+
+                    auto continue_text_2 = world->entity()
+                    .is_a(UIElement)
+                    .child_of(meta_response_data)
+                    .set<TextRenderable>({"is", "Inter", 16.0f, 0xFFFFFFFF})
+                    .set<ZIndex>({17});
+
+                    create_badge(meta_response_data, UIElement, "near", 0xad734bff, false, true, "3", "2", 0x39aa28ff);
+
+                    auto continue_text_3 = world->entity()
+                    .is_a(UIElement)
+                    .child_of(meta_response_data)
+                    .set<TextRenderable>({"the old oak", "Inter", 16.0f, 0xFFFFFFFF})
+                    .set<ZIndex>({17});
+
+                    create_badge(meta_response_data, UIElement, "tree", 0xad734bff, false, false, "3");
+                    // Dynamic nextline...
 
                 });
 
@@ -3236,7 +3344,7 @@ int main(int, char *[]) {
         if (imgHandle == -1) {
             std::cerr << "Failed to load " << img.path << std::endl;
         }
-        e.set<ImageRenderable>({imgHandle, img.scaleX, img.scaleY, 0.0f, 0.0f});
+        e.set<ImageRenderable>({imgHandle, img.scaleX, img.scaleY, 0.0f, 0.0f, img.tint});
         e.remove<ImageCreator>();
     });
 
@@ -4645,6 +4753,7 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
                                                               image.imageHandle, 1.0); // image.alpha
                             nvgBeginPath(graphics.vg);
                             nvgRect(graphics.vg, cmd.pos.x, cmd.pos.y, image.width, image.height);
+                            imgPaint.innerColor = imgPaint.outerColor = image.tint;
                             nvgFillPaint(graphics.vg, imgPaint);
                             nvgFill(graphics.vg);
                         }
@@ -5076,7 +5185,7 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
                                 // .set<ProportionalConstraint>({800.0f, 200.0f})
                                 // hmmm....
                                 .set<ImageCreator>({"../build/" + frame_filename, 1.0f, 1.0f})
-                                .set<ZIndex>({30});
+                                .set<ZIndex>({15});
                                 //  .set<Constrain>({true, true})
                                 //  .set<Expand>({false, 4.0f, 4.0f, 1.0f, true, 0.0f, 0.0f, 1.0f, true})
                                 // .child_of(leaf.target<EditorCanvas>().target<FilmstripChannel>());
