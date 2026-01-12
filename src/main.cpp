@@ -2,6 +2,7 @@
 #include <fstream>
 #include <cmath>
 #include <vector>
+#include <array>
 #include <random>
 #include <stack>
 #include <algorithm>
@@ -595,6 +596,28 @@ struct ChatPanel {
     flecs::entity message_list;
 };
 
+// Particle animation for grid triangles - moving with velocity to collide at target
+struct TriangleParticle {
+    float targetX, targetY, targetZ;  // Final grid position (collision point)
+    float localX, localY, localZ;     // Rotated local offset from tetrahedron centroid
+    float vx, vy, vz;  // Velocity
+    float collisionTime;  // When this particle reaches its target
+    float u, v;  // UV coordinates (don't animate)
+    float elapsedTime;  // Current time
+    int vertexIndex;  // Which vertex in the buffer
+    bool locked;  // Has reached target
+};
+
+// Noise tetrahedron that flies past without joining grid
+struct NoiseTetrahedron {
+    float x, y, z;      // Current position (centroid)
+    float vz;           // Velocity towards camera
+    float scale;        // Size multiplier
+    // Random rotation (axis-angle)
+    float axisX, axisY, axisZ;
+    float rotAngle;
+};
+
 struct Graphics {
     NVGcontext* vg;
 
@@ -609,11 +632,27 @@ struct Graphics {
     GLuint gridVBO;
     GLuint gridEBO;
     GLuint shaderProgram;
+    GLuint greyTexture;  // 1x1 grey texture for noise tetrahedrons
     float tiltAngle;
     int uiWidth;
     int uiHeight;
     bool useGridMode;
     int gridVertexCount;
+
+    // Particle system data
+    std::vector<TriangleParticle> particles;
+    std::vector<float> gridVertices;  // Store vertices for dynamic updates
+
+    // Noise tetrahedrons (fly past, don't join grid)
+    GLuint noiseVAO;
+    GLuint noiseVBO;
+    std::vector<NoiseTetrahedron> noiseParticles;
+    std::vector<float> noiseVertices;
+    int noiseVertexCount;
+
+    // FTL deceleration state
+    float decelerationTime;      // Time since start of deceleration
+    float decelerationDuration;  // Total deceleration period
 };
 
 enum class EditorType
@@ -3280,17 +3319,32 @@ GLuint compileShader(GLenum type, const char* source) {
     return shader;
 }
 
-// Generate discrete triangular tiling pattern (alternating up/down triangles)
-// Each triangle is a separate mesh with its own random normal offset
+// Helper function to check if a point is inside a triangle using barycentric coordinates
+bool pointInTriangle(float px, float py,
+                     float ax, float ay, float bx, float by, float cx, float cy) {
+    float v0x = cx - ax, v0y = cy - ay;
+    float v1x = bx - ax, v1y = by - ay;
+    float v2x = px - ax, v2y = py - ay;
+
+    float dot00 = v0x * v0x + v0y * v0y;
+    float dot01 = v0x * v1x + v0y * v1y;
+    float dot02 = v0x * v2x + v0y * v2y;
+    float dot11 = v1x * v1x + v1y * v1y;
+    float dot12 = v1x * v2x + v1y * v2y;
+
+    float invDenom = 1.0f / (dot00 * dot11 - dot01 * dot01);
+    float u = (dot11 * dot02 - dot01 * dot12) * invDenom;
+    float v = (dot00 * dot12 - dot01 * dot02) * invDenom;
+
+    return (u >= 0) && (v >= 0) && (u + v <= 1);
+}
+
+// Generate flat triangle grid pattern (alternating up/down triangles)
+// Each triangle has 3 vertices and 1 face
 void generateTriangularGrid(std::vector<float>& vertices, std::vector<unsigned int>& indices,
                            float width, float height, int subdivisionsX, int subdivisionsY) {
     vertices.clear();
     indices.clear();
-
-    // Set up random number generator with normal distribution
-    static std::random_device rd;
-    static std::mt19937 gen(rd());
-    std::normal_distribution<float> normalDist(0.0f, 0.08f); // mean=0, stddev=0.08
 
     int vertexIndex = 0;
 
@@ -3298,10 +3352,23 @@ void generateTriangularGrid(std::vector<float>& vertices, std::vector<unsigned i
     float triWidth = width / subdivisionsX;
     float triHeight = triWidth * 0.866025f; // sqrt(3)/2 for equilateral triangles
 
+    // Giant triangle boundary (upward pointing, centered)
+    // Align bottom edge with grid rows so it lands on flat triangle edges
+    float triSize = std::min(width, height) * 0.8f;
+    // Snap bottom Y to nearest row boundary for clean edge alignment
+    float giantBottomY = -triSize * 0.4f;
+    giantBottomY = floor(giantBottomY / triHeight) * triHeight;  // Snap to grid row
+    float giantTopY = giantBottomY + triSize * 0.866025f;  // Equilateral triangle height
+    float halfBase = (giantTopY - giantBottomY) / 0.866025f * 0.5f;  // Half base width
+
+    float giantTriAx = -halfBase, giantTriAy = giantBottomY;   // Bottom left
+    float giantTriBx =  halfBase, giantTriBy = giantBottomY;   // Bottom right
+    float giantTriCx =  0.0f,     giantTriCy = giantTopY;      // Top center
+
     // Adjust number of rows based on height
     int numRows = (int)(height / triHeight) + 1;
 
-    // Generate triangular tiling pattern
+    // Generate triangle tiling pattern
     for (int row = 0; row < numRows; row++) {
         // Calculate Y position for this row
         float rowY = (row * triHeight) - height * 0.5f;
@@ -3322,95 +3389,427 @@ void generateTriangularGrid(std::vector<float>& vertices, std::vector<unsigned i
                 baseX += triWidth * 0.25f; // Offset odd rows
             }
 
-            // Generate random Z offset for this triangle
-            float zOffset = normalDist(gen);
+            float x0, x1, x2, y0, y1, y2;
 
             if (isUpward) {
                 // Upward pointing triangle (△)
-                float x0 = baseX;                    // left
-                float x1 = baseX + triWidth;         // right
-                float x2 = baseX + triWidth * 0.5f;  // top (center)
+                x0 = baseX;                    // left
+                x1 = baseX + triWidth;         // right
+                x2 = baseX + triWidth * 0.5f;  // top (center)
 
-                float y0 = rowY;
-                float y1 = rowY;
-                float y2 = rowY + triHeight;
-
-                // Calculate UV coordinates
-                float u0 = (x0 + width * 0.5f) / width;
-                float u1 = (x1 + width * 0.5f) / width;
-                float u2 = (x2 + width * 0.5f) / width;
-
-                float v0 = (y0 + height * 0.5f) / height;
-                float v1 = (y1 + height * 0.5f) / height;
-                float v2 = (y2 + height * 0.5f) / height;
-
-                // Vertex 0: bottom-left
-                vertices.push_back(x0);
-                vertices.push_back(y0);
-                vertices.push_back(zOffset);
-                vertices.push_back(u0);
-                vertices.push_back(v0);
-
-                // Vertex 1: bottom-right
-                vertices.push_back(x1);
-                vertices.push_back(y1);
-                vertices.push_back(zOffset);
-                vertices.push_back(u1);
-                vertices.push_back(v1);
-
-                // Vertex 2: top
-                vertices.push_back(x2);
-                vertices.push_back(y2);
-                vertices.push_back(zOffset);
-                vertices.push_back(u2);
-                vertices.push_back(v2);
+                y0 = rowY;
+                y1 = rowY;
+                y2 = rowY + triHeight;
             } else {
                 // Downward pointing triangle (▽)
-                float x0 = baseX;                    // left
-                float x1 = baseX + triWidth;         // right
-                float x2 = baseX + triWidth * 0.5f;  // bottom (center)
+                x0 = baseX;                    // left
+                x1 = baseX + triWidth;         // right
+                x2 = baseX + triWidth * 0.5f;  // bottom (center)
 
-                float y0 = rowY + triHeight;
-                float y1 = rowY + triHeight;
-                float y2 = rowY;
-
-                // Calculate UV coordinates
-                float u0 = (x0 + width * 0.5f) / width;
-                float u1 = (x1 + width * 0.5f) / width;
-                float u2 = (x2 + width * 0.5f) / width;
-
-                float v0 = (y0 + height * 0.5f) / height;
-                float v1 = (y1 + height * 0.5f) / height;
-                float v2 = (y2 + height * 0.5f) / height;
-
-                // Vertex 0: top-left
-                vertices.push_back(x0);
-                vertices.push_back(y0);
-                vertices.push_back(zOffset);
-                vertices.push_back(u0);
-                vertices.push_back(v0);
-
-                // Vertex 1: top-right
-                vertices.push_back(x1);
-                vertices.push_back(y1);
-                vertices.push_back(zOffset);
-                vertices.push_back(u1);
-                vertices.push_back(v1);
-
-                // Vertex 2: bottom
-                vertices.push_back(x2);
-                vertices.push_back(y2);
-                vertices.push_back(zOffset);
-                vertices.push_back(u2);
-                vertices.push_back(v2);
+                y0 = rowY + triHeight;
+                y1 = rowY + triHeight;
+                y2 = rowY;
             }
 
-            // Indices for this triangle
-            indices.push_back(vertexIndex++);
-            indices.push_back(vertexIndex++);
-            indices.push_back(vertexIndex++);
+            // Calculate UV coordinates
+            float u0 = (x0 + width * 0.5f) / width;
+            float u1 = (x1 + width * 0.5f) / width;
+            float u2 = (x2 + width * 0.5f) / width;
+
+            float v0 = (y0 + height * 0.5f) / height;
+            float v1 = (y1 + height * 0.5f) / height;
+            float v2 = (y2 + height * 0.5f) / height;
+
+            // Vertex 0
+            vertices.push_back(x0);
+            vertices.push_back(y0);
+            vertices.push_back(0.0f);  // Flat on Z=0
+            vertices.push_back(u0);
+            vertices.push_back(v0);
+
+            // Vertex 1
+            vertices.push_back(x1);
+            vertices.push_back(y1);
+            vertices.push_back(0.0f);
+            vertices.push_back(u1);
+            vertices.push_back(v1);
+
+            // Vertex 2
+            vertices.push_back(x2);
+            vertices.push_back(y2);
+            vertices.push_back(0.0f);
+            vertices.push_back(u2);
+            vertices.push_back(v2);
+
+            // Single triangle face
+            indices.push_back(vertexIndex);
+            indices.push_back(vertexIndex + 1);
+            indices.push_back(vertexIndex + 2);
+
+            vertexIndex += 3; // 3 vertices per triangle
         }
     }
+}
+
+// Apply rotation to a point around origin (Rodrigues' rotation formula simplified for unit axis)
+void rotatePoint(float& x, float& y, float& z, float axisX, float axisY, float axisZ, float angle) {
+    float c = cos(angle);
+    float s = sin(angle);
+    float dot = x * axisX + y * axisY + z * axisZ;
+    float crossX = axisY * z - axisZ * y;
+    float crossY = axisZ * x - axisX * z;
+    float crossZ = axisX * y - axisY * x;
+
+    float newX = x * c + crossX * s + axisX * dot * (1 - c);
+    float newY = y * c + crossY * s + axisY * dot * (1 - c);
+    float newZ = z * c + crossZ * s + axisZ * dot * (1 - c);
+
+    x = newX;
+    y = newY;
+    z = newZ;
+}
+
+// Initialize particle animation - FTL deceleration into Thornfield
+// Screen tetrahedrons move with velocities, calculated to collide at their target positions
+void initializeParticles(Graphics& graphics, const std::vector<float>& targetVertices,
+                         float width, float height, float duration = 3.0f) {
+    static std::random_device rd;
+    static std::mt19937 gen(rd());
+
+    // Velocity distribution - coming from far away (negative Z) towards camera/grid (positive Z)
+    std::uniform_real_distribution<float> vxDist(-0.3f, 0.3f);   // Small lateral drift
+    std::uniform_real_distribution<float> vyDist(-0.3f, 0.3f);   // Small vertical drift
+    std::uniform_real_distribution<float> vzDist(1.5f, 4.0f);    // Moving towards camera (+Z direction)
+    std::uniform_real_distribution<float> rotAngleDist(0.0f, 2.0f * M_PI);
+    std::uniform_real_distribution<float> axisDist(-1.0f, 1.0f);
+    std::uniform_real_distribution<float> collisionTimeDist(0.5f, 3.0f);  // Central triangle timing
+    std::uniform_real_distribution<float> outerCollisionTimeDist(4.0f, 7.0f);  // Outer grid delayed
+
+    // Calculate giant triangle bounds (same as in generateTriangularGrid)
+    float triWidth = width / 40;  // Match subdivisions
+    float triHeight = triWidth * 0.866025f;
+    float triSize = std::min(width, height) * 0.8f;
+    float bottomY = -triSize * 0.4f;
+    bottomY = floor(bottomY / triHeight) * triHeight;
+    float topY = bottomY + triSize * 0.866025f;
+    float halfBase = (topY - bottomY) / 0.866025f * 0.5f;
+    float giantTriAx = -halfBase, giantTriAy = bottomY;
+    float giantTriBx =  halfBase, giantTriBy = bottomY;
+    float giantTriCx =  0.0f,     giantTriCy = topY;
+
+    graphics.particles.clear();
+    graphics.gridVertices = targetVertices;
+
+    // Each vertex has 5 floats: x, y, z, u, v
+    int numVertices = targetVertices.size() / 5;
+    // 3 vertices per triangle
+    int numTriangles = numVertices / 3;
+
+    for (int t = 0; t < numTriangles; t++) {
+        // Calculate triangle's centroid from target vertices
+        float centroidX = 0, centroidY = 0, centroidZ = 0;
+        for (int v = 0; v < 3; v++) {
+            int i = t * 3 + v;
+            centroidX += targetVertices[i * 5 + 0];
+            centroidY += targetVertices[i * 5 + 1];
+            centroidZ += targetVertices[i * 5 + 2];
+        }
+        centroidX /= 3.0f;
+        centroidY /= 3.0f;
+        centroidZ /= 3.0f;
+
+        // Check if this triangle is inside the central giant triangle
+        bool isInCentralTriangle = pointInTriangle(centroidX, centroidY,
+                                                    giantTriAx, giantTriAy,
+                                                    giantTriBx, giantTriBy,
+                                                    giantTriCx, giantTriCy);
+
+        // Generate velocity for this triangle (all vertices share same velocity)
+        float vx = vxDist(gen);
+        float vy = vyDist(gen);
+        float vz = vzDist(gen);
+
+        // Central triangle loads first, outer grid is delayed
+        float collisionTime = isInCentralTriangle ? collisionTimeDist(gen) : outerCollisionTimeDist(gen);
+
+        // Random rotation axis (normalized) for initial orientation
+        float axisX = axisDist(gen);
+        float axisY = axisDist(gen);
+        float axisZ = axisDist(gen);
+        float axisLen = sqrt(axisX*axisX + axisY*axisY + axisZ*axisZ);
+        if (axisLen > 0.001f) {
+            axisX /= axisLen;
+            axisY /= axisLen;
+            axisZ /= axisLen;
+        } else {
+            axisX = 0; axisY = 0; axisZ = 1;
+        }
+        float rotAngle = rotAngleDist(gen);
+
+        // Apply to all 3 vertices of this triangle
+        for (int v = 0; v < 3; v++) {
+            int i = t * 3 + v;
+            TriangleParticle p;
+
+            // Target position from grid (where it will collide)
+            p.targetX = targetVertices[i * 5 + 0];
+            p.targetY = targetVertices[i * 5 + 1];
+            p.targetZ = targetVertices[i * 5 + 2];
+
+            // Local offset from centroid (maintains triangle shape)
+            float localX = p.targetX - centroidX;
+            float localY = p.targetY - centroidY;
+            float localZ = p.targetZ - centroidZ;
+
+            // Apply random rotation to local offset (tumbling debris orientation)
+            rotatePoint(localX, localY, localZ, axisX, axisY, axisZ, rotAngle);
+
+            // Store rotated local offset (for maintaining shape during flight)
+            p.localX = localX;
+            p.localY = localY;
+            p.localZ = localZ;
+
+            // Velocity (same for all vertices of this triangle)
+            p.vx = vx;
+            p.vy = vy;
+            p.vz = vz;
+
+            // Collision time
+            p.collisionTime = collisionTime;
+
+            // UVs don't animate
+            p.u = targetVertices[i * 5 + 3];
+            p.v = targetVertices[i * 5 + 4];
+
+            p.elapsedTime = 0.0f;
+            p.vertexIndex = i;
+            p.locked = false;
+
+            graphics.particles.push_back(p);
+        }
+    }
+}
+
+// Update particle positions based on velocity trajectories toward collision points
+void updateParticles(Graphics& graphics, float deltaTime) {
+    for (auto& p : graphics.particles) {
+        p.elapsedTime += deltaTime;
+
+        float x, y, z;
+
+        if (p.locked || p.elapsedTime >= p.collisionTime) {
+            // Collision happened - locked at target position
+            x = p.targetX;
+            y = p.targetY;
+            z = p.targetZ;
+            p.locked = true;
+        } else {
+            // Flying towards collision point along velocity trajectory
+            float timeToCollision = p.collisionTime - p.elapsedTime;
+            float t = p.elapsedTime / p.collisionTime;  // 0 at start, 1 at collision
+
+            // Centroid follows trajectory: starts far, arrives at target centroid
+            float centroidX = p.targetX - p.vx * timeToCollision;
+            float centroidY = p.targetY - p.vy * timeToCollision;
+            float centroidZ = p.targetZ - p.vz * timeToCollision;
+
+            // Rotated local offset blends out as we approach collision (tumbling -> aligned)
+            float localBlend = 1.0f - t;
+            x = centroidX + p.localX * localBlend;
+            y = centroidY + p.localY * localBlend;
+            z = centroidZ + p.localZ * localBlend;
+        }
+
+        // Update in grid vertices buffer (5 floats per vertex)
+        int offset = p.vertexIndex * 5;
+        graphics.gridVertices[offset + 0] = x;
+        graphics.gridVertices[offset + 1] = y;
+        graphics.gridVertices[offset + 2] = z;
+        // UV stays the same
+    }
+}
+
+// Upload updated vertices to GPU
+void uploadParticleVertices(Graphics& graphics) {
+    glBindBuffer(GL_ARRAY_BUFFER, graphics.gridVBO);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, graphics.gridVertices.size() * sizeof(float), graphics.gridVertices.data());
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+}
+
+// Initialize noise tetrahedrons - grey debris all around (we've just hit the debris field)
+void initializeNoiseTetrahedrons(Graphics& graphics, int count = 300) {
+    static std::random_device rd;
+    static std::mt19937 gen(rd());
+    // Spread debris all around in 3D space
+    std::uniform_real_distribution<float> xDist(-8.0f, 8.0f);
+    std::uniform_real_distribution<float> yDist(-6.0f, 6.0f);
+    std::uniform_real_distribution<float> zDistFar(-15.0f, -3.0f);   // Far debris field
+    std::uniform_real_distribution<float> zDistNear(-3.0f, 2.0f);    // Near-camera debris (passes through early)
+    std::uniform_real_distribution<float> velocityDist(4.0f, 10.0f);  // FTL speeds
+    std::uniform_real_distribution<float> scaleDist(0.015f, 0.06f);
+    std::uniform_real_distribution<float> axisDist(-1.0f, 1.0f);
+    std::uniform_real_distribution<float> angleDist(0.0f, 2.0f * M_PI);
+
+    // Initialize FTL deceleration state
+    graphics.decelerationTime = 0.0f;
+    graphics.decelerationDuration = 5.0f;  // 5 seconds to decelerate
+
+    graphics.noiseParticles.clear();
+    graphics.noiseParticles.reserve(count);
+
+    // Spawn 40% of particles near the camera so they pass through early
+    int nearCount = count * 4 / 10;
+
+    for (int i = 0; i < count; i++) {
+        NoiseTetrahedron n;
+        // Distribute throughout 3D space around the viewer
+        n.x = xDist(gen);
+        n.y = yDist(gen);
+        // Near particles pass through camera area early, before screen forms
+        n.z = (i < nearCount) ? zDistNear(gen) : zDistFar(gen);
+        n.vz = velocityDist(gen);
+        n.scale = scaleDist(gen);
+
+        // Random rotation axis (normalized)
+        n.axisX = axisDist(gen);
+        n.axisY = axisDist(gen);
+        n.axisZ = axisDist(gen);
+        float axisLen = sqrt(n.axisX*n.axisX + n.axisY*n.axisY + n.axisZ*n.axisZ);
+        if (axisLen > 0.001f) {
+            n.axisX /= axisLen;
+            n.axisY /= axisLen;
+            n.axisZ /= axisLen;
+        } else {
+            n.axisX = 0; n.axisY = 0; n.axisZ = 1;
+        }
+        n.rotAngle = angleDist(gen);
+
+        graphics.noiseParticles.push_back(n);
+    }
+
+    // Pre-allocate vertex buffer (4 verts * 5 floats per tetrahedron)
+    graphics.noiseVertices.resize(count * 4 * 5);
+    graphics.noiseVertexCount = count * 12; // 4 faces * 3 indices
+}
+
+// Respawn a noise tetrahedron at far distance
+void respawnNoiseTetrahedron(NoiseTetrahedron& n) {
+    static std::random_device rd;
+    static std::mt19937 gen(rd());
+    std::uniform_real_distribution<float> xDist(-8.0f, 8.0f);
+    std::uniform_real_distribution<float> yDist(-6.0f, 6.0f);
+    std::uniform_real_distribution<float> velocityDist(4.0f, 10.0f);
+    std::uniform_real_distribution<float> scaleDist(0.015f, 0.06f);
+    std::uniform_real_distribution<float> axisDist(-1.0f, 1.0f);
+    std::uniform_real_distribution<float> angleDist(0.0f, 2.0f * M_PI);
+
+    n.x = xDist(gen);
+    n.y = yDist(gen);
+    n.z = -20.0f;  // Respawn far away
+    n.vz = velocityDist(gen);
+    n.scale = scaleDist(gen);
+
+    // New random rotation
+    n.axisX = axisDist(gen);
+    n.axisY = axisDist(gen);
+    n.axisZ = axisDist(gen);
+    float axisLen = sqrt(n.axisX*n.axisX + n.axisY*n.axisY + n.axisZ*n.axisZ);
+    if (axisLen > 0.001f) {
+        n.axisX /= axisLen;
+        n.axisY /= axisLen;
+        n.axisZ /= axisLen;
+    } else {
+        n.axisX = 0; n.axisY = 0; n.axisZ = 1;
+    }
+    n.rotAngle = angleDist(gen);
+}
+
+// Update noise tetrahedrons - move towards camera with FTL deceleration
+void updateNoiseTetrahedrons(Graphics& graphics, float deltaTime) {
+    // Update deceleration time
+    graphics.decelerationTime += deltaTime;
+
+    // Calculate deceleration factor: starts at 1.0 (full speed), decays towards 0.1 (crawl)
+    float t = std::min(graphics.decelerationTime / graphics.decelerationDuration, 1.0f);
+    // Exponential decay for deceleration feel
+    float speedMultiplier = 0.1f + 0.9f * exp(-3.0f * t);
+
+    for (auto& n : graphics.noiseParticles) {
+        // Apply decelerated velocity
+        n.z += n.vz * speedMultiplier * deltaTime;
+
+        // Respawn if past camera (but only if still decelerating fast enough)
+        if (n.z > 5.0f) {
+            if (speedMultiplier > 0.15f) {
+                respawnNoiseTetrahedron(n);
+            } else {
+                // At near-stop, just keep them drifting slowly past
+                n.z = 5.1f; // Park them just past camera
+            }
+        }
+    }
+}
+
+// Generate vertices for noise tetrahedrons
+void generateNoiseVertices(Graphics& graphics) {
+    int idx = 0;
+    for (const auto& n : graphics.noiseParticles) {
+        float s = n.scale;
+        float h = s * 0.8f;  // Apex height
+
+        // Base triangle vertices (local, centered at origin)
+        float lx0 = -s,    ly0 = -s * 0.577f, lz0 = 0;
+        float lx1 = s,     ly1 = -s * 0.577f, lz1 = 0;
+        float lx2 = 0,     ly2 = s * 1.155f,  lz2 = 0;
+        float lx3 = 0,     ly3 = 0,           lz3 = h;  // Apex
+
+        // Apply rotation to each local vertex
+        rotatePoint(lx0, ly0, lz0, n.axisX, n.axisY, n.axisZ, n.rotAngle);
+        rotatePoint(lx1, ly1, lz1, n.axisX, n.axisY, n.axisZ, n.rotAngle);
+        rotatePoint(lx2, ly2, lz2, n.axisX, n.axisY, n.axisZ, n.rotAngle);
+        rotatePoint(lx3, ly3, lz3, n.axisX, n.axisY, n.axisZ, n.rotAngle);
+
+        // Translate to world position
+        float x0 = n.x + lx0, y0 = n.y + ly0, z0 = n.z + lz0;
+        float x1 = n.x + lx1, y1 = n.y + ly1, z1 = n.z + lz1;
+        float x2 = n.x + lx2, y2 = n.y + ly2, z2 = n.z + lz2;
+        float x3 = n.x + lx3, y3 = n.y + ly3, z3 = n.z + lz3;
+
+        // Grey UV
+        float u = 0.5f, v = 0.5f;
+
+        // Vertex 0
+        graphics.noiseVertices[idx++] = x0;
+        graphics.noiseVertices[idx++] = y0;
+        graphics.noiseVertices[idx++] = z0;
+        graphics.noiseVertices[idx++] = u;
+        graphics.noiseVertices[idx++] = v;
+        // Vertex 1
+        graphics.noiseVertices[idx++] = x1;
+        graphics.noiseVertices[idx++] = y1;
+        graphics.noiseVertices[idx++] = z1;
+        graphics.noiseVertices[idx++] = u;
+        graphics.noiseVertices[idx++] = v;
+        // Vertex 2
+        graphics.noiseVertices[idx++] = x2;
+        graphics.noiseVertices[idx++] = y2;
+        graphics.noiseVertices[idx++] = z2;
+        graphics.noiseVertices[idx++] = u;
+        graphics.noiseVertices[idx++] = v;
+        // Vertex 3 (apex)
+        graphics.noiseVertices[idx++] = x3;
+        graphics.noiseVertices[idx++] = y3;
+        graphics.noiseVertices[idx++] = z3;
+        graphics.noiseVertices[idx++] = u;
+        graphics.noiseVertices[idx++] = v;
+    }
+}
+
+// Upload noise vertices to GPU
+void uploadNoiseVertices(Graphics& graphics) {
+    glBindBuffer(GL_ARRAY_BUFFER, graphics.noiseVBO);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, graphics.noiseVertices.size() * sizeof(float), graphics.noiseVertices.data());
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
 }
 
 // Initialize 3D rendering resources
@@ -3506,10 +3905,10 @@ void initialize3DRendering(Graphics& graphics, int width, int height) {
     // Create triangular grid geometry (20x20 subdivisions for smooth tessellation)
     std::vector<float> gridVertices;
     std::vector<unsigned int> gridIndices;
-    generateTriangularGrid(gridVertices, gridIndices, planeWidth, planeHeight, 20, 20);
+    generateTriangularGrid(gridVertices, gridIndices, planeWidth, planeHeight, 40, 40);
 
     graphics.gridVertexCount = gridIndices.size();
-    graphics.useGridMode = false; // Start with single plane
+    graphics.useGridMode = true; // Start with grid mode to show particle animation
 
     glGenVertexArrays(1, &graphics.gridVAO);
     glGenBuffers(1, &graphics.gridVBO);
@@ -3517,11 +3916,75 @@ void initialize3DRendering(Graphics& graphics, int width, int height) {
 
     glBindVertexArray(graphics.gridVAO);
 
+    // Initialize particles with random positions that will animate to grid
+    initializeParticles(graphics, gridVertices, planeWidth, planeHeight, 3.0f);
+
     glBindBuffer(GL_ARRAY_BUFFER, graphics.gridVBO);
-    glBufferData(GL_ARRAY_BUFFER, gridVertices.size() * sizeof(float), gridVertices.data(), GL_STATIC_DRAW);
+    // Use DYNAMIC_DRAW since we'll update vertices each frame during animation
+    glBufferData(GL_ARRAY_BUFFER, graphics.gridVertices.size() * sizeof(float), graphics.gridVertices.data(), GL_DYNAMIC_DRAW);
 
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, graphics.gridEBO);
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, gridIndices.size() * sizeof(unsigned int), gridIndices.data(), GL_STATIC_DRAW);
+
+    // Position attribute
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+
+    // Texture coord attribute
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+
+    glBindVertexArray(0);
+
+    // Create grey texture for noise tetrahedrons
+    unsigned char greyPixel[4] = {100, 100, 100, 255};  // Dark grey RGBA
+    glGenTextures(1, &graphics.greyTexture);
+    glBindTexture(GL_TEXTURE_2D, graphics.greyTexture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, greyPixel);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+
+    // Initialize noise tetrahedrons
+    initializeNoiseTetrahedrons(graphics, 300);
+
+    // Generate indices for noise tetrahedrons (4 faces * 3 verts each)
+    std::vector<unsigned int> noiseIndices;
+    for (int t = 0; t < (int)graphics.noiseParticles.size(); t++) {
+        unsigned int base = t * 4;
+        // Face 0: base (v0, v1, v2)
+        noiseIndices.push_back(base + 0);
+        noiseIndices.push_back(base + 1);
+        noiseIndices.push_back(base + 2);
+        // Face 1: side (v0, v1, apex)
+        noiseIndices.push_back(base + 0);
+        noiseIndices.push_back(base + 1);
+        noiseIndices.push_back(base + 3);
+        // Face 2: side (v1, v2, apex)
+        noiseIndices.push_back(base + 1);
+        noiseIndices.push_back(base + 2);
+        noiseIndices.push_back(base + 3);
+        // Face 3: side (v2, v0, apex)
+        noiseIndices.push_back(base + 2);
+        noiseIndices.push_back(base + 0);
+        noiseIndices.push_back(base + 3);
+    }
+    graphics.noiseVertexCount = noiseIndices.size();
+
+    glGenVertexArrays(1, &graphics.noiseVAO);
+    glGenBuffers(1, &graphics.noiseVBO);
+    GLuint noiseEBO;
+    glGenBuffers(1, &noiseEBO);
+
+    glBindVertexArray(graphics.noiseVAO);
+
+    // Generate initial vertices
+    generateNoiseVertices(graphics);
+
+    glBindBuffer(GL_ARRAY_BUFFER, graphics.noiseVBO);
+    glBufferData(GL_ARRAY_BUFFER, graphics.noiseVertices.size() * sizeof(float), graphics.noiseVertices.data(), GL_DYNAMIC_DRAW);
+
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, noiseEBO);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, noiseIndices.size() * sizeof(unsigned int), noiseIndices.data(), GL_STATIC_DRAW);
 
     // Position attribute
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)0);
@@ -3550,6 +4013,17 @@ void mat4Perspective(float* mat, float fov, float aspect, float near, float far)
     mat[11] = -1.0f;
     mat[14] = -(2.0f * far * near) / (far - near);
     mat[15] = 0.0f;
+}
+
+// Helper function to create an orthographic projection matrix
+void mat4Ortho(float* mat, float left, float right, float bottom, float top, float near, float far) {
+    mat4Identity(mat);
+    mat[0] = 2.0f / (right - left);
+    mat[5] = 2.0f / (top - bottom);
+    mat[10] = -2.0f / (far - near);
+    mat[12] = -(right + left) / (right - left);
+    mat[13] = -(top + bottom) / (top - bottom);
+    mat[14] = -(far + near) / (far - near);
 }
 
 // Helper function to create a look-at view matrix
@@ -3634,12 +4108,15 @@ void resize3DRendering(Graphics& graphics, int width, int height) {
     // Update grid geometry to match aspect ratio
     std::vector<float> gridVertices;
     std::vector<unsigned int> gridIndices;
-    generateTriangularGrid(gridVertices, gridIndices, planeWidth, planeHeight, 20, 20);
+    generateTriangularGrid(gridVertices, gridIndices, planeWidth, planeHeight, 40, 40);
 
     graphics.gridVertexCount = gridIndices.size();
 
+    // Reinitialize particles for new grid dimensions
+    initializeParticles(graphics, gridVertices, planeWidth, planeHeight, 3.0f);
+
     glBindBuffer(GL_ARRAY_BUFFER, graphics.gridVBO);
-    glBufferData(GL_ARRAY_BUFFER, gridVertices.size() * sizeof(float), gridVertices.data(), GL_STATIC_DRAW);
+    glBufferData(GL_ARRAY_BUFFER, graphics.gridVertices.size() * sizeof(float), graphics.gridVertices.data(), GL_DYNAMIC_DRAW);
 
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, graphics.gridEBO);
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, gridIndices.size() * sizeof(unsigned int), gridIndices.data(), GL_STATIC_DRAW);
@@ -3717,8 +4194,11 @@ int main(int, char *[]) {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_COMPAT_PROFILE);
-    
-    GLFWwindow* window = glfwCreateWindow(1200, 800, "Thornfield", NULL, NULL);
+
+    // Start in fullscreen mode
+    GLFWmonitor* monitor = glfwGetPrimaryMonitor();
+    const GLFWvidmode* mode = glfwGetVideoMode(monitor);
+    GLFWwindow* window = glfwCreateWindow(mode->width, mode->height, "Thornfield", monitor, NULL);
     if (window == NULL) {
         std::cerr << "Failed to create GLFW window" << std::endl;
         glfwTerminate();
@@ -5229,6 +5709,26 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
         }
     });
 
+    // Particle animation system - updates triangle positions for spawn animation
+    auto particleAnimationSystem = world->system<Graphics>()
+        .kind(flecs::PostUpdate)
+        .each([](flecs::iter& it, size_t i, Graphics& graphics) {
+            float deltaTime = it.delta_time();
+
+            // Update grid particles
+            if (!graphics.particles.empty()) {
+                updateParticles(graphics, deltaTime);
+                uploadParticleVertices(graphics);
+            }
+
+            // Update noise tetrahedrons (fly past continuously)
+            if (!graphics.noiseParticles.empty()) {
+                updateNoiseTetrahedrons(graphics, deltaTime);
+                generateNoiseVertices(graphics);
+                uploadNoiseVertices(graphics);
+            }
+        });
+
     auto renderExecutionSystem = world->system<RenderQueue, Graphics>()
         .kind(flecs::PostUpdate)
         .each([&](flecs::entity e, RenderQueue& queue, Graphics& graphics) {
@@ -5968,8 +6468,8 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
         // Resize 3D rendering resources if window size changed
         resize3DRendering(graphics, winWidth, winHeight);
 
-        // Update tilt animation
-        graphics.tiltAngle += 0.01f;
+        // Tilt animation disabled - using orthographic projection
+        // graphics.tiltAngle += 0.01f;
 
         // PHASE 1: Render UI to framebuffer
         glBindFramebuffer(GL_FRAMEBUFFER, graphics.fbo);
@@ -5991,7 +6491,7 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
         // PHASE 2: Render 3D plane with UI texture to screen
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         glViewport(0, 0, fbWidth, fbHeight);
-        glClearColor(0.1f, 0.1f, 0.15f, 1.0f);  // Dark background
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);  // Black background
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
         glEnable(GL_DEPTH_TEST);
@@ -6000,15 +6500,16 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
         // Set up matrices
         float model[16], view[16], projection[16];
 
-        // Model matrix with rotation (tilting side to side)
-        mat4RotateY(model, sin(graphics.tiltAngle) * 0.3f);  // Tilt between -0.3 and +0.3 radians
+        // Model matrix - identity (no tilt)
+        mat4Identity(model);
 
-        // View matrix (camera looking at plane from distance)
-        mat4LookAt(view, 0.0f, 0.0f, 3.0f,  // Eye position
-                   0.0f, 0.0f, 0.0f,         // Look at center
-                   0.0f, 1.0f, 0.0f);        // Up vector
+        // View matrix (camera positioned so plane fills viewport)
+        // With 45° FOV, distance = halfHeight / tan(fov/2) = 1.0 / tan(22.5°) ≈ 2.414
+        mat4LookAt(view, 0.0f, 0.0f, 2.414f,  // Eye position (calculated to fill screen)
+                   0.0f, 0.0f, 0.0f,           // Look at center
+                   0.0f, 1.0f, 0.0f);          // Up vector
 
-        // Projection matrix
+        // Perspective projection matrix
         float aspect = (float)fbWidth / (float)fbHeight;
         mat4Perspective(projection, 0.785398f, aspect, 0.1f, 100.0f);  // 45 degrees FOV
 
@@ -6026,14 +6527,29 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
         glBindTexture(GL_TEXTURE_2D, graphics.fboTexture);
         glUniform1i(glGetUniformLocation(graphics.shaderProgram, "uiTexture"), 0);
 
-        // Draw either plane or grid
+        // Draw either plane or grid with debris
         if (graphics.useGridMode) {
-            // Draw tessellated triangular grid
+            // Disable backface culling for tetrahedrons (we want to see all faces)
+            glDisable(GL_CULL_FACE);
+
+            // Draw noise tetrahedrons (grey debris flying past)
+            if (!graphics.noiseParticles.empty()) {
+                glBindTexture(GL_TEXTURE_2D, graphics.greyTexture);
+                glBindVertexArray(graphics.noiseVAO);
+                glDrawElements(GL_TRIANGLES, graphics.noiseVertexCount, GL_UNSIGNED_INT, 0);
+                glBindVertexArray(0);
+            }
+
+            // Draw screen tetrahedrons (textured, being picked up from debris field)
+            glBindTexture(GL_TEXTURE_2D, graphics.fboTexture);
             glBindVertexArray(graphics.gridVAO);
             glDrawElements(GL_TRIANGLES, graphics.gridVertexCount, GL_UNSIGNED_INT, 0);
             glBindVertexArray(0);
+
+            glEnable(GL_CULL_FACE);
         } else {
-            // Draw single plane
+            // Draw single plane (normal texture mode)
+            glBindTexture(GL_TEXTURE_2D, graphics.fboTexture);
             glBindVertexArray(graphics.planeVAO);
             glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
             glBindVertexArray(0);
