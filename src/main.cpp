@@ -3081,19 +3081,6 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
             return;
         }
 
-        // Toggle between single plane and triangular grid
-        if (key == GLFW_KEY_G)
-        {
-            flecs::entity graphicsEntity = world->lookup("Graphics");
-            if (graphicsEntity.is_valid()) {
-                Graphics* graphics = graphicsEntity.try_get_mut<Graphics>();
-                if (graphics) {
-                    graphics->useGridMode = !graphics->useGridMode;
-                    std::cout << "Switched to " << (graphics->useGridMode ? "Grid" : "Plane") << " mode" << std::endl;
-                }
-            }
-            return;
-        }
 
     // Retrieve the singleton ChatState
     ChatState* chat = world->try_get_mut<ChatState>();
@@ -3318,6 +3305,7 @@ in float Glow;
 
 uniform sampler2D uiTexture;
 uniform int glowPass;  // 0 = normal, 1 = outer glow pass
+uniform float chromaStrength;  // Chromatic aberration intensity
 
 void main()
 {
@@ -3347,7 +3335,19 @@ void main()
         if (TexCoord.x < 0.0 || TexCoord.x > 1.0 || TexCoord.y < 0.0 || TexCoord.y > 1.0) {
             FragColor = vec4(0.0, 0.0, 0.0, 0.0);
         } else {
-            FragColor = texture(uiTexture, TexCoord);
+            // Chromatic aberration: offset RGB channels radially from center
+            vec2 center = vec2(0.5, 0.5);
+            vec2 dir = TexCoord - center;
+            float dist = length(dir);
+            vec2 offset = dir * chromaStrength * dist;  // Stronger at edges
+
+            // Sample each channel at slightly different positions
+            float r = texture(uiTexture, TexCoord + offset).r;
+            float g = texture(uiTexture, TexCoord).g;
+            float b = texture(uiTexture, TexCoord - offset).b;
+            float a = texture(uiTexture, TexCoord).a;
+
+            FragColor = vec4(r, g, b, a);
         }
     }
 }
@@ -5863,6 +5863,20 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
             if (!graphics.particles.empty()) {
                 updateParticles(graphics, deltaTime);
                 uploadParticleVertices(graphics);
+
+                // Check if all triangles are locked - switch to plane mode
+                if (graphics.useGridMode) {
+                    bool allLocked = true;
+                    for (const auto& p : graphics.particles) {
+                        if (!p.locked) {
+                            allLocked = false;
+                            break;
+                        }
+                    }
+                    if (allLocked) {
+                        graphics.useGridMode = false;
+                    }
+                }
             }
 
             // Update noise tetrahedrons (fly past continuously)
@@ -6674,6 +6688,16 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
         // Get glow uniforms
         GLint glowPassLoc = glGetUniformLocation(graphics.shaderProgram, "glowPass");
         GLint glowExpandLoc = glGetUniformLocation(graphics.shaderProgram, "glowExpand");
+        GLint chromaLoc = glGetUniformLocation(graphics.shaderProgram, "chromaStrength");
+
+        // Calculate chromatic aberration (fades out after central triangle forms)
+        float chromaAmount = 0.0f;
+        float chromaDuration = 2.2f;  // Fade out over 2.2 seconds
+        if (graphics.decelerationTime < chromaDuration) {
+            float t = graphics.decelerationTime / chromaDuration;
+            chromaAmount = 0.3f * (1.0f - t) * (1.0f - t);  // Quadratic fadeout, max 0.3
+        }
+        glUniform1f(chromaLoc, chromaAmount);
 
         // Draw either plane or grid with debris
         if (graphics.useGridMode) {
@@ -6723,6 +6747,7 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
             // Draw single plane (normal texture mode)
             glUniform1i(glowPassLoc, 0);  // Normal pass
             glUniform1f(glowExpandLoc, 0.0f);  // No expansion
+            glUniform1f(chromaLoc, 0.0f);  // No chromatic aberration
             glBindTexture(GL_TEXTURE_2D, graphics.fboTexture);
             glBindVertexArray(graphics.planeVAO);
             glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
