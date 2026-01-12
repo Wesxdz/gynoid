@@ -2,6 +2,7 @@
 #include <fstream>
 #include <cmath>
 #include <vector>
+#include <random>
 #include <stack>
 #include <algorithm>
 #include <variant>
@@ -596,6 +597,23 @@ struct ChatPanel {
 
 struct Graphics {
     NVGcontext* vg;
+
+    // 3D rendering resources
+    GLuint fbo;
+    GLuint fboTexture;
+    GLuint fboDepthRenderBuffer;
+    GLuint planeVAO;
+    GLuint planeVBO;
+    GLuint planeEBO;
+    GLuint gridVAO;
+    GLuint gridVBO;
+    GLuint gridEBO;
+    GLuint shaderProgram;
+    float tiltAngle;
+    int uiWidth;
+    int uiHeight;
+    bool useGridMode;
+    int gridVertexCount;
 };
 
 enum class EditorType
@@ -3022,6 +3040,20 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
             return;
         }
 
+        // Toggle between single plane and triangular grid
+        if (key == GLFW_KEY_G)
+        {
+            flecs::entity graphicsEntity = world->lookup("Graphics");
+            if (graphicsEntity.is_valid()) {
+                Graphics* graphics = graphicsEntity.try_get_mut<Graphics>();
+                if (graphics) {
+                    graphics->useGridMode = !graphics->useGridMode;
+                    std::cout << "Switched to " << (graphics->useGridMode ? "Grid" : "Plane") << " mode" << std::endl;
+                }
+            }
+            return;
+        }
+
     // Retrieve the singleton ChatState
     ChatState* chat = world->try_get_mut<ChatState>();
     if (chat)
@@ -3196,6 +3228,437 @@ void trace_pop(const char *file, size_t line, const char *name) {
         TracyCZoneEnd(zone_stack.top());
         zone_stack.pop();
     }
+}
+
+// Shader sources for 3D plane rendering
+const char* vertexShaderSource = R"(
+#version 330 core
+layout (location = 0) in vec3 aPos;
+layout (location = 1) in vec2 aTexCoord;
+
+out vec2 TexCoord;
+
+uniform mat4 model;
+uniform mat4 view;
+uniform mat4 projection;
+
+void main()
+{
+    gl_Position = projection * view * model * vec4(aPos, 1.0);
+    TexCoord = aTexCoord;
+}
+)";
+
+const char* fragmentShaderSource = R"(
+#version 330 core
+out vec4 FragColor;
+
+in vec2 TexCoord;
+
+uniform sampler2D uiTexture;
+
+void main()
+{
+    FragColor = texture(uiTexture, TexCoord);
+}
+)";
+
+// Compile shader helper
+GLuint compileShader(GLenum type, const char* source) {
+    GLuint shader = glCreateShader(type);
+    glShaderSource(shader, 1, &source, NULL);
+    glCompileShader(shader);
+
+    GLint success;
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
+    if (!success) {
+        char infoLog[512];
+        glGetShaderInfoLog(shader, 512, NULL, infoLog);
+        std::cerr << "Shader compilation failed: " << infoLog << std::endl;
+    }
+
+    return shader;
+}
+
+// Generate discrete triangular tiling pattern (alternating up/down triangles)
+// Each triangle is a separate mesh with its own random normal offset
+void generateTriangularGrid(std::vector<float>& vertices, std::vector<unsigned int>& indices,
+                           float width, float height, int subdivisionsX, int subdivisionsY) {
+    vertices.clear();
+    indices.clear();
+
+    // Set up random number generator with normal distribution
+    static std::random_device rd;
+    static std::mt19937 gen(rd());
+    std::normal_distribution<float> normalDist(0.0f, 0.08f); // mean=0, stddev=0.08
+
+    int vertexIndex = 0;
+
+    // Calculate triangle dimensions for triangular tiling
+    float triWidth = width / subdivisionsX;
+    float triHeight = triWidth * 0.866025f; // sqrt(3)/2 for equilateral triangles
+
+    // Adjust number of rows based on height
+    int numRows = (int)(height / triHeight) + 1;
+
+    // Generate triangular tiling pattern
+    for (int row = 0; row < numRows; row++) {
+        // Calculate Y position for this row
+        float rowY = (row * triHeight) - height * 0.5f;
+
+        // Determine if this is an even or odd row (for offset)
+        bool isEvenRow = (row % 2 == 0);
+
+        // Number of triangles in this row
+        int numTrisInRow = subdivisionsX * 2;
+
+        for (int col = 0; col < numTrisInRow; col++) {
+            // Determine if this is an upward or downward pointing triangle
+            bool isUpward = (col % 2 == 0);
+
+            // Calculate base X position
+            float baseX = (col * triWidth * 0.5f) - width * 0.5f;
+            if (!isEvenRow) {
+                baseX += triWidth * 0.25f; // Offset odd rows
+            }
+
+            // Generate random Z offset for this triangle
+            float zOffset = normalDist(gen);
+
+            if (isUpward) {
+                // Upward pointing triangle (△)
+                float x0 = baseX;                    // left
+                float x1 = baseX + triWidth;         // right
+                float x2 = baseX + triWidth * 0.5f;  // top (center)
+
+                float y0 = rowY;
+                float y1 = rowY;
+                float y2 = rowY + triHeight;
+
+                // Calculate UV coordinates
+                float u0 = (x0 + width * 0.5f) / width;
+                float u1 = (x1 + width * 0.5f) / width;
+                float u2 = (x2 + width * 0.5f) / width;
+
+                float v0 = (y0 + height * 0.5f) / height;
+                float v1 = (y1 + height * 0.5f) / height;
+                float v2 = (y2 + height * 0.5f) / height;
+
+                // Vertex 0: bottom-left
+                vertices.push_back(x0);
+                vertices.push_back(y0);
+                vertices.push_back(zOffset);
+                vertices.push_back(u0);
+                vertices.push_back(v0);
+
+                // Vertex 1: bottom-right
+                vertices.push_back(x1);
+                vertices.push_back(y1);
+                vertices.push_back(zOffset);
+                vertices.push_back(u1);
+                vertices.push_back(v1);
+
+                // Vertex 2: top
+                vertices.push_back(x2);
+                vertices.push_back(y2);
+                vertices.push_back(zOffset);
+                vertices.push_back(u2);
+                vertices.push_back(v2);
+            } else {
+                // Downward pointing triangle (▽)
+                float x0 = baseX;                    // left
+                float x1 = baseX + triWidth;         // right
+                float x2 = baseX + triWidth * 0.5f;  // bottom (center)
+
+                float y0 = rowY + triHeight;
+                float y1 = rowY + triHeight;
+                float y2 = rowY;
+
+                // Calculate UV coordinates
+                float u0 = (x0 + width * 0.5f) / width;
+                float u1 = (x1 + width * 0.5f) / width;
+                float u2 = (x2 + width * 0.5f) / width;
+
+                float v0 = (y0 + height * 0.5f) / height;
+                float v1 = (y1 + height * 0.5f) / height;
+                float v2 = (y2 + height * 0.5f) / height;
+
+                // Vertex 0: top-left
+                vertices.push_back(x0);
+                vertices.push_back(y0);
+                vertices.push_back(zOffset);
+                vertices.push_back(u0);
+                vertices.push_back(v0);
+
+                // Vertex 1: top-right
+                vertices.push_back(x1);
+                vertices.push_back(y1);
+                vertices.push_back(zOffset);
+                vertices.push_back(u1);
+                vertices.push_back(v1);
+
+                // Vertex 2: bottom
+                vertices.push_back(x2);
+                vertices.push_back(y2);
+                vertices.push_back(zOffset);
+                vertices.push_back(u2);
+                vertices.push_back(v2);
+            }
+
+            // Indices for this triangle
+            indices.push_back(vertexIndex++);
+            indices.push_back(vertexIndex++);
+            indices.push_back(vertexIndex++);
+        }
+    }
+}
+
+// Initialize 3D rendering resources
+void initialize3DRendering(Graphics& graphics, int width, int height) {
+    graphics.uiWidth = width;
+    graphics.uiHeight = height;
+    graphics.tiltAngle = 0.0f;
+
+    // Create framebuffer for UI rendering
+    glGenFramebuffers(1, &graphics.fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, graphics.fbo);
+
+    // Create texture to render UI to
+    glGenTextures(1, &graphics.fboTexture);
+    glBindTexture(GL_TEXTURE_2D, graphics.fboTexture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, graphics.fboTexture, 0);
+
+    // Create depth and stencil renderbuffer
+    glGenRenderbuffers(1, &graphics.fboDepthRenderBuffer);
+    glBindRenderbuffer(GL_RENDERBUFFER, graphics.fboDepthRenderBuffer);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, width, height);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, graphics.fboDepthRenderBuffer);
+
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        std::cerr << "Framebuffer is not complete!" << std::endl;
+    }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    // Create shader program
+    GLuint vertexShader = compileShader(GL_VERTEX_SHADER, vertexShaderSource);
+    GLuint fragmentShader = compileShader(GL_FRAGMENT_SHADER, fragmentShaderSource);
+
+    graphics.shaderProgram = glCreateProgram();
+    glAttachShader(graphics.shaderProgram, vertexShader);
+    glAttachShader(graphics.shaderProgram, fragmentShader);
+    glLinkProgram(graphics.shaderProgram);
+
+    GLint success;
+    glGetProgramiv(graphics.shaderProgram, GL_LINK_STATUS, &success);
+    if (!success) {
+        char infoLog[512];
+        glGetProgramInfoLog(graphics.shaderProgram, 512, NULL, infoLog);
+        std::cerr << "Shader program linking failed: " << infoLog << std::endl;
+    }
+
+    glDeleteShader(vertexShader);
+    glDeleteShader(fragmentShader);
+
+    // Create plane geometry
+    float aspectRatio = (float)width / (float)height;
+    float planeWidth = 2.0f * aspectRatio;
+    float planeHeight = 2.0f;
+
+    float vertices[] = {
+        // positions          // texture coords (flipped V to correct upside-down rendering)
+        -planeWidth/2, -planeHeight/2, 0.0f,   0.0f, 0.0f,  // bottom left
+         planeWidth/2, -planeHeight/2, 0.0f,   1.0f, 0.0f,  // bottom right
+         planeWidth/2,  planeHeight/2, 0.0f,   1.0f, 1.0f,  // top right
+        -planeWidth/2,  planeHeight/2, 0.0f,   0.0f, 1.0f   // top left
+    };
+
+    unsigned int indices[] = {
+        0, 1, 2,
+        0, 2, 3
+    };
+
+    glGenVertexArrays(1, &graphics.planeVAO);
+    glGenBuffers(1, &graphics.planeVBO);
+    glGenBuffers(1, &graphics.planeEBO);
+
+    glBindVertexArray(graphics.planeVAO);
+
+    glBindBuffer(GL_ARRAY_BUFFER, graphics.planeVBO);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
+
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, graphics.planeEBO);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(indices), indices, GL_STATIC_DRAW);
+
+    // Position attribute
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+
+    // Texture coord attribute
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+
+    glBindVertexArray(0);
+
+    // Create triangular grid geometry (20x20 subdivisions for smooth tessellation)
+    std::vector<float> gridVertices;
+    std::vector<unsigned int> gridIndices;
+    generateTriangularGrid(gridVertices, gridIndices, planeWidth, planeHeight, 20, 20);
+
+    graphics.gridVertexCount = gridIndices.size();
+    graphics.useGridMode = false; // Start with single plane
+
+    glGenVertexArrays(1, &graphics.gridVAO);
+    glGenBuffers(1, &graphics.gridVBO);
+    glGenBuffers(1, &graphics.gridEBO);
+
+    glBindVertexArray(graphics.gridVAO);
+
+    glBindBuffer(GL_ARRAY_BUFFER, graphics.gridVBO);
+    glBufferData(GL_ARRAY_BUFFER, gridVertices.size() * sizeof(float), gridVertices.data(), GL_STATIC_DRAW);
+
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, graphics.gridEBO);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, gridIndices.size() * sizeof(unsigned int), gridIndices.data(), GL_STATIC_DRAW);
+
+    // Position attribute
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+
+    // Texture coord attribute
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+
+    glBindVertexArray(0);
+}
+
+// Helper function to create a 4x4 identity matrix
+void mat4Identity(float* mat) {
+    for (int i = 0; i < 16; i++) mat[i] = 0.0f;
+    mat[0] = mat[5] = mat[10] = mat[15] = 1.0f;
+}
+
+// Helper function to create a perspective projection matrix
+void mat4Perspective(float* mat, float fov, float aspect, float near, float far) {
+    float tanHalfFov = tan(fov / 2.0f);
+    mat4Identity(mat);
+    mat[0] = 1.0f / (aspect * tanHalfFov);
+    mat[5] = 1.0f / tanHalfFov;
+    mat[10] = -(far + near) / (far - near);
+    mat[11] = -1.0f;
+    mat[14] = -(2.0f * far * near) / (far - near);
+    mat[15] = 0.0f;
+}
+
+// Helper function to create a look-at view matrix
+void mat4LookAt(float* mat, float eyeX, float eyeY, float eyeZ,
+                float centerX, float centerY, float centerZ,
+                float upX, float upY, float upZ) {
+    // Calculate forward vector
+    float fx = centerX - eyeX;
+    float fy = centerY - eyeY;
+    float fz = centerZ - eyeZ;
+    float fLen = sqrt(fx*fx + fy*fy + fz*fz);
+    fx /= fLen; fy /= fLen; fz /= fLen;
+
+    // Calculate right vector
+    float rx = fy * upZ - fz * upY;
+    float ry = fz * upX - fx * upZ;
+    float rz = fx * upY - fy * upX;
+    float rLen = sqrt(rx*rx + ry*ry + rz*rz);
+    rx /= rLen; ry /= rLen; rz /= rLen;
+
+    // Calculate up vector
+    float ux = ry * fz - rz * fy;
+    float uy = rz * fx - rx * fz;
+    float uz = rx * fy - ry * fx;
+
+    mat4Identity(mat);
+    mat[0] = rx; mat[4] = ry; mat[8] = rz;
+    mat[1] = ux; mat[5] = uy; mat[9] = uz;
+    mat[2] = -fx; mat[6] = -fy; mat[10] = -fz;
+    mat[12] = -(rx * eyeX + ry * eyeY + rz * eyeZ);
+    mat[13] = -(ux * eyeX + uy * eyeY + uz * eyeZ);
+    mat[14] = (fx * eyeX + fy * eyeY + fz * eyeZ);
+}
+
+// Helper function to create a rotation matrix around Y axis
+void mat4RotateY(float* mat, float angle) {
+    mat4Identity(mat);
+    float c = cos(angle);
+    float s = sin(angle);
+    mat[0] = c;
+    mat[2] = s;
+    mat[8] = -s;
+    mat[10] = c;
+}
+
+// Resize framebuffer and plane when window size changes
+void resize3DRendering(Graphics& graphics, int width, int height) {
+    if (width == graphics.uiWidth && height == graphics.uiHeight) {
+        return; // No change, skip resize
+    }
+
+    graphics.uiWidth = width;
+    graphics.uiHeight = height;
+
+    // Resize framebuffer texture
+    glBindTexture(GL_TEXTURE_2D, graphics.fboTexture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    // Resize depth/stencil renderbuffer
+    glBindRenderbuffer(GL_RENDERBUFFER, graphics.fboDepthRenderBuffer);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, width, height);
+    glBindRenderbuffer(GL_RENDERBUFFER, 0);
+
+    // Update plane geometry to match aspect ratio
+    float aspectRatio = (float)width / (float)height;
+    float planeWidth = 2.0f * aspectRatio;
+    float planeHeight = 2.0f;
+
+    float vertices[] = {
+        // positions          // texture coords (flipped V to correct upside-down rendering)
+        -planeWidth/2, -planeHeight/2, 0.0f,   0.0f, 0.0f,  // bottom left
+         planeWidth/2, -planeHeight/2, 0.0f,   1.0f, 0.0f,  // bottom right
+         planeWidth/2,  planeHeight/2, 0.0f,   1.0f, 1.0f,  // top right
+        -planeWidth/2,  planeHeight/2, 0.0f,   0.0f, 1.0f   // top left
+    };
+
+    glBindBuffer(GL_ARRAY_BUFFER, graphics.planeVBO);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+    // Update grid geometry to match aspect ratio
+    std::vector<float> gridVertices;
+    std::vector<unsigned int> gridIndices;
+    generateTriangularGrid(gridVertices, gridIndices, planeWidth, planeHeight, 20, 20);
+
+    graphics.gridVertexCount = gridIndices.size();
+
+    glBindBuffer(GL_ARRAY_BUFFER, graphics.gridVBO);
+    glBufferData(GL_ARRAY_BUFFER, gridVertices.size() * sizeof(float), gridVertices.data(), GL_STATIC_DRAW);
+
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, graphics.gridEBO);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, gridIndices.size() * sizeof(unsigned int), gridIndices.data(), GL_STATIC_DRAW);
+
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+}
+
+// Cleanup 3D resources
+void cleanup3DRendering(Graphics& graphics) {
+    glDeleteFramebuffers(1, &graphics.fbo);
+    glDeleteTextures(1, &graphics.fboTexture);
+    glDeleteRenderbuffers(1, &graphics.fboDepthRenderBuffer);
+    glDeleteVertexArrays(1, &graphics.planeVAO);
+    glDeleteBuffers(1, &graphics.planeVBO);
+    glDeleteBuffers(1, &graphics.planeEBO);
+    glDeleteVertexArrays(1, &graphics.gridVAO);
+    glDeleteBuffers(1, &graphics.gridVBO);
+    glDeleteBuffers(1, &graphics.gridEBO);
+    glDeleteProgram(graphics.shaderProgram);
 }
 
 int main(int, char *[]) {
@@ -3379,6 +3842,10 @@ int main(int, char *[]) {
 
     auto graphicsEntity = world->entity("Graphics")
         .set<Graphics>({vg});
+
+    // Initialize 3D rendering for plane
+    Graphics& graphics = graphicsEntity.ensure<Graphics>();
+    initialize3DRendering(graphics, 1200, 800);
 
     auto renderQueueEntity = world->entity("RenderQueue")
         .set<RenderQueue>({});
@@ -5498,15 +5965,22 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
         glfwGetFramebufferSize(window, &fbWidth, &fbHeight);
         float devicePixelRatio = (float)fbWidth / (float)winWidth;
 
-        glViewport(0, 0, fbWidth, fbHeight);
-        // glClearColor(22.0f/255.0f, 22.0f/255.0f, 22.0f/255.0f, 0.0f);
+        // Resize 3D rendering resources if window size changed
+        resize3DRendering(graphics, winWidth, winHeight);
+
+        // Update tilt animation
+        graphics.tiltAngle += 0.01f;
+
+        // PHASE 1: Render UI to framebuffer
+        glBindFramebuffer(GL_FRAMEBUFFER, graphics.fbo);
+        glViewport(0, 0, graphics.uiWidth, graphics.uiHeight);
         glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
 
         glfwStateEntity.set<Window>({window, winWidth, winHeight});
 
-        nvgBeginFrame(vg, winWidth, winHeight, devicePixelRatio);
-        
+        nvgBeginFrame(vg, graphics.uiWidth, graphics.uiHeight, 1.0f);
+
         world->defer_begin();
         glfwPollEvents();
         world->defer_end();
@@ -5514,8 +5988,64 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
         FrameMark;
         nvgEndFrame(vg);
 
+        // PHASE 2: Render 3D plane with UI texture to screen
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glViewport(0, 0, fbWidth, fbHeight);
+        glClearColor(0.1f, 0.1f, 0.15f, 1.0f);  // Dark background
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+        glEnable(GL_DEPTH_TEST);
+        glUseProgram(graphics.shaderProgram);
+
+        // Set up matrices
+        float model[16], view[16], projection[16];
+
+        // Model matrix with rotation (tilting side to side)
+        mat4RotateY(model, sin(graphics.tiltAngle) * 0.3f);  // Tilt between -0.3 and +0.3 radians
+
+        // View matrix (camera looking at plane from distance)
+        mat4LookAt(view, 0.0f, 0.0f, 3.0f,  // Eye position
+                   0.0f, 0.0f, 0.0f,         // Look at center
+                   0.0f, 1.0f, 0.0f);        // Up vector
+
+        // Projection matrix
+        float aspect = (float)fbWidth / (float)fbHeight;
+        mat4Perspective(projection, 0.785398f, aspect, 0.1f, 100.0f);  // 45 degrees FOV
+
+        // Set uniforms
+        GLint modelLoc = glGetUniformLocation(graphics.shaderProgram, "model");
+        GLint viewLoc = glGetUniformLocation(graphics.shaderProgram, "view");
+        GLint projLoc = glGetUniformLocation(graphics.shaderProgram, "projection");
+
+        glUniformMatrix4fv(modelLoc, 1, GL_FALSE, model);
+        glUniformMatrix4fv(viewLoc, 1, GL_FALSE, view);
+        glUniformMatrix4fv(projLoc, 1, GL_FALSE, projection);
+
+        // Bind UI texture
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, graphics.fboTexture);
+        glUniform1i(glGetUniformLocation(graphics.shaderProgram, "uiTexture"), 0);
+
+        // Draw either plane or grid
+        if (graphics.useGridMode) {
+            // Draw tessellated triangular grid
+            glBindVertexArray(graphics.gridVAO);
+            glDrawElements(GL_TRIANGLES, graphics.gridVertexCount, GL_UNSIGNED_INT, 0);
+            glBindVertexArray(0);
+        } else {
+            // Draw single plane
+            glBindVertexArray(graphics.planeVAO);
+            glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+            glBindVertexArray(0);
+        }
+
+        glDisable(GL_DEPTH_TEST);
+
         glfwSwapBuffers(window);
     }
+
+    // Cleanup 3D rendering resources
+    cleanup3DRendering(graphics);
 
     nvgDeleteGL2(vg);
 
