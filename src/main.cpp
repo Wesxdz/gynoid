@@ -1899,7 +1899,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         .add<ServerDescription>()
         .child_of(leaf.target<EditorCanvas>());
 
-        std::vector<std::string> server_icons = {"aeri_memory", "flecs", "x11", "parakeet", "chatterbox", "doctr", "huggingface", "dino2", "autodistill", "yolo", "alpaca", "modal"};
+        std::vector<std::string> server_icons = {"aeri_memory", "claude", "flecs", "x11", "parakeet", "chatterbox", "doctr", "huggingface", "dino2", "alpaca", "modal"}; // , "autodistill", "yolo", 
         // std::vector<std::string> server_icons = {"peach_core"};
 
         for (const auto& icon : server_icons)
@@ -1923,7 +1923,8 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
             .child_of(server_icon)
             .set<ImageCreator>({"../assets/server_dot.png", 1.0f, 1.0f})
             .set<Align>({-0.5f, -0.5f, 0.5f, 0.9f})
-            .set<ZIndex>({12});
+            .set<ZIndex>({12})
+            .set<Expand>({false, 0.0f, 0.0f, 1.0f, false, 0.0f, 0.0f, 1.0f, true});
         }
         
     }
@@ -2777,8 +2778,9 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
     }
 
     // Find the active VNC client
-    auto query = world->query<VNCClient, Position, ImageRenderable>();
-    query.each([&](flecs::entity e, VNCClient& vnc, Position& pos, ImageRenderable& img) {
+    auto query = world->query<VNCClientHandle, Position, ImageRenderable>();
+    query.each([&](flecs::entity e, VNCClientHandle& handle, Position& pos, ImageRenderable& img) {
+        VNCClient& vnc = *handle;
         if (vnc.connected && vnc.client) {
             // Convert mouse coordinates from window space to VNC space
             int win_w, win_h;
@@ -3104,6 +3106,11 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
             // Enter: send message
             chat->messages.push_back({"You", chat->draft});
 
+            // TODO: Run interpretation on statement
+            // To start, simply extract local entities and relationships
+            // Use a language model, because it will be easy and simple to prototype
+            system(("python3 ../scripts/interpretation.py " + chat->draft).c_str());
+
             // Query for the ChatPanel entity to attach the UI element to
             world->query<ChatPanel>()
                 .each([&](flecs::entity leaf, ChatPanel& chat_panel) {
@@ -3200,8 +3207,9 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
     }
     // TODO: Check for focused VNC Stream...
     // Use static cached query to avoid creating new query on every key press
-    static auto vnc_query = world->query<VNCClient>();
-    vnc_query.each([&](flecs::entity e, VNCClient& vnc) {
+    static auto vnc_query = world->query<VNCClientHandle>();
+    vnc_query.each([&](flecs::entity e, VNCClientHandle& handle) {
+        VNCClient& vnc = *handle;
         if (vnc.connected && vnc.client && vnc.eventPassthroughEnabled) {
             rfbKeySym keysym = glfw_key_to_rfb_keysym(key, mods);
 
