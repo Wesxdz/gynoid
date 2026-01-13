@@ -20,6 +20,7 @@ include_directories("deps/mel_spec/src")
 include_directories("deps/mel_spec/deps/glad/include")
 include_directories("deps/spdlog/include")
 include_directories("deps/mel_spec/deps/fpng/src")
+include_directories("deps/json-3.11.2/single_include")
 
 add_definitions(-DTRACY_ENABLE)
 add_subdirectory("deps/tracy-0.13.1")

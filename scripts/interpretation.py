@@ -14,7 +14,7 @@ def extract_knowledge_graph(text):
     tools = [
         {
             "name": "graph_extractor",
-            "description": "Extract entities with word-index grounding.",
+            "description": "Extract entities with word-index grounding. Assign semantically relevant colors to entities (e.g., green for plants/nature, brown for earth/wood, blue for water/sky, red for danger/fire, grey for stone/metal, etc.).",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -25,10 +25,11 @@ def extract_knowledge_graph(text):
                             "properties": {
                                 "id": {"type": "string"},
                                 "label": {"type": "string"},
+                                "color": {"type": "string", "description": "A hex color code (e.g., '4a7c4e' for green) that is semantically relevant to this entity. Choose colors that evoke the nature of the entity."},
                                 "start_index": {"type": "integer", "description": "The 0-based index of the first word of this entity"},
                                 "end_index": {"type": "integer", "description": "The 0-based index of the last word of this entity"}
                             },
-                            "required": ["id", "label", "start_index", "end_index"]
+                            "required": ["id", "label", "color", "start_index", "end_index"]
                         }
                     },
                     "edges": {
@@ -39,11 +40,12 @@ def extract_knowledge_graph(text):
                                 "source": {"type": "string"},
                                 "target": {"type": "string"},
                                 "relationship": {"type": "string"},
+                                "color": {"type": "string", "description": "A hex color code for this relationship. Choose colors that evoke the nature of the relationship (e.g., warm colors for proximity, cool colors for distance)."},
                                 "in-situ": {"type": "boolean", "description": "Whether the entity can be represented directly from contiguous words in the sentence or is implied. If false then do not include start_index and end_index"},
-                                "start_index": {"type": "integer", "description": "The 0-based index of the first word of this entity"},
-                                "end_index": {"type": "integer", "description": "The 0-based index of the last word of this entity"}
+                                "start_index": {"type": "integer", "description": "The 0-based index of the first word of the words representing only the relationship type portion of the edge"},
+                                "end_index": {"type": "integer", "description": "The 0-based index of the last word of the words representing only the relationship type portion of the edge"}
                             },
-                            "required": ["source", "target", "relationship"]
+                            "required": ["source", "target", "relationship", "color"]
                         }
                     }
                 },

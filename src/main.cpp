@@ -22,6 +22,8 @@
 
 #include <float.h>
 #include <unordered_map>
+#include <map>
+#include <sstream>
 #include <raymath.h>
 
 #include <ctime>
@@ -58,6 +60,9 @@
 #include <stack>
 
 #include <libssh2.h>
+#include <nlohmann/json.hpp>
+
+using json = nlohmann::json;
 
 struct TextSize { float w, h; };
 
@@ -595,6 +600,17 @@ struct ChatPanel {
     flecs::entity input_text;
     flecs::entity message_list;
 };
+
+// Async interpretation of chat messages
+struct PendingInterpretation {
+    std::string draft;
+    std::string result;
+    std::atomic<bool> completed{false};
+    flecs::entity message_list;  // Parent for badges
+};
+
+std::mutex pending_interpretations_mutex;
+std::vector<std::shared_ptr<PendingInterpretation>> pending_interpretations;
 
 // Particle animation for grid triangles - moving with velocity to collide at target
 struct TriangleParticle {
@@ -1438,9 +1454,9 @@ void draw_double_arrow(NVGcontext* vg, const RenderCommand* cmd, const CustomRen
     }
 }
 
-flecs::entity create_badge(flecs::entity parent, flecs::entity UIElement, 
-                           const char* text, uint32_t base_color, 
-                           bool is_capsule = false, bool is_double_arrow = false, std::string postfix_symbol = "", std::string prefix_symbol = "", uint32_t prefix_tint = 0) {
+flecs::entity create_badge(flecs::entity parent, flecs::entity UIElement,
+                           const char* text, uint32_t base_color,
+                           bool is_capsule = false, bool is_double_arrow = false, std::string postfix_symbol = "", std::string prefix_symbol = "", uint32_t prefix_tint = 0, uint32_t postfix_tint = 0) {
     
     // --- 1. Color Logic (matching comp_gen.py) ---
     uint32_t dark = base_color;
@@ -1538,12 +1554,12 @@ flecs::entity create_badge(flecs::entity parent, flecs::entity UIElement,
 
     if (postfix_symbol.length() > 0)
     {
-
-        unsigned char r = (light >> 24) & 0xFF;
-        unsigned char g = (light >> 16) & 0xFF;
-        unsigned char b = (light >> 8) & 0xFF;
-        unsigned char a = (light) & 0xFF;
-        NVGcolor color = nvgRGBA(r, g, b, a);
+        // Use postfix_tint if provided, otherwise fall back to light color from base_color
+        uint32_t tint_color = postfix_tint != 0 ? scale_color(postfix_tint, 1.3f) : light;
+        unsigned char r = (tint_color >> 24) & 0xFF;
+        unsigned char g = (tint_color >> 16) & 0xFF;
+        unsigned char b = (tint_color >> 8) & 0xFF;
+        unsigned char a = (tint_color) & 0xFF;
 
         world->entity()
         .is_a(UIElement)
@@ -3106,17 +3122,12 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
             // Enter: send message
             chat->messages.push_back({"You", chat->draft});
 
-            // TODO: Run interpretation on statement
-            // To start, simply extract local entities and relationships
-            // Use a language model, because it will be easy and simple to prototype
-            system(("python3 ../scripts/interpretation.py " + chat->draft).c_str());
-
             // Query for the ChatPanel entity to attach the UI element to
             world->query<ChatPanel>()
                 .each([&](flecs::entity leaf, ChatPanel& chat_panel) {
-                    
+
                     auto UIElement = world->lookup("UIElement");
-                    
+
                     auto messageBox = world->entity()
                     .is_a(UIElement)
                     .child_of(chat_panel.message_list)
@@ -3131,7 +3142,7 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                         .set<UIContainer>({8, 6})
                         // .add<DebugRenderBounds>()
                         .set<ZIndex>({15});
-                        
+
                         auto message_content = world->entity()
                         .is_a(UIElement)
                         .set<Position, Local>({8, 8})
@@ -3155,49 +3166,39 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                     .set<ZIndex>({20})
                     .set<ImageCreator>({"../assets/bfo/generically_dependent_continuant.png", 1.0f, 1.0f});
 
-                    auto meta_response = world->entity()
-                    .is_a(UIElement)
-                    .set<HorizontalLayoutBox>({0.0f, 2.0f})
-                    .add(flecs::OrderedChildren)
-                    .child_of(chat_panel.message_list);
+                    // Run interpretation async - badges will be created when it completes
+                    auto pending = std::make_shared<PendingInterpretation>();
+                    pending->draft = chat->draft;
+                    pending->message_list = chat_panel.message_list;
 
-                    create_badge(meta_response, UIElement, "Heonae", 0xc72783ff, false, false, "1");
+                    {
+                        std::lock_guard<std::mutex> lock(pending_interpretations_mutex);
+                        pending_interpretations.push_back(pending);
+                    }
 
-                    create_badge(meta_response, UIElement, "understands", 0xc72783ff, false, true);
-                    
+                    std::thread([pending]() {
+                        // Escape the draft for shell
+                        std::string escaped_draft;
+                        for (char c : pending->draft) {
+                            if (c == '\'' || c == '\\' || c == '"' || c == '$' || c == '`') {
+                                escaped_draft += '\\';
+                            }
+                            escaped_draft += c;
+                        }
 
-                    auto meta_response_data = world->entity()
-                    .is_a(UIElement)
-                    .set<FlowLayoutBox>({0.0f, 0.0f, 2.0f, 0.0f, 2.0f})
-                    .set<Expand>({true, 0, 0, 1, false, 0, 0, 0})
-                    .add(flecs::OrderedChildren)
-                    .child_of(chat_panel.message_list);
-
-                    auto continue_text = world->entity()
-                    .is_a(UIElement)
-                    .child_of(meta_response_data)
-                    .set<TextRenderable>({"A", "Inter", 16.0f, 0xFFFFFFFF})
-                    .set<ZIndex>({17});
-                    
-                    create_badge(meta_response_data, UIElement, "goblin", 0x39aa28ff, false, false, "2");
-
-                    auto continue_text_2 = world->entity()
-                    .is_a(UIElement)
-                    .child_of(meta_response_data)
-                    .set<TextRenderable>({"is", "Inter", 16.0f, 0xFFFFFFFF})
-                    .set<ZIndex>({17});
-
-                    create_badge(meta_response_data, UIElement, "near", 0xad734bff, false, true, "3", "2", 0x39aa28ff);
-
-                    auto continue_text_3 = world->entity()
-                    .is_a(UIElement)
-                    .child_of(meta_response_data)
-                    .set<TextRenderable>({"the old oak", "Inter", 16.0f, 0xFFFFFFFF})
-                    .set<ZIndex>({17});
-
-                    create_badge(meta_response_data, UIElement, "tree", 0xad734bff, false, false, "3");
-                    // Dynamic nextline...
-
+                        std::string cmd = "python3 ../scripts/interpretation.py \"" + escaped_draft + "\" 2>&1";
+                        FILE* pipe = popen(cmd.c_str(), "r");
+                        if (pipe) {
+                            char buffer[4096];
+                            std::string result;
+                            while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+                                result += buffer;
+                            }
+                            pclose(pipe);
+                            pending->result = result;
+                        }
+                        pending->completed.store(true);
+                    }).detach();
                 });
 
             chat->draft.clear();
@@ -6671,6 +6672,196 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
         glfwPollEvents();
         world->defer_end();
         world->progress();
+
+        // Process completed interpretations and create badges
+        {
+            std::lock_guard<std::mutex> lock(pending_interpretations_mutex);
+            auto it = pending_interpretations.begin();
+            while (it != pending_interpretations.end()) {
+                if ((*it)->completed.load()) {
+                    auto& pending = *it;
+                    auto UIElement = world->lookup("UIElement");
+
+                    // Create "Heonae understands" header
+                    auto meta_response = world->entity()
+                        .is_a(UIElement)
+                        .set<HorizontalLayoutBox>({0.0f, 2.0f})
+                        .add(flecs::OrderedChildren)
+                        .child_of(pending->message_list);
+
+                    // TODO: Reification underline or sphere indicator
+                    // create_badge(meta_response, UIElement, "Heonae", 0xc72783ff, false, false, "1");
+                    // create_badge(meta_response, UIElement, "understands", 0xc72783ff, false, true);
+
+                    // Parse JSON and create dynamic badges
+                    try {
+                        json result = json::parse(pending->result);
+
+                        // Split draft into words for interleaving
+                        std::vector<std::string> words;
+                        std::istringstream iss(pending->draft);
+                        std::string word;
+                        while (iss >> word) {
+                            words.push_back(word);
+                        }
+
+                        // Build a map of word indices to node/edge info
+                        struct Annotation {
+                            std::string label;
+                            std::string id;  // postfix_symbol (node number or target number)
+                            uint32_t color;
+                            bool is_relationship;
+                            std::string prefix_symbol;
+                            uint32_t prefix_tint;
+                            uint32_t postfix_tint;
+                            int end_idx;  // End index of this annotation span
+                        };
+                        std::map<int, Annotation> start_annotations;
+
+                        // Parse hex color string to uint32_t with alpha
+                        auto parse_hex_color = [](const std::string& hex) -> uint32_t {
+                            std::string clean_hex = hex;
+                            // Remove leading '#' if present
+                            if (!clean_hex.empty() && clean_hex[0] == '#') {
+                                clean_hex = clean_hex.substr(1);
+                            }
+                            // Parse as RGB, add full alpha
+                            uint32_t rgb = std::stoul(clean_hex, nullptr, 16);
+                            return (rgb << 8) | 0xff;
+                        };
+
+                        // Fallback color generator based on ID hash
+                        auto hash_color = [](const std::string& id) -> uint32_t {
+                            std::hash<std::string> hasher;
+                            size_t h = hasher(id);
+                            uint8_t r = 80 + (h % 150);
+                            uint8_t g = 80 + ((h >> 8) % 150);
+                            uint8_t b = 80 + ((h >> 16) % 150);
+                            return (r << 24) | (g << 16) | (b << 8) | 0xff;
+                        };
+
+                        std::map<std::string, uint32_t> node_colors;
+                        std::map<std::string, std::string> node_numbers;  // Map node ID to its display number
+                        if (result.contains("nodes")) {
+                            int node_num = 1;
+                            for (auto& node : result["nodes"]) {
+                                std::string id = node["id"].get<std::string>();
+                                std::string label = node["label"].get<std::string>();
+                                int start_idx = node["start_index"].get<int>();
+                                int end_idx = node["end_index"].get<int>();
+
+                                // Use semantic color from API if available, otherwise hash
+                                uint32_t color;
+                                if (node.contains("color")) {
+                                    try {
+                                        color = parse_hex_color(node["color"].get<std::string>());
+                                    } catch (...) {
+                                        color = hash_color(id);
+                                    }
+                                } else {
+                                    color = hash_color(id);
+                                }
+                                node_colors[id] = color;
+                                node_numbers[id] = std::to_string(node_num);
+
+                                start_annotations[start_idx] = {label, std::to_string(node_num), color, false, "", 0, color, end_idx};
+                                node_num++;
+                            }
+                        }
+
+                        // Process edges (relationships)
+                        if (result.contains("edges")) {
+                            for (auto& edge : result["edges"]) {
+                                bool in_situ = edge.value("in-situ", false);
+                                if (in_situ && edge.contains("start_index")) {
+                                    std::string rel = edge["relationship"].get<std::string>();
+                                    std::string source = edge["source"].get<std::string>();
+                                    std::string target = edge["target"].get<std::string>();
+                                    int start_idx = edge["start_index"].get<int>();
+                                    int end_idx = edge["end_index"].get<int>();
+
+                                    // Use semantic color from API if available
+                                    uint32_t color;
+                                    if (edge.contains("color")) {
+                                        try {
+                                            color = parse_hex_color(edge["color"].get<std::string>());
+                                        } catch (...) {
+                                            color = 0xad734bff;
+                                        }
+                                    } else {
+                                        color = 0xad734bff;
+                                    }
+                                    uint32_t source_color = node_colors.count(source) ? node_colors[source] : 0x888888ff;
+                                    uint32_t target_color = node_colors.count(target) ? node_colors[target] : 0x888888ff;
+                                    // Use source node's number for the MNIST prefix image
+                                    std::string source_num = node_numbers.count(source) ? node_numbers[source] : "";
+                                    // Use target node's number for the MNIST postfix image
+                                    std::string target_num = node_numbers.count(target) ? node_numbers[target] : "";
+
+                                    start_annotations[start_idx] = {rel, target_num, color, true, source_num, source_color, target_color, end_idx};
+                                }
+                            }
+                        }
+
+                        // Create flow layout for interleaved text and badges
+                        auto meta_response_data = world->entity()
+                            .is_a(UIElement)
+                            .set<FlowLayoutBox>({0.0f, 0.0f, 2.0f, 0.0f, 2.0f})
+                            .set<Expand>({true, 0, 0, 1, false, 0, 0, 0})
+                            .add(flecs::OrderedChildren)
+                            .child_of(pending->message_list);
+
+                        // Interleave text with badges - badges replace their word spans
+                        std::string current_text;
+                        for (size_t i = 0; i < words.size(); ) {
+                            // Check if an annotation starts at this position
+                            if (start_annotations.count(i)) {
+                                // Flush any accumulated text
+                                if (!current_text.empty()) {
+                                    world->entity()
+                                        .is_a(UIElement)
+                                        .child_of(meta_response_data)
+                                        .set<TextRenderable>({current_text.c_str(), "Inter", 16.0f, 0x777777FF})
+                                        .set<ZIndex>({17});
+                                    current_text.clear();
+                                }
+
+                                auto& ann = start_annotations[i];
+                                create_badge(meta_response_data, UIElement, ann.label.c_str(),
+                                           ann.color, false, ann.is_relationship,
+                                           ann.id, ann.prefix_symbol, ann.prefix_tint, ann.postfix_tint);
+
+                                // Skip all words covered by this annotation (start_idx to end_idx inclusive)
+                                i = ann.end_idx + 1;
+                            } else {
+                                // Add the word to accumulated text
+                                if (!current_text.empty()) current_text += " ";
+                                current_text += words[i];
+                                i++;
+                            }
+                        }
+
+                        // Flush remaining text
+                        if (!current_text.empty()) {
+                            world->entity()
+                                .is_a(UIElement)
+                                .child_of(meta_response_data)
+                                .set<TextRenderable>({current_text.c_str(), "Inter", 16.0f, 0xFFFFFFFF})
+                                .set<ZIndex>({17});
+                        }
+
+                    } catch (const json::exception& e) {
+                        std::cerr << "[Interpretation] JSON parse error: " << e.what() << std::endl;
+                        std::cerr << "[Interpretation] Raw result: " << pending->result << std::endl;
+                    }
+
+                    it = pending_interpretations.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+
         FrameMark;
         nvgEndFrame(vg);
 
