@@ -998,7 +998,8 @@ void vnc_connect_async(VNCClient* vnc) {
 }
 
 // VNC message processing thread - handles all network I/O
-void vnc_message_thread(VNCClient* vnc) {
+void vnc_message_thread(VNCClientHandle vnc_handle) {
+    VNCClient* vnc = vnc_handle.get();
     LOG_INFO(LogCategory::VNC_CLIENT, "VNC thread started for {}", vnc->toString());
 
     // First connect, then run message loop
@@ -1669,7 +1670,7 @@ std::vector<std::string> editor_types =
 struct VNCData
 {
     flecs::entity vnc_stream;
-    VNCClient* client;  // Pointer to avoid copying non-copyable VNCClient
+    VNCClientHandle client;  // Stable handle that survives ECS moves
 };
 
 VNCData get_vnc_source(const std::string& host, int port) {
@@ -1677,46 +1678,46 @@ VNCData get_vnc_source(const std::string& host, int port) {
 
     // 1. Check if we already have this connection
     auto existing = world->lookup(addr.c_str());
-    if (existing && existing.has<VNCClient>()) {
-        existing.ensure<VNCClient>().reference_count++;
-        return {existing, &existing.ensure<VNCClient>()};
+    if (existing && existing.has<VNCClientHandle>()) {
+        auto& handle = existing.ensure<VNCClientHandle>();
+        handle->reference_count++;
+        return {existing, handle};
     }
 
-    // 2. Create VNCClient with async connection setup
-    VNCClient client_data;
-    client_data.host = host;
-    client_data.port = port;
-    client_data.reference_count = 1;
-    client_data.surfaceMutex = std::make_shared<std::mutex>();
-    client_data.dirtyRectQueue = std::make_shared<DirtyRectQueue>();
-    client_data.connectionState = VNCClient::CONNECTING;
+    // 2. Create VNCClient on heap with shared_ptr for thread safety
+    auto client_handle = std::make_shared<VNCClient>();
+    client_handle->host = host;
+    client_handle->port = port;
+    client_handle->reference_count = 1;
+    client_handle->surfaceMutex = std::make_shared<std::mutex>();
+    client_handle->dirtyRectQueue = std::make_shared<DirtyRectQueue>();
+    client_handle->connectionState = VNCClient::CONNECTING;
 
     // Create OpenGL texture (will be resized when connected)
-    glGenTextures(1, &client_data.vncTexture);
-    glBindTexture(GL_TEXTURE_2D, client_data.vncTexture);
+    glGenTextures(1, &client_handle->vncTexture);
+    glBindTexture(GL_TEXTURE_2D, client_handle->vncTexture);
     // Allocate empty texture initially (will resize when connected)
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1920, 1080, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 
     // Create PBO for async texture upload
-    glGenBuffers(1, &client_data.pbo);
-    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, client_data.pbo);
+    glGenBuffers(1, &client_handle->pbo);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, client_handle->pbo);
     glBufferData(GL_PIXEL_UNPACK_BUFFER, 1920 * 1080 * 4, nullptr, GL_STREAM_DRAW);
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
 
-    client_data.nvgHandle = nvglCreateImageFromHandleGL2(world->try_get<Graphics>()->vg,
-        client_data.vncTexture, 1920, 1080, 0);
+    client_handle->nvgHandle = nvglCreateImageFromHandleGL2(world->try_get<Graphics>()->vg,
+        client_handle->vncTexture, 1920, 1080, 0);
 
-    // Create entity BEFORE starting thread (move client_data)
-    flecs::entity created = world->entity(addr.c_str()).set<VNCClient>(std::move(client_data));
+    // Create entity with VNCClientHandle (shared_ptr stays stable)
+    flecs::entity created = world->entity(addr.c_str()).set<VNCClientHandle>(client_handle);
 
-    // Start network thread AFTER entity is created
-    VNCClient& vnc_ref = created.ensure<VNCClient>();
-    vnc_ref.threadShouldStop = false;
-    vnc_ref.messageThread = std::thread(vnc_message_thread, &vnc_ref);
+    // Start network thread with shared_ptr (thread keeps VNCClient alive)
+    client_handle->threadShouldStop = false;
+    client_handle->messageThread = std::thread(vnc_message_thread, client_handle);
 
-    return {created, &vnc_ref};
+    return {created, client_handle};
 }
 
 struct ScissorContainer {};
@@ -2645,9 +2646,9 @@ void drop_callback(GLFWwindow* window, int count, const char** paths)
 
     vnc_query.each([&](flecs::entity e, Position& pos, ImageRenderable& img) {
         flecs::entity vnc_entity = e.target<IsStreamingFrom>();
-        const VNCClient* vnc = vnc_entity.try_get<VNCClient>();
+        const VNCClientHandle* handle = vnc_entity.try_get<VNCClientHandle>();
 
-        if (vnc && vnc->eventPassthroughEnabled && vnc->connected) {
+        if (handle && *handle && (*handle)->eventPassthroughEnabled && (*handle)->connected) {
             target_vnc_entity = vnc_entity;
         }
     });
@@ -2662,11 +2663,12 @@ void drop_callback(GLFWwindow* window, int count, const char** paths)
 
     // 4. Initialize worker thread if first time
     if (!sftp.thread_running) {
-        const VNCClient* vnc = target_vnc_entity.try_get<VNCClient>();
-        if (!vnc) {
-            LOG_ERROR(LogCategory::SFTP, "VNC entity has no VNCClient component");
+        const VNCClientHandle* handle = target_vnc_entity.try_get<VNCClientHandle>();
+        if (!handle || !*handle) {
+            LOG_ERROR(LogCategory::SFTP, "VNC entity has no VNCClientHandle component");
             return;
         }
+        const VNCClient* vnc = handle->get();
 
         sftp.host = vnc->host;
         sftp.port = 23;
@@ -4372,6 +4374,15 @@ int main(int, char *[]) {
         return -1;
     }
 
+    // Initialize SDL for VNC texture creation
+    std::cout << "[SDL] Initializing SDL..." << std::endl;
+    if (SDL_Init(SDL_INIT_VIDEO) < 0) {
+        std::cerr << "[SDL ERROR] Failed to initialize: " << SDL_GetError() << std::endl;
+        glfwTerminate();
+        return -1;
+    }
+    std::cout << "[SDL] SDL initialized successfully" << std::endl;
+
     world->component<Position>()
     .member<float>("x")
     .member<float>("y");
@@ -6049,9 +6060,10 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
             queue.clear();
         });
 
-    auto vncInitSystem = world->system<VNCClient>()
+    auto vncInitSystem = world->system<VNCClientHandle>()
         .kind(flecs::PreUpdate)
-        .each([](flecs::iter& it, size_t i, VNCClient& vnc) {
+        .each([](flecs::iter& it, size_t i, VNCClientHandle& handle) {
+            VNCClient& vnc = *handle;
             if (!vnc.initialized && vnc.connected && vnc.client) {
                 SendFramebufferUpdateRequest(vnc.client, 0, 0, vnc.client->width, vnc.client->height, FALSE);
                 vnc.initialized = true;  // Mark as initialized to avoid repeated requests
@@ -6066,7 +6078,9 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
         .term_at(0).second<World>()
         .kind(flecs::PreUpdate)
         .each([&](flecs::entity e, Position& pos, ImageRenderable& img) {
-            VNCClient& vnc = e.target<IsStreamingFrom>().ensure<VNCClient>();
+            auto* handle = e.target<IsStreamingFrom>().try_get<VNCClientHandle>();
+            if (!handle || !*handle) return;
+            VNCClient& vnc = **handle;
             if (!vnc.connected || !vnc.client) return;
             // Get cursor state
             auto glfw_state = world->lookup("GLFWState");
@@ -6112,7 +6126,9 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
         .with<IsStreamingFrom>(flecs::Wildcard)
         .kind(flecs::PreUpdate)
         .each([&](flecs::entity e, ImageRenderable& img) {
-            VNCClient& vnc = e.target<IsStreamingFrom>().ensure<VNCClient>();
+            auto* handle = e.target<IsStreamingFrom>().try_get<VNCClientHandle>();
+            if (!handle || !*handle) return;
+            VNCClient& vnc = **handle;
             if (!vnc.connected || !vnc.client) return;
             e.target<ActiveIndicator>().ensure<RenderStatus>().visible = vnc.eventPassthroughEnabled;
         });
@@ -6234,9 +6250,10 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
         }
     });
 
-    auto vncTextureUpdateSystem = world->system<VNCClient>()
+    auto vncTextureUpdateSystem = world->system<VNCClientHandle>()
         .kind(flecs::OnUpdate)
-        .each([&](flecs::entity e, VNCClient& vnc) {
+        .each([&](flecs::entity e, VNCClientHandle& handle) {
+            VNCClient& vnc = *handle;
             if (!vnc.connected || !vnc.client) {
                 return;
             }
@@ -6457,9 +6474,10 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
         });
 
     // VNC cleanup system - handles thread lifecycle and resource cleanup
-    auto vncCleanupSystem = world->system<VNCClient>()
+    auto vncCleanupSystem = world->system<VNCClientHandle>()
         .kind(flecs::OnUpdate)
-        .each([](flecs::entity e, VNCClient& vnc) {
+        .each([](flecs::entity e, VNCClientHandle& handle) {
+            VNCClient& vnc = *handle;
             // Handle connection state transitions
             switch (vnc.connectionState.load()) {
                 case VNCClient::CONNECTING:
@@ -6530,7 +6548,9 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
         .with<IsStreamingFrom>(flecs::Wildcard)
         .each([&](flecs::entity e, X11Container& container, Position& localPos, ImageRenderable& img) {
             flecs::entity vnc_entity = e.target<IsStreamingFrom>();
-            VNCClient& vnc = vnc_entity.ensure<VNCClient>();
+            auto* handle = vnc_entity.try_get<VNCClientHandle>();
+            if (!handle || !*handle) return;
+            VNCClient& vnc = **handle;
             if (!vnc.connected || !vnc.client) return;
 
             // TODO: Query to determine what VNC Streams that there are that are visible in Editor VNCStream type

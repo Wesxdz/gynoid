@@ -173,5 +173,9 @@ struct VNCClient {
     }
 };
 
+// Stable handle to VNCClient that survives ECS component moves
+// Use this as the ECS component instead of VNCClient directly
+using VNCClientHandle = std::shared_ptr<VNCClient>;
+
 struct IsStreamingFrom {};
 struct ActiveIndicator {};
