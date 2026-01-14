@@ -13,6 +13,7 @@ enum class LogCategory {
     OCR_STREAM,
     OCR_RENDER,
     SERVER_LAUNCHER,
+    NATURAL_LANGUAGE_GRAPH_PARSER,
     X11_OUTLINE,
     BLENDER_PANEL,
     VNC_CLIENT,
@@ -36,6 +37,7 @@ private:
         category_names[LogCategory::OCR_STREAM] = "OCR_STREAM";
         category_names[LogCategory::OCR_RENDER] = "OCR_RENDER";
         category_names[LogCategory::SERVER_LAUNCHER] = "SERVER_LAUNCHER";
+        category_names[LogCategory::SERVER_LAUNCHER] = "NATURAL_LANGUAGE_GRAPH_PARSER";
         category_names[LogCategory::X11_OUTLINE] = "X11_OUTLINE";
         category_names[LogCategory::BLENDER_PANEL] = "BLENDER_PANEL";
         category_names[LogCategory::VNC_CLIENT] = "VNC_CLIENT";
@@ -58,7 +60,7 @@ private:
             // Default: only enable important categories
             if (false) {
                 logger->set_level(spdlog::level::debug);
-            } else if (pair.first == LogCategory::SFTP) {
+            } else if (pair.first == LogCategory::NATURAL_LANGUAGE_GRAPH_PARSER) {
                 logger->set_level(spdlog::level::info);
             } else {
                 logger->set_level(spdlog::level::off);

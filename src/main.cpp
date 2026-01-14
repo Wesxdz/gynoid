@@ -612,6 +612,22 @@ struct PendingInterpretation {
 std::mutex pending_interpretations_mutex;
 std::vector<std::shared_ptr<PendingInterpretation>> pending_interpretations;
 
+// Known entities from previous interpretations (for context/binding)
+struct KnownEntity {
+    std::string id;
+    std::string label;
+    std::string color;  // Hex color string
+    int display_number;  // The MNIST digit number for this entity
+};
+std::mutex known_entities_mutex;
+std::vector<KnownEntity> known_entities;
+int next_entity_number = 1;  // Global counter for entity display numbers
+
+// Previous sentences for context (last N sentences)
+std::mutex previous_sentences_mutex;
+std::vector<std::string> previous_sentences;
+const int MAX_PREVIOUS_SENTENCES = 10;  // Keep last N sentences for context
+
 // Particle animation for grid triangles - moving with velocity to collide at target
 struct TriangleParticle {
     float targetX, targetY, targetZ;  // Final grid position (collision point)
@@ -677,12 +693,12 @@ enum class EditorType
 {
     Void,
     PeachCore,
+    ImaginaryInterlocutor,
     VNCStream,
     Healthbar,
     // Respawn,
     // Genome,
     Embodiment,
-    LanguageGame,
     Vision,
     Hearing,
     Memory,
@@ -1454,23 +1470,72 @@ void draw_double_arrow(NVGcontext* vg, const RenderCommand* cmd, const CustomRen
     }
 }
 
+// Forward declaration for vector-based version
+flecs::entity create_badge_impl(flecs::entity parent, flecs::entity UIElement,
+                           const char* text, uint32_t base_color,
+                           bool is_capsule, bool is_double_arrow,
+                           const std::vector<std::string>& prefix_ids,
+                           const std::vector<uint32_t>& prefix_tints,
+                           const std::vector<std::string>& postfix_ids,
+                           const std::vector<uint32_t>& postfix_tints);
+
+// Backward-compatible overload with single prefix/postfix
 flecs::entity create_badge(flecs::entity parent, flecs::entity UIElement,
                            const char* text, uint32_t base_color,
-                           bool is_capsule = false, bool is_double_arrow = false, std::string postfix_symbol = "", std::string prefix_symbol = "", uint32_t prefix_tint = 0, uint32_t postfix_tint = 0) {
-    
+                           bool is_capsule = false, bool is_double_arrow = false,
+                           std::string postfix_symbol = "", std::string prefix_symbol = "",
+                           uint32_t prefix_tint = 0, uint32_t postfix_tint = 0) {
+    std::vector<std::string> prefix_ids;
+    std::vector<uint32_t> prefix_tints;
+    std::vector<std::string> postfix_ids;
+    std::vector<uint32_t> postfix_tints;
+
+    if (!prefix_symbol.empty()) {
+        prefix_ids.push_back(prefix_symbol);
+        prefix_tints.push_back(prefix_tint);
+    }
+    if (!postfix_symbol.empty()) {
+        postfix_ids.push_back(postfix_symbol);
+        postfix_tints.push_back(postfix_tint);
+    }
+
+    return create_badge_impl(parent, UIElement, text, base_color, is_capsule, is_double_arrow,
+                             prefix_ids, prefix_tints, postfix_ids, postfix_tints);
+}
+
+// Vector-based version for sets of sources/targets
+flecs::entity create_badge(flecs::entity parent, flecs::entity UIElement,
+                           const char* text, uint32_t base_color,
+                           bool is_capsule, bool is_double_arrow,
+                           const std::vector<std::string>& prefix_ids,
+                           const std::vector<uint32_t>& prefix_tints,
+                           const std::vector<std::string>& postfix_ids,
+                           const std::vector<uint32_t>& postfix_tints) {
+    return create_badge_impl(parent, UIElement, text, base_color, is_capsule, is_double_arrow,
+                             prefix_ids, prefix_tints, postfix_ids, postfix_tints);
+}
+
+flecs::entity create_badge_impl(flecs::entity parent, flecs::entity UIElement,
+                           const char* text, uint32_t base_color,
+                           bool is_capsule, bool is_double_arrow,
+                           const std::vector<std::string>& prefix_ids,
+                           const std::vector<uint32_t>& prefix_tints,
+                           const std::vector<std::string>& postfix_ids,
+                           const std::vector<uint32_t>& postfix_tints) {
+
     // --- 1. Color Logic (matching comp_gen.py) ---
     uint32_t dark = base_color;
     uint32_t very_dark = scale_color(base_color, 0.2f);
     uint32_t light = scale_color(base_color, 1.3f); // Clamped to 255 in scale_color
     uint32_t white = 0xFFFFFFFF;
-    
+
     // Outline: Light variation with 50% alpha (128)
-    uint32_t outline_color = (light & 0xFFFFFF00) | 0x80; 
+    uint32_t outline_color = (light & 0xFFFFFF00) | 0x80;
 
     // --- 2. Dimensions & Shape ---
     float corner_radius = 4.0f;
     float badge_height = 25.0f; // Base height
-    
+
     if (is_capsule) {
         corner_radius = badge_height / 2.0f;
     }
@@ -1479,7 +1544,7 @@ flecs::entity create_badge(flecs::entity parent, flecs::entity UIElement,
 
     flecs::entity badge = flecs::entity::null();
 
-    int xPad = 6.0f;
+    float xPad = 6.0f;
 
     if (is_double_arrow)
     {
@@ -1493,7 +1558,7 @@ flecs::entity create_badge(flecs::entity parent, flecs::entity UIElement,
             .set<ZIndex>({20});
 
     } else
-    {        
+    {
         badge = world->entity()
             .is_a(UIElement)
             .child_of(parent)
@@ -1501,7 +1566,7 @@ flecs::entity create_badge(flecs::entity parent, flecs::entity UIElement,
             .set<RenderGradient>({dark, very_dark}) // Vertical gradient
             .set<UIContainer>({xPad, 3})
             .set<ZIndex>({20});
-    
+
         // Outline Overlay
         world->entity()
             .is_a(UIElement)
@@ -1511,37 +1576,71 @@ flecs::entity create_badge(flecs::entity parent, flecs::entity UIElement,
             .set<ZIndex>({22});
     }
 
-    flecs::entity badge_text_parent = badge;
-    if (postfix_symbol.length() > 0)
-    {
-        auto badge_content = world->entity()
-        .is_a(UIElement)
-        .set<HorizontalLayoutBox>({0.0f, 0.0f})
-        .set<Position, Local>({xPad, 0.0f}) // reduce Y spacing for MNIST
-        .add(flecs::OrderedChildren)
-        // .add<DebugRenderBounds>()
-        .child_of(badge);
-        
-        badge_text_parent = badge_content;
-    }
-
-    if (prefix_symbol.length() > 0)
-    {
-        uint32_t light_src = scale_color(prefix_tint, 1.3f);
-        unsigned char r = (light_src >> 24) & 0xFF;
-        unsigned char g = (light_src >> 16) & 0xFF;
-        unsigned char b = (light_src >> 8) & 0xFF;
-        unsigned char a = (light_src) & 0xFF;
-        NVGcolor color = nvgRGBA(r, g, b, a);
+    // Helper lambda to create MNIST digit with tint
+    auto create_mnist_digit = [&](flecs::entity parent_entity, const std::string& digit, uint32_t tint) {
+        uint32_t tint_color = scale_color(tint, 1.3f);
+        unsigned char r = (tint_color >> 24) & 0xFF;
+        unsigned char g = (tint_color >> 16) & 0xFF;
+        unsigned char b = (tint_color >> 8) & 0xFF;
+        unsigned char a = (tint_color) & 0xFF;
 
         world->entity()
-        .is_a(UIElement)
-        .child_of(badge_text_parent)
-        .set<ImageCreator>({"../assets/mnist/set_0/" + prefix_symbol + ".png", 0.9f, 0.9f, nvgRGBA(r, g, b, a)})
-        .set<ZIndex>({25});
+            .is_a(UIElement)
+            .child_of(parent_entity)
+            .set<ImageCreator>({"../assets/mnist/set_0/" + digit + ".png", 0.9f, 0.9f, nvgRGBA(r, g, b, a)})
+            .set<ZIndex>({25});
+    };
 
+    // Helper lambda to create text element
+    auto create_text_element = [&](flecs::entity parent_entity, const char* txt, uint32_t color_val) {
+        world->entity()
+            .is_a(UIElement)
+            .child_of(parent_entity)
+            .set<Position, Local>({0.0f, 6.0f})
+            .set<TextRenderable>({txt, "Inter", 16.0f, color_val})
+            .set<ZIndex>({25});
+    };
+
+    // Helper to render a set of IDs with optional curly braces
+    auto render_id_set = [&](flecs::entity parent_entity, const std::vector<std::string>& ids, const std::vector<uint32_t>& tints) {
+        if (ids.empty()) return;
+
+        bool is_set = ids.size() > 1;
+
+        if (is_set) {
+            create_text_element(parent_entity, " {", white);
+        }
+
+        for (size_t i = 0; i < ids.size(); i++) {
+            if (i > 0) {
+                create_text_element(parent_entity, ",", white);
+            }
+            uint32_t tint = (i < tints.size()) ? tints[i] : 0x888888ff;
+            create_mnist_digit(parent_entity, ids[i], tint);
+        }
+
+        if (is_set) {
+            create_text_element(parent_entity, "} ", white);
+        }
+    };
+
+    // Create content container if we have prefix or postfix
+    flecs::entity badge_text_parent = badge;
+    if (!prefix_ids.empty() || !postfix_ids.empty())
+    {
+        auto badge_content = world->entity()
+            .is_a(UIElement)
+            .set<HorizontalLayoutBox>({0.0f, 0.0f})
+            .set<Position, Local>({xPad, 0.0f})
+            .add(flecs::OrderedChildren)
+            .child_of(badge);
+
+        badge_text_parent = badge_content;
         badge.set<UIContainer>({xPad, 0});
     }
+
+    // Render prefix IDs (sources)
+    render_id_set(badge_text_parent, prefix_ids, prefix_tints);
 
     // Text with Gradient
     world->entity()
@@ -1549,26 +1648,11 @@ flecs::entity create_badge(flecs::entity parent, flecs::entity UIElement,
         .child_of(badge_text_parent)
         .set<Position, Local>({xPad, 6.0f})
         .set<TextRenderable>({text, "Inter", 16.0f, white, 1.2f})
-        .set<RenderGradient>({white, light})   // Apply gradient to text
+        .set<RenderGradient>({white, light})
         .set<ZIndex>({25});
 
-    if (postfix_symbol.length() > 0)
-    {
-        // Use postfix_tint if provided, otherwise fall back to light color from base_color
-        uint32_t tint_color = postfix_tint != 0 ? scale_color(postfix_tint, 1.3f) : light;
-        unsigned char r = (tint_color >> 24) & 0xFF;
-        unsigned char g = (tint_color >> 16) & 0xFF;
-        unsigned char b = (tint_color >> 8) & 0xFF;
-        unsigned char a = (tint_color) & 0xFF;
-
-        world->entity()
-        .is_a(UIElement)
-        .child_of(badge_text_parent)
-        .set<ImageCreator>({"../assets/mnist/set_0/" + postfix_symbol + ".png", 0.9f, 0.9f, nvgRGBA(r, g, b, a)})
-        .set<ZIndex>({25});
-
-        badge.set<UIContainer>({xPad, 0});
-    }
+    // Render postfix IDs (targets)
+    render_id_set(badge_text_parent, postfix_ids, postfix_tints);
 
     return badge;
 }
@@ -1669,11 +1753,11 @@ std::vector<std::string> editor_types =
     "Void",
     // "ECS Graph", // Entity component relationship
     "Peach Core",
+    "Interlocutor", // Queue or Stream
     "VNC Stream",
     "Healthbar",
     // "Gynoid",
     "Embodiment",
-    "Language Game", // Queue or Stream
     "Vision",
     "Hearing",
     "Memory",
@@ -2031,7 +2115,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         create_badge(badges, UIElement, "Physical", 0x619393ff);
         
     }
-    else if (editor_type == EditorType::LanguageGame)
+    else if (editor_type == EditorType::ImaginaryInterlocutor)
     {
         auto canvas = leaf.target<EditorCanvas>();
 
@@ -3176,7 +3260,44 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                         pending_interpretations.push_back(pending);
                     }
 
-                    std::thread([pending]() {
+                    // Capture known entities for context
+                    std::string context_json;
+                    {
+                        std::lock_guard<std::mutex> lock(known_entities_mutex);
+                        json entities_array = json::array();
+                        for (const auto& entity : known_entities) {
+                            entities_array.push_back({
+                                {"id", entity.id},
+                                {"label", entity.label},
+                                {"color", entity.color},
+                                {"display_number", entity.display_number}
+                            });
+                        }
+                        context_json = entities_array.dump();
+                    }
+
+                    // Capture previous sentences for context
+                    std::string sentences_json;
+                    {
+                        std::lock_guard<std::mutex> lock(previous_sentences_mutex);
+                        json sentences_array = json::array();
+                        for (const auto& sentence : previous_sentences) {
+                            sentences_array.push_back(sentence);
+                        }
+                        sentences_json = sentences_array.dump();
+                    }
+
+                    // Add current sentence to previous sentences
+                    {
+                        std::lock_guard<std::mutex> lock(previous_sentences_mutex);
+                        previous_sentences.push_back(pending->draft);
+                        // Keep only the last N sentences
+                        while (previous_sentences.size() > MAX_PREVIOUS_SENTENCES) {
+                            previous_sentences.erase(previous_sentences.begin());
+                        }
+                    }
+
+                    std::thread([pending, context_json, sentences_json]() {
                         // Escape the draft for shell
                         std::string escaped_draft;
                         for (char c : pending->draft) {
@@ -3186,7 +3307,25 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                             escaped_draft += c;
                         }
 
-                        std::string cmd = "python3 ../scripts/interpretation.py \"" + escaped_draft + "\" 2>&1";
+                        // Escape the context JSON for shell
+                        std::string escaped_context;
+                        for (char c : context_json) {
+                            if (c == '\'' || c == '\\' || c == '"' || c == '$' || c == '`') {
+                                escaped_context += '\\';
+                            }
+                            escaped_context += c;
+                        }
+
+                        // Escape the sentences JSON for shell
+                        std::string escaped_sentences;
+                        for (char c : sentences_json) {
+                            if (c == '\'' || c == '\\' || c == '"' || c == '$' || c == '`') {
+                                escaped_sentences += '\\';
+                            }
+                            escaped_sentences += c;
+                        }
+
+                        std::string cmd = "python3 ../scripts/interpretation.py \"" + escaped_draft + "\" \"" + escaped_context + "\" \"" + escaped_sentences + "\" 2>&1";
                         FILE* pipe = popen(cmd.c_str(), "r");
                         if (pipe) {
                             char buffer[4096];
@@ -6708,12 +6847,14 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
                         // Build a map of word indices to node/edge info
                         struct Annotation {
                             std::string label;
-                            std::string id;  // postfix_symbol (node number or target number)
                             uint32_t color;
                             bool is_relationship;
-                            std::string prefix_symbol;
-                            uint32_t prefix_tint;
-                            uint32_t postfix_tint;
+                            bool is_binding;  // True if this binds to an existing entity
+                            // For relationships: vectors of source/target IDs and colors
+                            std::vector<std::string> prefix_ids;   // Source node numbers (for relationships) or empty
+                            std::vector<uint32_t> prefix_tints;    // Source node colors
+                            std::vector<std::string> postfix_ids;  // Target node numbers (for relationships) or node's own number
+                            std::vector<uint32_t> postfix_tints;   // Target node colors or node's own color
                             int end_idx;  // End index of this annotation span
                         };
                         std::map<int, Annotation> start_annotations;
@@ -6742,30 +6883,84 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
 
                         std::map<std::string, uint32_t> node_colors;
                         std::map<std::string, std::string> node_numbers;  // Map node ID to its display number
+                        std::vector<KnownEntity> new_entities;  // New entities to add after processing
+
                         if (result.contains("nodes")) {
-                            int node_num = 1;
                             for (auto& node : result["nodes"]) {
                                 std::string id = node["id"].get<std::string>();
                                 std::string label = node["label"].get<std::string>();
                                 int start_idx = node["start_index"].get<int>();
                                 int end_idx = node["end_index"].get<int>();
+                                bool is_new = node.value("is_new", true);
+                                std::string binds_to = node.value("binds_to", "");
 
-                                // Use semantic color from API if available, otherwise hash
                                 uint32_t color;
-                                if (node.contains("color")) {
-                                    try {
-                                        color = parse_hex_color(node["color"].get<std::string>());
-                                    } catch (...) {
+                                std::string display_num;
+                                bool is_binding = false;
+                                std::string color_hex;
+
+                                if (!is_new && !binds_to.empty()) {
+                                    // This is a binding to an existing entity
+                                    is_binding = true;
+                                    std::lock_guard<std::mutex> lock(known_entities_mutex);
+                                    for (const auto& known : known_entities) {
+                                        if (known.id == binds_to) {
+                                            color = parse_hex_color(known.color);
+                                            display_num = std::to_string(known.display_number);
+                                            color_hex = known.color;
+                                            break;
+                                        }
+                                    }
+                                    // Fallback if binding target not found
+                                    if (display_num.empty()) {
                                         color = hash_color(id);
+                                        display_num = "?";
                                     }
                                 } else {
-                                    color = hash_color(id);
-                                }
-                                node_colors[id] = color;
-                                node_numbers[id] = std::to_string(node_num);
+                                    // This is a new entity
+                                    if (node.contains("color")) {
+                                        try {
+                                            color_hex = node["color"].get<std::string>();
+                                            color = parse_hex_color(color_hex);
+                                        } catch (...) {
+                                            color = hash_color(id);
+                                            // Convert hash color back to hex for storage
+                                            std::stringstream ss;
+                                            ss << std::hex << ((color >> 8) & 0xFFFFFF);
+                                            color_hex = ss.str();
+                                        }
+                                    } else {
+                                        color = hash_color(id);
+                                        std::stringstream ss;
+                                        ss << std::hex << ((color >> 8) & 0xFFFFFF);
+                                        color_hex = ss.str();
+                                    }
 
-                                start_annotations[start_idx] = {label, std::to_string(node_num), color, false, "", 0, color, end_idx};
-                                node_num++;
+                                    // Assign new display number
+                                    int assigned_num;
+                                    {
+                                        std::lock_guard<std::mutex> lock(known_entities_mutex);
+                                        assigned_num = next_entity_number++;
+                                    }
+                                    display_num = std::to_string(assigned_num);
+
+                                    // Queue this entity to be added to known entities
+                                    new_entities.push_back({id, label, color_hex, assigned_num});
+                                }
+
+                                node_colors[id] = color;
+                                node_numbers[id] = display_num;
+
+                                // For nodes: no prefix, single postfix with the node's number
+                                start_annotations[start_idx] = {label, color, false, is_binding, {}, {}, {display_num}, {color}, end_idx};
+                            }
+                        }
+
+                        // Add new entities to the global known entities list
+                        {
+                            std::lock_guard<std::mutex> lock(known_entities_mutex);
+                            for (const auto& entity : new_entities) {
+                                known_entities.push_back(entity);
                             }
                         }
 
@@ -6775,8 +6970,6 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
                                 bool in_situ = edge.value("in-situ", false);
                                 if (in_situ && edge.contains("start_index")) {
                                     std::string rel = edge["relationship"].get<std::string>();
-                                    std::string source = edge["source"].get<std::string>();
-                                    std::string target = edge["target"].get<std::string>();
                                     int start_idx = edge["start_index"].get<int>();
                                     int end_idx = edge["end_index"].get<int>();
 
@@ -6791,14 +6984,30 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
                                     } else {
                                         color = 0xad734bff;
                                     }
-                                    uint32_t source_color = node_colors.count(source) ? node_colors[source] : 0x888888ff;
-                                    uint32_t target_color = node_colors.count(target) ? node_colors[target] : 0x888888ff;
-                                    // Use source node's number for the MNIST prefix image
-                                    std::string source_num = node_numbers.count(source) ? node_numbers[source] : "";
-                                    // Use target node's number for the MNIST postfix image
-                                    std::string target_num = node_numbers.count(target) ? node_numbers[target] : "";
 
-                                    start_annotations[start_idx] = {rel, target_num, color, true, source_num, source_color, target_color, end_idx};
+                                    // Collect source IDs and colors (now an array)
+                                    std::vector<std::string> source_nums;
+                                    std::vector<uint32_t> source_colors;
+                                    if (edge.contains("sources")) {
+                                        for (const auto& src : edge["sources"]) {
+                                            std::string source = src.get<std::string>();
+                                            source_nums.push_back(node_numbers.count(source) ? node_numbers[source] : "?");
+                                            source_colors.push_back(node_colors.count(source) ? node_colors[source] : 0x888888ff);
+                                        }
+                                    }
+
+                                    // Collect target IDs and colors (now an array)
+                                    std::vector<std::string> target_nums;
+                                    std::vector<uint32_t> target_colors;
+                                    if (edge.contains("targets")) {
+                                        for (const auto& tgt : edge["targets"]) {
+                                            std::string target = tgt.get<std::string>();
+                                            target_nums.push_back(node_numbers.count(target) ? node_numbers[target] : "?");
+                                            target_colors.push_back(node_colors.count(target) ? node_colors[target] : 0x888888ff);
+                                        }
+                                    }
+
+                                    start_annotations[start_idx] = {rel, color, true, false, source_nums, source_colors, target_nums, target_colors, end_idx};
                                 }
                             }
                         }
@@ -6829,7 +7038,8 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
                                 auto& ann = start_annotations[i];
                                 create_badge(meta_response_data, UIElement, ann.label.c_str(),
                                            ann.color, false, ann.is_relationship,
-                                           ann.id, ann.prefix_symbol, ann.prefix_tint, ann.postfix_tint);
+                                           ann.prefix_ids, ann.prefix_tints,
+                                           ann.postfix_ids, ann.postfix_tints);
 
                                 // Skip all words covered by this annotation (start_idx to end_idx inclusive)
                                 i = ann.end_idx + 1;

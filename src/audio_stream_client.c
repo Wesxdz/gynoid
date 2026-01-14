@@ -53,7 +53,7 @@ void frame_callback(unsigned char* image_data, int width, int height, void* user
         g_prev_height = height;
 
         if (g_frame_count % 100 == 0) {
-            printf("[CLIENT] Frame %d: Sent full %dx%d image\n", g_frame_count, width, height);
+            // printf("[CLIENT] Frame %d: Sent full %dx%d image\n", g_frame_count, width, height);
         }
         return;
     }
@@ -95,7 +95,7 @@ check_rightmost:
         memcpy(g_prev_image, image_data, width * height * 3);
 
         if (g_frame_count % 100 == 0) {
-            printf("[CLIENT] Frame %d: Sent scrolled full image\n", g_frame_count);
+            // printf("[CLIENT] Frame %d: Sent scrolled full image\n", g_frame_count);
         }
         return;
     }
