@@ -22,14 +22,16 @@ def extract_knowledge_graph(text, known_entities=None, previous_sentences=None):
     tools = [
         {
             "name": "natural_language_to_graph_parser",
-            "description": 
-            """Extract entities with word-index grounding. 
-            For entities that match known entities from context, use 'binds_to' to reference them. 
-            Most often, use the exact words from the sentence for the label. 
-            Do not change the root word in a way that would make the in-situ sentence labeling change in meaning (that includes pronouns, keep them the same word). 
-            For new entities, set 'is_new' to true. 
+            "description":
+            """Extract entities with word-index grounding.
+            For entities that match known entities from context, use 'binds_to' to reference them.
+            Most often, use the exact words from the sentence for the label.
+            Do not change the root word in a way that would make the in-situ sentence labeling change in meaning (that includes pronouns, keep them the same word).
+            For new entities, set 'is_new' to true.
             Assign semantically relevant colors to NEW entities (e.g., green for plants/nature, brown for earth/wood, blue for water/sky, red for danger/fire, grey for stone/metal, etc.).
-            
+
+            IMPORTANT: Do NOT create nodes for indefinite pronouns like 'someone', 'somebody', 'something', 'anyone', 'anything', 'everyone', 'everything', 'no one', 'nothing'. These are not specific entities. Instead, use '*' (wildcard) directly in the edge sources/targets array when these words appear as subjects or objects of relationships.
+
             """,
             
             "input_schema": {
@@ -59,12 +61,12 @@ def extract_knowledge_graph(text, known_entities=None, previous_sentences=None):
                                 "sources": {
                                     "type": "array",
                                     "items": {"type": "string"},
-                                    "description": "Array of source node IDs. Use multiple sources when entities are grouped (e.g., 'The goblin and orc attack' -> sources: ['goblin', 'orc'])"
+                                    "description": "Array of source node IDs. Use multiple sources when entities are grouped (e.g., 'The goblin and orc attack' -> sources: ['goblin', 'orc']). Use '*' (wildcard) when the source is unknown, unspecified, or intentionally left open for later binding (e.g., 'attacks the knight' with no subject -> sources: ['*']). Also use '*' for indefinite pronouns like 'someone', 'somebody', 'something', 'anyone', 'anything' that refer to an unspecified entity."
                                 },
                                 "targets": {
                                     "type": "array",
                                     "items": {"type": "string"},
-                                    "description": "Array of target node IDs. Use multiple targets when entities are grouped (e.g., 'attacks the knight and wizard' -> targets: ['knight', 'wizard'])"
+                                    "description": "Array of target node IDs. Use multiple targets when entities are grouped (e.g., 'attacks the knight and wizard' -> targets: ['knight', 'wizard']). Use '*' (wildcard) when the target is unknown, unspecified, or intentionally left open for later binding (e.g., 'The goblin attacks' with no object -> targets: ['*']). Also use '*' for indefinite pronouns like 'someone', 'somebody', 'something', 'anyone', 'anything' that refer to an unspecified entity."
                                 },
                                 "relationship": {"type": "string"},
                                 "color": {"type": "string", "description": "A hex color code for this relationship. Choose colors that evoke the nature of the relationship (e.g., warm colors for proximity, cool colors for distance)."},

@@ -1577,17 +1577,27 @@ flecs::entity create_badge_impl(flecs::entity parent, flecs::entity UIElement,
     }
 
     // Helper lambda to create MNIST digit with tint
-    auto create_mnist_digit = [&](flecs::entity parent_entity, const std::string& digit, uint32_t tint) {
+    // Helper lambda to create MNIST digit or wildcard image
+    auto create_slot_image = [&](flecs::entity parent_entity, const std::string& symbol, uint32_t tint) {
         uint32_t tint_color = scale_color(tint, 1.3f);
         unsigned char r = (tint_color >> 24) & 0xFF;
         unsigned char g = (tint_color >> 16) & 0xFF;
         unsigned char b = (tint_color >> 8) & 0xFF;
         unsigned char a = (tint_color) & 0xFF;
 
+        std::string image_path;
+        if (symbol == "*") {
+            // Wildcard - use wildcard.png
+            image_path = "../assets/wildcard.png";
+        } else {
+            // Standard MNIST digit
+            image_path = "../assets/mnist/set_0/" + symbol + ".png";
+        }
+
         world->entity()
             .is_a(UIElement)
             .child_of(parent_entity)
-            .set<ImageCreator>({"../assets/mnist/set_0/" + digit + ".png", 0.9f, 0.9f, nvgRGBA(r, g, b, a)})
+            .set<ImageCreator>({image_path, 0.9f, 0.9f, nvgRGBA(r, g, b, a)})
             .set<ZIndex>({25});
     };
 
@@ -1616,7 +1626,7 @@ flecs::entity create_badge_impl(flecs::entity parent, flecs::entity UIElement,
                 create_text_element(parent_entity, ",", white);
             }
             uint32_t tint = (i < tints.size()) ? tints[i] : 0x888888ff;
-            create_mnist_digit(parent_entity, ids[i], tint);
+            create_slot_image(parent_entity, ids[i], tint);
         }
 
         if (is_set) {
@@ -6844,6 +6854,13 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
                             words.push_back(word);
                         }
 
+                        // Binding type for relationship slots
+                        enum class SlotBindingType {
+                            Standard,  // Single bound entity
+                            Set,       // Multiple bound entities
+                            Wildcard   // Unbound/intensional slot
+                        };
+
                         // Build a map of word indices to node/edge info
                         struct Annotation {
                             std::string label;
@@ -6855,9 +6872,19 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
                             std::vector<uint32_t> prefix_tints;    // Source node colors
                             std::vector<std::string> postfix_ids;  // Target node numbers (for relationships) or node's own number
                             std::vector<uint32_t> postfix_tints;   // Target node colors or node's own color
+                            SlotBindingType prefix_type;   // Type of source binding
+                            SlotBindingType postfix_type;  // Type of target binding
                             int end_idx;  // End index of this annotation span
                         };
                         std::map<int, Annotation> start_annotations;
+
+                        // Helper to determine slot binding type
+                        auto get_slot_type = [](const std::vector<std::string>& ids) -> SlotBindingType {
+                            if (ids.empty()) return SlotBindingType::Standard;
+                            if (ids.size() == 1 && ids[0] == "*") return SlotBindingType::Wildcard;
+                            if (ids.size() > 1) return SlotBindingType::Set;
+                            return SlotBindingType::Standard;
+                        };
 
                         // Parse hex color string to uint32_t with alpha
                         auto parse_hex_color = [](const std::string& hex) -> uint32_t {
@@ -6952,7 +6979,7 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
                                 node_numbers[id] = display_num;
 
                                 // For nodes: no prefix, single postfix with the node's number
-                                start_annotations[start_idx] = {label, color, false, is_binding, {}, {}, {display_num}, {color}, end_idx};
+                                start_annotations[start_idx] = {label, color, false, is_binding, {}, {}, {display_num}, {color}, SlotBindingType::Standard, SlotBindingType::Standard, end_idx};
                             }
                         }
 
@@ -6985,14 +7012,23 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
                                         color = 0xad734bff;
                                     }
 
+                                    // Wildcard color - muted purple/gray for unbound slots
+                                    const uint32_t WILDCARD_COLOR = 0x8866aaff;
+
                                     // Collect source IDs and colors (now an array)
                                     std::vector<std::string> source_nums;
                                     std::vector<uint32_t> source_colors;
                                     if (edge.contains("sources")) {
                                         for (const auto& src : edge["sources"]) {
                                             std::string source = src.get<std::string>();
-                                            source_nums.push_back(node_numbers.count(source) ? node_numbers[source] : "?");
-                                            source_colors.push_back(node_colors.count(source) ? node_colors[source] : 0x888888ff);
+                                            if (source == "*") {
+                                                // Wildcard - unbound slot
+                                                source_nums.push_back("*");
+                                                source_colors.push_back(WILDCARD_COLOR);
+                                            } else {
+                                                source_nums.push_back(node_numbers.count(source) ? node_numbers[source] : "?");
+                                                source_colors.push_back(node_colors.count(source) ? node_colors[source] : 0x888888ff);
+                                            }
                                         }
                                     }
 
@@ -7002,12 +7038,22 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
                                     if (edge.contains("targets")) {
                                         for (const auto& tgt : edge["targets"]) {
                                             std::string target = tgt.get<std::string>();
-                                            target_nums.push_back(node_numbers.count(target) ? node_numbers[target] : "?");
-                                            target_colors.push_back(node_colors.count(target) ? node_colors[target] : 0x888888ff);
+                                            if (target == "*") {
+                                                // Wildcard - unbound slot
+                                                target_nums.push_back("*");
+                                                target_colors.push_back(WILDCARD_COLOR);
+                                            } else {
+                                                target_nums.push_back(node_numbers.count(target) ? node_numbers[target] : "?");
+                                                target_colors.push_back(node_colors.count(target) ? node_colors[target] : 0x888888ff);
+                                            }
                                         }
                                     }
 
-                                    start_annotations[start_idx] = {rel, color, true, false, source_nums, source_colors, target_nums, target_colors, end_idx};
+                                    // Determine binding types
+                                    SlotBindingType src_type = get_slot_type(source_nums);
+                                    SlotBindingType tgt_type = get_slot_type(target_nums);
+
+                                    start_annotations[start_idx] = {rel, color, true, false, source_nums, source_colors, target_nums, target_colors, src_type, tgt_type, end_idx};
                                 }
                             }
                         }
