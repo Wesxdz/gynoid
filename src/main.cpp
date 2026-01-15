@@ -28,6 +28,8 @@
 
 #include <ctime>
 #include <chrono>
+#include <sys/socket.h>
+#include <sys/un.h>
 
 // LibVNC
 #include <rfb/rfbclient.h>
@@ -633,12 +635,103 @@ struct SentenceToken {
     int binding_digit;  // -1 for unassigned, 0-9 for MNIST digit (entities)
     int source_digit;   // -1 for wildcard, 0-9 for MNIST digit (relationships)
     int target_digit;   // -1 for wildcard, 0-9 for MNIST digit (relationships)
+    int reified_digit;  // -1 for not reified, 0-9 for reified relationship entity
     TokenType type;
 
     bool is_binding() const { return type != TokenType::PlainText; }
     // For selection: relationships have 3 selectable parts (source, rel, target)
-    int selection_width() const { return type == TokenType::Relationship ? 3 : 1; }
+    // Reified indicator is inside badge but not separately selectable
+    int selection_width() const {
+        return type == TokenType::Relationship ? 3 : 1;
+    }
 };
+
+// Cache for entity colors (binding_digit -> color)
+std::map<int, uint32_t> entity_color_cache;
+
+// Get color via Unix socket to persistent Python server (fast after first call)
+uint32_t get_entity_color(int binding_digit, const std::string& entity_text) {
+    // Check cache first
+    auto it = entity_color_cache.find(binding_digit);
+    if (it != entity_color_cache.end()) {
+        return it->second;
+    }
+
+    // Build list of taken colors
+    std::string taken_json = "[";
+    bool first = true;
+    for (const auto& [id, color] : entity_color_cache) {
+        if (!first) taken_json += ",";
+        first = false;
+        char hex[7];
+        snprintf(hex, sizeof(hex), "%06x", (color >> 8) & 0xFFFFFF);
+        taken_json += "\"" + std::string(hex) + "\"";
+    }
+    taken_json += "]";
+
+    // Try to connect to server
+    const char* socket_path = "/tmp/entity_color.sock";
+    int sock = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (sock < 0) {
+        entity_color_cache[binding_digit] = 0x4d9be6FF;
+        return 0x4d9be6FF;
+    }
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
+
+    if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        // Server not running, start it
+        close(sock);
+        system("python3 ../scripts/entity_color_server.py &");
+        usleep(2000000); // Wait 2s for server to start and load model
+
+        sock = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (sock < 0 || connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+            if (sock >= 0) close(sock);
+            entity_color_cache[binding_digit] = 0x4d9be6FF;
+            return 0x4d9be6FF;
+        }
+    }
+
+    // Send request
+    std::string request = "{\"text\":\"" + entity_text + "\",\"taken\":" + taken_json + "}";
+    send(sock, request.c_str(), request.length(), 0);
+
+    // Receive response
+    char buffer[1024];
+    int n = recv(sock, buffer, sizeof(buffer) - 1, 0);
+    close(sock);
+
+    if (n <= 0) {
+        entity_color_cache[binding_digit] = 0x4d9be6FF;
+        return 0x4d9be6FF;
+    }
+    buffer[n] = '\0';
+    std::string result(buffer);
+
+    // Parse JSON response
+    uint32_t color = 0x4d9be6FF;
+    size_t color_pos = result.find("\"color\"");
+    if (color_pos != std::string::npos) {
+        size_t start = result.find("\"", color_pos + 7);
+        if (start != std::string::npos) {
+            size_t end = result.find("\"", start + 1);
+            if (end != std::string::npos) {
+                std::string hex = result.substr(start + 1, end - start - 1);
+                if (hex.length() == 6) {
+                    unsigned int rgb = std::stoul(hex, nullptr, 16);
+                    color = (rgb << 8) | 0xFF;
+                }
+            }
+        }
+    }
+
+    entity_color_cache[binding_digit] = color;
+    return color;
+}
 
 // Parse sentence template string into tokens
 // Formats:
@@ -669,23 +762,42 @@ std::vector<SentenceToken> parse_sentence_template(const std::string& sentence) 
                     while (!spec.empty() && std::isspace(spec.front())) spec.erase(0, 1);
                     while (!spec.empty() && std::isspace(spec.back())) spec.pop_back();
 
-                    // Parse spec: digit for entity, R:src:tgt for relationship
+                    // Parse spec: digit for entity, R (src:tgt)reified or R src:tgt for relationship
                     TokenType type = TokenType::Entity;
                     int digit = -1;
                     int source_digit = -1;
                     int target_digit = -1;
+                    int reified_digit = -1;
 
                     if (!spec.empty()) {
                         char prefix = spec[0];
                         if (prefix == 'R' || prefix == 'r') {
                             type = TokenType::Relationship;
-                            // Parse R:source:target format
-                            size_t colon1 = spec.find(':');
-                            if (colon1 != std::string::npos) {
-                                size_t colon2 = spec.find(':', colon1 + 1);
-                                if (colon2 != std::string::npos) {
-                                    std::string src_str = spec.substr(colon1 + 1, colon2 - colon1 - 1);
-                                    std::string tgt_str = spec.substr(colon2 + 1);
+                            // Check for reified format: R (src:tgt)reified
+                            size_t paren_open = spec.find('(');
+                            size_t paren_close = spec.find(')');
+                            if (paren_open != std::string::npos && paren_close != std::string::npos && paren_close > paren_open) {
+                                // Reified format: R (src:tgt)reified
+                                std::string inner = spec.substr(paren_open + 1, paren_close - paren_open - 1);
+                                std::string reified_str = spec.substr(paren_close + 1);
+                                size_t colon = inner.find(':');
+                                if (colon != std::string::npos) {
+                                    std::string src_str = inner.substr(0, colon);
+                                    std::string tgt_str = inner.substr(colon + 1);
+                                    if (src_str != "*") try { source_digit = std::stoi(src_str); } catch (...) {}
+                                    if (tgt_str != "*") try { target_digit = std::stoi(tgt_str); } catch (...) {}
+                                }
+                                if (!reified_str.empty()) try { reified_digit = std::stoi(reified_str); } catch (...) {}
+                            } else {
+                                // Non-reified format: R src:tgt
+                                size_t space = spec.find(' ');
+                                std::string rest = (space != std::string::npos) ? spec.substr(space + 1) : spec.substr(1);
+                                // Trim whitespace
+                                while (!rest.empty() && std::isspace(rest.front())) rest.erase(0, 1);
+                                size_t colon = rest.find(':');
+                                if (colon != std::string::npos) {
+                                    std::string src_str = rest.substr(0, colon);
+                                    std::string tgt_str = rest.substr(colon + 1);
                                     if (src_str != "*") try { source_digit = std::stoi(src_str); } catch (...) {}
                                     if (tgt_str != "*") try { target_digit = std::stoi(tgt_str); } catch (...) {}
                                 }
@@ -694,7 +806,7 @@ std::vector<SentenceToken> parse_sentence_template(const std::string& sentence) 
                             try { digit = std::stoi(spec); } catch (...) {}
                         }
                     }
-                    tokens.push_back({text, digit, source_digit, target_digit, type});
+                    tokens.push_back({text, digit, source_digit, target_digit, reified_digit, type});
                 }
                 i = end + 2;
                 continue;
@@ -708,7 +820,7 @@ std::vector<SentenceToken> parse_sentence_template(const std::string& sentence) 
             i++;
         }
         if (i > word_start) {
-            tokens.push_back({sentence.substr(word_start, i - word_start), -1, -1, -1, TokenType::PlainText});
+            tokens.push_back({sentence.substr(word_start, i - word_start), -1, -1, -1, -1, TokenType::PlainText});
         }
     }
     return tokens;
@@ -725,7 +837,13 @@ std::string tokens_to_template(const std::vector<SentenceToken>& tokens) {
                 case TokenType::Relationship: {
                     std::string src = tokens[i].source_digit >= 0 ? std::to_string(tokens[i].source_digit) : "*";
                     std::string tgt = tokens[i].target_digit >= 0 ? std::to_string(tokens[i].target_digit) : "*";
-                    spec = "R:" + src + ":" + tgt;
+                    if (tokens[i].reified_digit >= 0) {
+                        // Reified format: R (src:tgt)reified
+                        spec = "R (" + src + ":" + tgt + ")" + std::to_string(tokens[i].reified_digit);
+                    } else {
+                        // Non-reified format: R src:tgt
+                        spec = "R " + src + ":" + tgt;
+                    }
                     break;
                 }
                 default:
@@ -1863,11 +1981,43 @@ void recreate_annotation_entities(WordAnnotationSelector& selector) {
                 .set<ImageCreator>({src_path, 1.0f, 1.0f})
                 .set<ZIndex>({25});
 
-            // 4. Relationship text
+            // 4. Relationship text (with optional reified indicator above)
+            flecs::entity text_parent = badge_content;
+            if (token.reified_digit >= 0) {
+                // Create vertical container for reified indicator + text
+                flecs::entity text_column = world->entity()
+                    .is_a(UIElement)
+                    .set<VerticalLayoutBox>({0.0f, 0.0f})
+                    .add(flecs::OrderedChildren)
+                    .child_of(badge_content);
+
+                // Reified indicator (3d_node + digit) above text
+                flecs::entity reified_row = world->entity()
+                    .is_a(UIElement)
+                    .set<HorizontalLayoutBox>({0.0f, 0.0f})
+                    .add(flecs::OrderedChildren)
+                    .child_of(text_column);
+
+                world->entity()
+                    .is_a(UIElement)
+                    .child_of(reified_row)
+                    .set<ImageCreator>({"3d_node.png", 0.6f, 0.6f})
+                    .set<ZIndex>({25});
+
+                std::string reified_path = "mnist/set_0/" + std::to_string(token.reified_digit) + ".png";
+                world->entity()
+                    .is_a(UIElement)
+                    .child_of(reified_row)
+                    .set<ImageCreator>({reified_path, 0.6f, 0.6f})
+                    .set<ZIndex>({25});
+
+                text_parent = text_column;
+            }
+
             flecs::entity text_ent = world->entity()
                 .is_a(UIElement)
-                .child_of(badge_content)
-                .set<Position, Local>({0.0f, 6.0f})
+                .child_of(text_parent)
+                .set<Position, Local>({0.0f, token.reified_digit >= 0 ? 0.0f : 6.0f})
                 .set<TextRenderable>({token.text.c_str(), "Inter", 16.0f, 0xFFFFFFFF, 1.2f})
                 .set<RenderGradient>({0xFFFFFFFF, light})
                 .set<ZIndex>({25});
@@ -1884,20 +2034,23 @@ void recreate_annotation_entities(WordAnnotationSelector& selector) {
 
             // Only badge needs to be in ui_entities (children deleted with parent)
             selector.ui_entities.push_back(badge);
-            // Selection entities track all 3 parts for proper selection bounds
-            // Middle part (index 1) uses badge for full relationship bounds
+            // Selection entities track 3 parts: source, badge, target
+            // Reified indicator is inside badge but not separately selectable
             selector.selection_entities.push_back(source_ent);
             selector.selection_entities.push_back(badge);
             selector.selection_entities.push_back(target_ent);
 
         } else if (token.type == TokenType::Entity) {
-            // Entity binding: normal badge
+            // Entity binding: normal badge with semantic color
             std::string digit_str = token.binding_digit >= 0 ? std::to_string(token.binding_digit) : "";
+            uint32_t entity_color = token.binding_digit >= 0
+                ? get_entity_color(token.binding_digit, token.text)
+                : 0x4488FFFF;
             flecs::entity badge = create_badge(selector.parent_entity, UIElement,
-                token.text.c_str(), 0x4488FFFF,
+                token.text.c_str(), entity_color,
                 false, false,
                 digit_str, "",
-                0, 0x4488FFFF);
+                0, entity_color);
             selector.ui_entities.push_back(badge);
             selector.selection_entities.push_back(badge);
         } else {
@@ -3566,7 +3719,7 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                             new_sel_start += tokens[i].selection_width();
                             new_tokens.push_back(tokens[i]);
                         }
-                        new_tokens.push_back({combined_text, digit, -1, -1, TokenType::Entity});
+                        new_tokens.push_back({combined_text, digit, -1, -1, -1, TokenType::Entity});
                         for (int i = end_tok + 1; i < (int)tokens.size(); i++) {
                             new_tokens.push_back(tokens[i]);
                         }
@@ -3577,13 +3730,15 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                         selector.end_index = new_sel_start;
                         recreate_annotation_entities(selector);
                     } else if (tokens[token_idx].type == TokenType::Relationship) {
-                        // Assign digit to relationship part (source, rel, or target)
+                        // Assign digit to relationship part
+                        // Both reified and non-reified: 0=source, 1=badge, 2=target
+                        // Reified has additional: 3=reified (but reified digit set via R key)
                         if (sub_part == 0) {
                             tokens[token_idx].source_digit = digit;
                         } else if (sub_part == 2) {
                             tokens[token_idx].target_digit = digit;
                         }
-                        // sub_part == 1 is the relationship label itself, no digit to assign
+                        // badge part (1) and reified part (3) don't accept digit assignment
                         selector.sentence_template = tokens_to_template(tokens);
                         selector.dirty = true;
                         recreate_annotation_entities(selector);
@@ -3627,6 +3782,7 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
 
                     if (tokens[token_idx].type == TokenType::Relationship) {
                         // Set wildcard (-1) for source or target
+                        // Both reified and non-reified: 0=source, 1=badge, 2=target
                         if (sub_part == 0) {
                             tokens[token_idx].source_digit = -1;
                         } else if (sub_part == 2) {
@@ -3753,7 +3909,7 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                         new_sel_start += tokens[i].selection_width();
                         new_tokens.push_back(tokens[i]);
                     }
-                    new_tokens.push_back({combined_text, available_digit, -1, -1, TokenType::Entity});
+                    new_tokens.push_back({combined_text, available_digit, -1, -1, -1, TokenType::Entity});
                     for (int i = end_tok + 1; i < (int)tokens.size(); i++) {
                         new_tokens.push_back(tokens[i]);
                     }
@@ -3797,6 +3953,7 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                         tokens[token_idx].binding_digit = -1;
                         tokens[token_idx].source_digit = -1;
                         tokens[token_idx].target_digit = -1;
+                        tokens[token_idx].reified_digit = -1;
                         selector.sentence_template = tokens_to_template(tokens);
                         selector.dirty = true;
                         recreate_annotation_entities(selector);
@@ -3807,7 +3964,7 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
             if (handled) return;
         }
 
-        // R key - create relationship with wildcard source and target
+        // R key - create relationship or reify existing relationship
         if (key == GLFW_KEY_R)
         {
             bool handled = false;
@@ -3817,8 +3974,56 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                     auto tokens = parse_sentence_template(selector.sentence_template);
                     if (tokens.empty()) return;
 
-                    // Calculate expanded selection range (accounting for relationship width)
+                    // Find token at selection
                     int expanded_pos = 0;
+                    int token_idx = -1;
+                    for (size_t ti = 0; ti < tokens.size(); ti++) {
+                        int width = tokens[ti].selection_width();
+                        if (selector.start_index >= expanded_pos && selector.start_index < expanded_pos + width) {
+                            token_idx = (int)ti;
+                            break;
+                        }
+                        expanded_pos += width;
+                    }
+
+                    // If on existing relationship, toggle reification
+                    if (token_idx >= 0 && tokens[token_idx].type == TokenType::Relationship) {
+                        if (tokens[token_idx].reified_digit >= 0) {
+                            // Already reified - remove reification
+                            tokens[token_idx].reified_digit = -1;
+                        } else {
+                            // Reify: find first available digit
+                            std::set<int> used_digits;
+                            for (const auto& tok : tokens) {
+                                if (tok.type == TokenType::Entity && tok.binding_digit >= 0) {
+                                    used_digits.insert(tok.binding_digit);
+                                }
+                                if (tok.type == TokenType::Relationship) {
+                                    if (tok.source_digit >= 0) used_digits.insert(tok.source_digit);
+                                    if (tok.target_digit >= 0) used_digits.insert(tok.target_digit);
+                                    if (tok.reified_digit >= 0) used_digits.insert(tok.reified_digit);
+                                }
+                            }
+                            int available_digit = -1;
+                            for (int d = 0; d <= 9; d++) {
+                                if (used_digits.find(d) == used_digits.end()) {
+                                    available_digit = d;
+                                    break;
+                                }
+                            }
+                            if (available_digit >= 0) {
+                                tokens[token_idx].reified_digit = available_digit;
+                            }
+                        }
+                        selector.sentence_template = tokens_to_template(tokens);
+                        selector.dirty = true;
+                        recreate_annotation_entities(selector);
+                        handled = true;
+                        return;
+                    }
+
+                    // Calculate expanded selection range (accounting for relationship width)
+                    expanded_pos = 0;
                     int token_start = -1, token_end = -1;
                     for (size_t ti = 0; ti < tokens.size(); ti++) {
                         int width = tokens[ti].selection_width();
@@ -3849,7 +4054,7 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                     }
 
                     // Add single relationship token with wildcard source/target
-                    new_tokens.push_back({combined_text, -1, -1, -1, TokenType::Relationship});
+                    new_tokens.push_back({combined_text, -1, -1, -1, -1, TokenType::Relationship});
 
                     for (int i = token_end + 1; i < (int)tokens.size(); i++) {
                         new_tokens.push_back(tokens[i]);
