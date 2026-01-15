@@ -1975,10 +1975,19 @@ void recreate_annotation_entities(WordAnnotationSelector& selector) {
             std::string src_path = token.source_digit >= 0
                 ? "mnist/set_0/" + std::to_string(token.source_digit) + ".png"
                 : "wildcard.png";
+            // Tint with entity color if bound
+            NVGcolor src_tint = nvgRGBA(255, 255, 255, 255);
+            if (token.source_digit >= 0) {
+                auto it = entity_color_cache.find(token.source_digit);
+                if (it != entity_color_cache.end()) {
+                    uint32_t c = it->second;
+                    src_tint = nvgRGBA((c >> 24) & 0xFF, (c >> 16) & 0xFF, (c >> 8) & 0xFF, 255);
+                }
+            }
             flecs::entity source_ent = world->entity()
                 .is_a(UIElement)
                 .child_of(badge_content)
-                .set<ImageCreator>({src_path, 1.0f, 1.0f})
+                .set<ImageCreator>({src_path, 1.0f, 1.0f, src_tint})
                 .set<ZIndex>({25});
 
             // 4. Relationship text (with optional reified indicator above)
@@ -1998,17 +2007,27 @@ void recreate_annotation_entities(WordAnnotationSelector& selector) {
                     .add(flecs::OrderedChildren)
                     .child_of(text_column);
 
+                // Tint reified with entity color if it exists
+                NVGcolor reified_tint = nvgRGBA(255, 255, 255, 255);
+                if (token.reified_digit >= 0) {
+                    auto it = entity_color_cache.find(token.reified_digit);
+                    if (it != entity_color_cache.end()) {
+                        uint32_t c = it->second;
+                        reified_tint = nvgRGBA((c >> 24) & 0xFF, (c >> 16) & 0xFF, (c >> 8) & 0xFF, 255);
+                    }
+                }
+
                 world->entity()
                     .is_a(UIElement)
                     .child_of(reified_row)
-                    .set<ImageCreator>({"3d_node.png", 0.6f, 0.6f})
+                    .set<ImageCreator>({"3d_node.png", 0.6f, 0.6f, reified_tint})
                     .set<ZIndex>({25});
 
                 std::string reified_path = "mnist/set_0/" + std::to_string(token.reified_digit) + ".png";
                 world->entity()
                     .is_a(UIElement)
                     .child_of(reified_row)
-                    .set<ImageCreator>({reified_path, 0.6f, 0.6f})
+                    .set<ImageCreator>({reified_path, 0.6f, 0.6f, reified_tint})
                     .set<ZIndex>({25});
 
                 text_parent = text_column;
@@ -2026,10 +2045,19 @@ void recreate_annotation_entities(WordAnnotationSelector& selector) {
             std::string tgt_path = token.target_digit >= 0
                 ? "mnist/set_0/" + std::to_string(token.target_digit) + ".png"
                 : "wildcard.png";
+            // Tint with entity color if bound
+            NVGcolor tgt_tint = nvgRGBA(255, 255, 255, 255);
+            if (token.target_digit >= 0) {
+                auto it = entity_color_cache.find(token.target_digit);
+                if (it != entity_color_cache.end()) {
+                    uint32_t c = it->second;
+                    tgt_tint = nvgRGBA((c >> 24) & 0xFF, (c >> 16) & 0xFF, (c >> 8) & 0xFF, 255);
+                }
+            }
             flecs::entity target_ent = world->entity()
                 .is_a(UIElement)
                 .child_of(badge_content)
-                .set<ImageCreator>({tgt_path, 1.0f, 1.0f})
+                .set<ImageCreator>({tgt_path, 1.0f, 1.0f, tgt_tint})
                 .set<ZIndex>({25});
 
             // Only badge needs to be in ui_entities (children deleted with parent)
