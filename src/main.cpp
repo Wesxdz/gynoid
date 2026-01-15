@@ -575,7 +575,6 @@ struct CloseEditorSelector {};
 struct SetMenuHighlightColor {};
 struct SetMenuStandardColor {};
 
-// Language Game chat components
 struct ChatMessage {
     std::string author;
     std::string text;
@@ -619,6 +618,87 @@ struct KnownEntity {
     std::string color;  // Hex color string
     int display_number;  // The MNIST digit number for this entity
 };
+
+// Token in annotated sentence - either plain text or entity binding
+struct SentenceToken {
+    std::string text;
+    int binding_digit;  // -1 for plain text, 0-9 for entity binding
+    bool is_binding() const { return binding_digit >= 0; }
+};
+
+// Parse sentence template string into tokens
+// Format: "Hello {{world, 5}} how are you" -> [Hello, {world,5}, how, are, you]
+std::vector<SentenceToken> parse_sentence_template(const std::string& sentence) {
+    std::vector<SentenceToken> tokens;
+    size_t i = 0;
+    while (i < sentence.size()) {
+        // Skip whitespace
+        while (i < sentence.size() && std::isspace(sentence[i])) i++;
+        if (i >= sentence.size()) break;
+
+        // Check for entity binding {{text, digit}}
+        if (i + 1 < sentence.size() && sentence[i] == '{' && sentence[i+1] == '{') {
+            size_t start = i + 2;
+            size_t end = sentence.find("}}", start);
+            if (end != std::string::npos) {
+                std::string binding = sentence.substr(start, end - start);
+                size_t comma = binding.rfind(',');
+                if (comma != std::string::npos) {
+                    std::string text = binding.substr(0, comma);
+                    // Trim whitespace from text
+                    while (!text.empty() && std::isspace(text.back())) text.pop_back();
+                    while (!text.empty() && std::isspace(text.front())) text.erase(0, 1);
+                    std::string digit_str = binding.substr(comma + 1);
+                    // Trim whitespace from digit
+                    while (!digit_str.empty() && std::isspace(digit_str.front())) digit_str.erase(0, 1);
+                    int digit = 0;
+                    try { digit = std::stoi(digit_str); } catch (...) {}
+                    tokens.push_back({text, digit});
+                }
+                i = end + 2;
+                continue;
+            }
+        }
+
+        // Regular word
+        size_t word_start = i;
+        while (i < sentence.size() && !std::isspace(sentence[i]) &&
+               !(i + 1 < sentence.size() && sentence[i] == '{' && sentence[i+1] == '{')) {
+            i++;
+        }
+        if (i > word_start) {
+            tokens.push_back({sentence.substr(word_start, i - word_start), -1});
+        }
+    }
+    return tokens;
+}
+
+// Convert tokens back to template string
+std::string tokens_to_template(const std::vector<SentenceToken>& tokens) {
+    std::string result;
+    for (size_t i = 0; i < tokens.size(); i++) {
+        if (i > 0) result += " ";
+        if (tokens[i].is_binding()) {
+            result += "{{" + tokens[i].text + ", " + std::to_string(tokens[i].binding_digit) + "}}";
+        } else {
+            result += tokens[i].text;
+        }
+    }
+    return result;
+}
+
+// Word annotation selector - highlights words for annotation
+struct WordAnnotationSelector {
+    std::string sentence_template;              // Template string with {{entity, n}} bindings
+    std::vector<flecs::entity> ui_entities;     // Current UI entities (recreated from template)
+    flecs::entity parent_entity;                // Parent for UI entities
+    int start_index;                            // Start of selection range (0-based)
+    int end_index;                              // End of selection range (inclusive)
+    bool active;                                // Whether annotation mode is active
+    bool dirty;                                 // Needs UI entity recreation
+    uint32_t highlight_color;                   // Color for the highlight rectangle
+};
+
 std::mutex known_entities_mutex;
 std::vector<KnownEntity> known_entities;
 int next_entity_number = 1;  // Global counter for entity display numbers
@@ -3195,6 +3275,113 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
             return;
         }
 
+        // Word annotation selector - Tab toggles, arrows navigate, shift+arrows expand selection
+        static auto annotation_query = world->query<WordAnnotationSelector>();
+        if (key == GLFW_KEY_TAB)
+        {
+            annotation_query.each([](flecs::entity e, WordAnnotationSelector& selector) {
+                selector.active = !selector.active;
+                if (selector.active && !selector.sentence_template.empty()) {
+                    selector.start_index = 0;  // Reset to first word when activating
+                    selector.end_index = 0;
+                }
+            });
+            return;
+        }
+        else if (key == GLFW_KEY_LEFT || key == GLFW_KEY_RIGHT)
+        {
+            bool handled = false;
+            bool shift_held = (mods & GLFW_MOD_SHIFT) != 0;
+            annotation_query.each([&](flecs::entity e, WordAnnotationSelector& selector) {
+                if (selector.active && !selector.ui_entities.empty()) {
+                    int max_idx = (int)selector.ui_entities.size() - 1;
+                    if (key == GLFW_KEY_LEFT) {
+                        if (shift_held) {
+                            // Expand selection left, or shrink from right if can't
+                            if (selector.start_index > 0) {
+                                selector.start_index--;
+                                handled = true;
+                            } else if (selector.end_index > selector.start_index) {
+                                selector.end_index--;
+                                handled = true;
+                            }
+                        } else {
+                            // Move selection left (collapse to single word)
+                            if (selector.start_index > 0) {
+                                selector.start_index--;
+                                selector.end_index = selector.start_index;
+                                handled = true;
+                            }
+                        }
+                    } else if (key == GLFW_KEY_RIGHT) {
+                        if (shift_held) {
+                            // Expand selection right, or shrink from left if can't
+                            if (selector.end_index < max_idx) {
+                                selector.end_index++;
+                                handled = true;
+                            } else if (selector.start_index < selector.end_index) {
+                                selector.start_index++;
+                                handled = true;
+                            }
+                        } else {
+                            // Move selection right (collapse to single word)
+                            if (selector.end_index < max_idx) {
+                                selector.end_index++;
+                                selector.start_index = selector.end_index;
+                                handled = true;
+                            }
+                        }
+                    }
+                }
+            });
+            if (handled) return;
+        }
+
+        // Number keys (0-9) - promote selected tokens to an entity binding
+        if (key >= GLFW_KEY_0 && key <= GLFW_KEY_9)
+        {
+            int digit = key - GLFW_KEY_0;
+            bool handled = false;
+            annotation_query.each([&](flecs::entity e, WordAnnotationSelector& selector) {
+                if (selector.active && !selector.sentence_template.empty()) {
+                    // Parse current template into tokens
+                    auto tokens = parse_sentence_template(selector.sentence_template);
+                    if (tokens.empty()) return;
+
+                    // Clamp selection to valid range
+                    int max_idx = (int)tokens.size() - 1;
+                    if (selector.start_index > max_idx) selector.start_index = max_idx;
+                    if (selector.end_index > max_idx) selector.end_index = max_idx;
+
+                    // Combine selected tokens into one binding
+                    std::string combined_text;
+                    for (int i = selector.start_index; i <= selector.end_index; i++) {
+                        if (!combined_text.empty()) combined_text += " ";
+                        combined_text += tokens[i].text;
+                    }
+
+                    // Build new token list: before + binding + after
+                    std::vector<SentenceToken> new_tokens;
+                    for (int i = 0; i < selector.start_index; i++) {
+                        new_tokens.push_back(tokens[i]);
+                    }
+                    new_tokens.push_back({combined_text, digit});
+                    int new_binding_index = (int)new_tokens.size() - 1;
+                    for (int i = selector.end_index + 1; i < (int)tokens.size(); i++) {
+                        new_tokens.push_back(tokens[i]);
+                    }
+
+                    // Update template and mark dirty for UI recreation
+                    selector.sentence_template = tokens_to_template(new_tokens);
+                    selector.dirty = true;
+                    selector.start_index = new_binding_index;
+                    selector.end_index = new_binding_index;
+
+                    handled = true;
+                }
+            });
+            if (handled) return;
+        }
 
     // Retrieve the singleton ChatState
     ChatState* chat = world->try_get_mut<ChatState>();
@@ -3275,6 +3462,7 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                     {
                         std::lock_guard<std::mutex> lock(known_entities_mutex);
                         json entities_array = json::array();
+                        // TODO: Consider a simplified in-place representation
                         for (const auto& entity : known_entities) {
                             entities_array.push_back({
                                 {"id", entity.id},
@@ -3334,17 +3522,21 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                             }
                             escaped_sentences += c;
                         }
-
-                        std::string cmd = "python3 ../scripts/interpretation.py \"" + escaped_draft + "\" \"" + escaped_context + "\" \"" + escaped_sentences + "\" 2>&1";
-                        FILE* pipe = popen(cmd.c_str(), "r");
-                        if (pipe) {
-                            char buffer[4096];
-                            std::string result;
-                            while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-                                result += buffer;
+                        
+                        bool interpret_with_llm = false;
+                        if (interpret_with_llm)
+                        {
+                            std::string cmd = "python3 ../scripts/interpretation.py \"" + escaped_draft + "\" \"" + escaped_context + "\" \"" + escaped_sentences + "\" 2>&1";
+                            FILE* pipe = popen(cmd.c_str(), "r");
+                            if (pipe) {
+                                char buffer[4096];
+                                std::string result;
+                                while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+                                    result += buffer;
+                                }
+                                pclose(pipe);
+                                pending->result = result;
                             }
-                            pclose(pipe);
-                            pending->result = result;
                         }
                         pending->completed.store(true);
                     }).detach();
@@ -5834,10 +6026,95 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
 
     auto debugRenderBounds = world->system<RenderQueue, UIElementBounds, DebugRenderBounds>()
     .term_at(0).src(renderQueueEntity)
-    .each([](flecs::entity e, RenderQueue& render_queue, UIElementBounds& bounds, DebugRenderBounds) 
+    .each([](flecs::entity e, RenderQueue& render_queue, UIElementBounds& bounds, DebugRenderBounds)
     {
         RectRenderable debug_bound {bounds.xmax - bounds.xmin, bounds.ymax - bounds.ymin, true, 0xFFFF00FF};
         render_queue.addRectCommand({bounds.xmin, bounds.ymin}, debug_bound, 100);
+    });
+
+    // Word annotation selector - recreates UI entities from template and updates bounds
+    auto wordAnnotationBoundsSystem = world->system<WordAnnotationSelector, Position, RectRenderable>()
+    .term_at(1).second<World>()
+    .kind(flecs::PreUpdate)
+    .each([&](flecs::entity e, WordAnnotationSelector& selector, Position& pos, RectRenderable& rect) {
+        // Recreate UI entities if dirty
+        if (selector.dirty && selector.parent_entity.is_valid()) {
+            // Delete old UI entities
+            for (auto& ent : selector.ui_entities) {
+                if (ent.is_valid()) {
+                    ent.destruct();
+                }
+            }
+            selector.ui_entities.clear();
+
+            // Parse template and create new entities
+            auto tokens = parse_sentence_template(selector.sentence_template);
+            auto UIElement = world->lookup("UIElement");
+
+            for (const auto& token : tokens) {
+                if (token.is_binding()) {
+                    // Create badge for entity binding
+                    flecs::entity badge = create_badge(selector.parent_entity, UIElement,
+                        token.text.c_str(), 0x4488FFFF,
+                        false, false,
+                        std::to_string(token.binding_digit), "",
+                        0, 0x4488FFFF);
+                    selector.ui_entities.push_back(badge);
+                } else {
+                    // Create text entity
+                    flecs::entity text_ent = world->entity()
+                        .is_a(UIElement)
+                        .child_of(selector.parent_entity)
+                        .set<TextRenderable>({token.text.c_str(), "Inter", 16.0f, 0x777777FF})
+                        .set<ZIndex>({17});
+                    selector.ui_entities.push_back(text_ent);
+                }
+            }
+
+            selector.dirty = false;
+        }
+
+        if (!selector.active || selector.ui_entities.empty()) {
+            rect.width = 0;
+            rect.height = 0;
+            return;
+        }
+
+        // Clamp indices to valid range
+        int max_idx = (int)selector.ui_entities.size() - 1;
+        if (selector.start_index < 0) selector.start_index = 0;
+        if (selector.end_index < 0) selector.end_index = 0;
+        if (selector.start_index > max_idx) selector.start_index = max_idx;
+        if (selector.end_index > max_idx) selector.end_index = max_idx;
+        if (selector.start_index > selector.end_index) {
+            std::swap(selector.start_index, selector.end_index);
+        }
+
+        // Calculate combined bounds for all words in selection range
+        float combined_xmin = FLT_MAX, combined_ymin = FLT_MAX;
+        float combined_xmax = -FLT_MAX, combined_ymax = -FLT_MAX;
+        bool has_valid_bounds = false;
+
+        for (int i = selector.start_index; i <= selector.end_index; i++) {
+            flecs::entity word = selector.ui_entities[i];
+            const UIElementBounds* bounds = word.try_get<UIElementBounds>();
+            if (word.is_valid() && bounds) {
+                combined_xmin = std::min(combined_xmin, bounds->xmin);
+                combined_ymin = std::min(combined_ymin, bounds->ymin);
+                combined_xmax = std::max(combined_xmax, bounds->xmax);
+                combined_ymax = std::max(combined_ymax, bounds->ymax);
+                has_valid_bounds = true;
+            }
+        }
+
+        if (has_valid_bounds) {
+            // Set world position directly (annotation selector has no parent)
+            pos.x = combined_xmin;
+            pos.y = combined_ymin;
+            rect.width = combined_xmax - combined_xmin;
+            rect.height = combined_ymax - combined_ymin;
+            rect.color = selector.highlight_color;
+        }
     });
 
     auto roundedRectQueueSystem = world->system<Position, RoundedRectRenderable, ZIndex, RenderGradient*>()
@@ -6121,6 +6398,7 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
 
                         if (rect.stroke)
                         {
+                            nvgStrokeWidth(graphics.vg, 1.0f);
                             nvgStrokeColor(graphics.vg, nvgRGBA(r, g, b, a));
                             nvgStroke(graphics.vg);
                         } else
@@ -6842,17 +7120,42 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
                     // create_badge(meta_response, UIElement, "Heonae", 0xc72783ff, false, false, "1");
                     // create_badge(meta_response, UIElement, "understands", 0xc72783ff, false, true);
 
+                    // Split draft into words for interleaving
+                    std::vector<std::string> words;
+                    std::istringstream iss(pending->draft);
+                    std::string word;
+                    while (iss >> word) {
+                        words.push_back(word);
+                    }
+
+                    // If no LLM interpretation, just create text entities without badges
+                    if (pending->result.empty()) {
+                        auto meta_response_data = world->entity()
+                            .is_a(UIElement)
+                            .set<FlowLayoutBox>({0.0f, 0.0f, 2.0f, 0.0f, 2.0f})
+                            .set<Expand>({true, 0, 0, 1, false, 0, 0, 0})
+                            .add(flecs::OrderedChildren)
+                            .child_of(pending->message_list);
+
+                        // Create annotation selector with template string (system will create UI entities)
+                        world->entity()
+                            .set<WordAnnotationSelector>({
+                                pending->draft,           // sentence_template
+                                {},                       // ui_entities (empty, will be created by system)
+                                meta_response_data,       // parent_entity
+                                0, 0,                     // start_index, end_index
+                                false,                    // active
+                                true,                     // dirty (trigger UI creation)
+                                0x4488FFAA                // highlight_color
+                            })
+                            .set<Position, World>({0, 0})
+                            .set<RectRenderable>({0, 0, false, 0x4488FFAA})
+                            .set<RenderStatus>({true})
+                            .set<ZIndex>({15});
+                    } else {
                     // Parse JSON and create dynamic badges
                     try {
                         json result = json::parse(pending->result);
-
-                        // Split draft into words for interleaving
-                        std::vector<std::string> words;
-                        std::istringstream iss(pending->draft);
-                        std::string word;
-                        while (iss >> word) {
-                            words.push_back(word);
-                        }
 
                         // Binding type for relationship slots
                         enum class SlotBindingType {
@@ -7065,51 +7368,82 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
                             .set<Expand>({true, 0, 0, 1, false, 0, 0, 0})
                             .add(flecs::OrderedChildren)
                             .child_of(pending->message_list);
-
-                        // Interleave text with badges - badges replace their word spans
-                        std::string current_text;
-                        for (size_t i = 0; i < words.size(); ) {
-                            // Check if an annotation starts at this position
-                            if (start_annotations.count(i)) {
-                                // Flush any accumulated text
-                                if (!current_text.empty()) {
-                                    world->entity()
-                                        .is_a(UIElement)
-                                        .child_of(meta_response_data)
-                                        .set<TextRenderable>({current_text.c_str(), "Inter", 16.0f, 0x777777FF})
-                                        .set<ZIndex>({17});
-                                    current_text.clear();
-                                }
-
-                                auto& ann = start_annotations[i];
-                                create_badge(meta_response_data, UIElement, ann.label.c_str(),
-                                           ann.color, false, ann.is_relationship,
-                                           ann.prefix_ids, ann.prefix_tints,
-                                           ann.postfix_ids, ann.postfix_tints);
-
-                                // Skip all words covered by this annotation (start_idx to end_idx inclusive)
-                                i = ann.end_idx + 1;
-                            } else {
-                                // Add the word to accumulated text
-                                if (!current_text.empty()) current_text += " ";
-                                current_text += words[i];
-                                i++;
-                            }
-                        }
-
-                        // Flush remaining text
-                        if (!current_text.empty()) {
-                            world->entity()
+                        
+                        // We're currently disabling the model to test annotation
+                        for (size_t i = 0; i < words.size(); i++) 
+                        {
+                            flecs::entity text_annotator = world->entity()
                                 .is_a(UIElement)
-                                .child_of(meta_response_data)
-                                .set<TextRenderable>({current_text.c_str(), "Inter", 16.0f, 0xFFFFFFFF})
+                                .set<UIContainer>({4, 4})
+                                .set<RoundedRectRenderable>({0.0f, 0.0f, 2.0f, true, 0xFFFFFFFF})
+                                .set<ZIndex>({20})
+                                .child_of(meta_response_data);
+                                
+                            flecs::entity text_seq = world->entity()
+                                .is_a(UIElement)
+                                // .child_of(meta_response_data)
+                                .child_of(text_annotator)
+                                .set<TextRenderable>({words[i].c_str(), "Inter", 16.0f, 0x777777FF})
                                 .set<ZIndex>({17});
                         }
+
+                        // Interleave text with badges - badges replace their word spans
+                        // std::string current_text;
+                        // for (size_t i = 0; i < words.size(); ) {
+                        //     // Check if an annotation starts at this position
+                        //     if (start_annotations.count(i)) {
+                        //         // Flush any accumulated text
+                        //         if (!current_text.empty()) {
+
+                        //             flecs::entity text_annotator = world->entity()
+                        //                 .is_a(UIElement)
+                        //                 .set<UIContainer>({4, 4})
+                        //                 .set<RoundedRectRenderable>({0.0f, 0.0f, 2.0f, true, 0xFFFFFFFF})
+                        //                 .set<ZIndex>({20})
+                        //                 .child_of(meta_response_data);
+                                        
+                        //             flecs::entity text_seq = world->entity()
+                        //                 .is_a(UIElement)
+                        //                 // .child_of(meta_response_data)
+                        //                 .child_of(text_annotator)
+                        //                 .set<TextRenderable>({current_text.c_str(), "Inter", 16.0f, 0x777777FF})
+                        //                 .set<ZIndex>({17});
+                                    
+                                        
+                                    
+                        //             current_text.clear();
+                        //         }
+
+                        //         auto& ann = start_annotations[i];
+                        //         create_badge(meta_response_data, UIElement, ann.label.c_str(),
+                        //                    ann.color, false, ann.is_relationship,
+                        //                    ann.prefix_ids, ann.prefix_tints,
+                        //                    ann.postfix_ids, ann.postfix_tints);
+
+                        //         // Skip all words covered by this annotation (start_idx to end_idx inclusive)
+                        //         i = ann.end_idx + 1;
+                        //     } else {
+                        //         // Add the word to accumulated text
+                        //         if (!current_text.empty()) current_text += " ";
+                        //         current_text += words[i];
+                        //         i++;
+                        //     }
+                        // }
+
+                        // Flush remaining text
+                        // if (!current_text.empty()) {
+                        //     world->entity()
+                        //         .is_a(UIElement)
+                        //         .child_of(meta_response_data)
+                        //         .set<TextRenderable>({current_text.c_str(), "Inter", 16.0f, 0xFFFFFFFF})
+                        //         .set<ZIndex>({17});
+                        // }
 
                     } catch (const json::exception& e) {
                         std::cerr << "[Interpretation] JSON parse error: " << e.what() << std::endl;
                         std::cerr << "[Interpretation] Raw result: " << pending->result << std::endl;
                     }
+                    } // end else (has result)
 
                     it = pending_interpretations.erase(it);
                 } else {
