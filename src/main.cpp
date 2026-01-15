@@ -1807,12 +1807,8 @@ flecs::entity create_badge_impl(flecs::entity parent, flecs::entity UIElement,
 void recreate_annotation_entities(WordAnnotationSelector& selector) {
     if (!selector.parent_entity.is_valid()) return;
 
-    // Delete old UI entities
-    for (auto& ent : selector.ui_entities) {
-        if (ent.is_valid()) {
-            ent.destruct();
-        }
-    }
+    // Store old entities to delete after creating new ones (prevents flicker)
+    std::vector<flecs::entity> old_entities = std::move(selector.ui_entities);
     selector.ui_entities.clear();
     selector.selection_entities.clear();
 
@@ -1830,39 +1826,68 @@ void recreate_annotation_entities(WordAnnotationSelector& selector) {
         const auto& token = tokens[ti];
 
         if (token.type == TokenType::Relationship) {
-            // Create relationship as 3 separate sibling entities for correct bounds
+            // Create relationship badge with source/target images as children
             // Note: ImageCreator observer prepends "../assets/" so paths are relative to that
-            // 1. Source MNIST/wildcard image
+
+            // 1. Create the double arrow badge container
+            uint32_t base_color = 0xc72783FF;
+            uint32_t dark = base_color;
+            uint32_t very_dark = scale_color(base_color, 0.2f);
+            uint32_t light = scale_color(base_color, 1.3f);
+            uint32_t outline_color = (light & 0xFFFFFF00) | 0x80;
+            float xPad = 6.0f + 25.0f/2;
+
+            flecs::entity badge = world->entity()
+                .is_a(UIElement)
+                .child_of(selector.parent_entity)
+                .set<CustomRenderable>({100.0f, 25.0f, true, outline_color, draw_double_arrow})
+                .set<RenderGradient>({dark, very_dark})
+                .set<UIContainer>({xPad, 0})
+                .set<ZIndex>({20});
+
+            // 2. Create content container with horizontal layout
+            flecs::entity badge_content = world->entity()
+                .is_a(UIElement)
+                .set<HorizontalLayoutBox>({0.0f, 0.0f})
+                .set<Position, Local>({xPad, 0.0f})
+                .add(flecs::OrderedChildren)
+                .child_of(badge);
+
+            // 3. Source MNIST/wildcard image (child of badge_content)
             std::string src_path = token.source_digit >= 0
                 ? "mnist/set_0/" + std::to_string(token.source_digit) + ".png"
                 : "wildcard.png";
             flecs::entity source_ent = world->entity()
                 .is_a(UIElement)
-                .child_of(selector.parent_entity)
+                .child_of(badge_content)
                 .set<ImageCreator>({src_path, 1.0f, 1.0f})
-                .set<ZIndex>({17});
-            selector.ui_entities.push_back(source_ent);
-            selector.selection_entities.push_back(source_ent);
+                .set<ZIndex>({25});
 
-            // 2. Relationship badge (double arrow, no prefix/postfix)
-            flecs::entity badge = create_badge(selector.parent_entity, UIElement,
-                token.text.c_str(), 0xc72783FF,
-                false, true,  // double arrow for relationships
-                "", "",       // no prefix/postfix - they're separate entities
-                0, 0);
-            selector.ui_entities.push_back(badge);
-            selector.selection_entities.push_back(badge);
+            // 4. Relationship text
+            flecs::entity text_ent = world->entity()
+                .is_a(UIElement)
+                .child_of(badge_content)
+                .set<Position, Local>({0.0f, 6.0f})
+                .set<TextRenderable>({token.text.c_str(), "Inter", 16.0f, 0xFFFFFFFF, 1.2f})
+                .set<RenderGradient>({0xFFFFFFFF, light})
+                .set<ZIndex>({25});
 
-            // 3. Target MNIST/wildcard image
+            // 5. Target MNIST/wildcard image (child of badge_content)
             std::string tgt_path = token.target_digit >= 0
                 ? "mnist/set_0/" + std::to_string(token.target_digit) + ".png"
                 : "wildcard.png";
             flecs::entity target_ent = world->entity()
                 .is_a(UIElement)
-                .child_of(selector.parent_entity)
+                .child_of(badge_content)
                 .set<ImageCreator>({tgt_path, 1.0f, 1.0f})
-                .set<ZIndex>({17});
-            selector.ui_entities.push_back(target_ent);
+                .set<ZIndex>({25});
+
+            // Only badge needs to be in ui_entities (children deleted with parent)
+            selector.ui_entities.push_back(badge);
+            // Selection entities track all 3 parts for proper selection bounds
+            // Middle part (index 1) uses badge for full relationship bounds
+            selector.selection_entities.push_back(source_ent);
+            selector.selection_entities.push_back(badge);
             selector.selection_entities.push_back(target_ent);
 
         } else if (token.type == TokenType::Entity) {
@@ -1884,6 +1909,13 @@ void recreate_annotation_entities(WordAnnotationSelector& selector) {
                 .set<ZIndex>({17});
             selector.ui_entities.push_back(text_ent);
             selector.selection_entities.push_back(text_ent);
+        }
+    }
+
+    // Delete old entities after new ones are created (prevents flicker)
+    for (auto& ent : old_entities) {
+        if (ent.is_valid()) {
+            ent.destruct();
         }
     }
 
@@ -2369,14 +2401,14 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
             .set<RoundedRectRenderable>({100.0f, 100.0f, 4.0f, false, 0x050505FF})
             // TODO: Expand to fill remaining space in VerticalLayout...
             // .set<Expand>({true, 8.0f, 8.0f, 1.0f, true, 8.0f, 36.0f, })
-            .set<ZIndex>({10});
+            .set<ZIndex>({11});
 
         auto input_panel = world->entity()
             .is_a(UIElement)
             .child_of(chat_root)
             .set<RoundedRectRenderable>({100.0f, 36.0f, 2.0f, true, 0x555555FF})
             .add<AddTagOnLeftClick, FocusChatInput>()
-            .set<ZIndex>({10});
+            .set<ZIndex>({11});
 
             // TODO: We need to scale the input bkg to the text/content size...
         auto input_bkg = world->entity()
@@ -2384,7 +2416,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
             .child_of(input_panel)
             .set<RoundedRectRenderable>({10.0f, 10.0f, 2.0f, false, 0x222327FF})
             .set<Expand>({true, 0, 0, 1, true, 0, 0, 1})
-            .set<ZIndex>({9});
+            .set<ZIndex>({10});
 
         auto input_text = world->entity()
             .is_a(UIElement)
@@ -2416,7 +2448,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
 
         auto black_bkg = world->entity()
         .is_a(UIElement)
-        .set<ZIndex>({8})
+        .set<ZIndex>({9})
         .set<Expand>({true, 0.0f, 0.0f, 1.0f, true, 0.0f, 0.0f, 1.0f})
         .set<RectRenderable>({0.0f, 0.0f, false, 0x000000FF})
         .child_of(leaf.target<EditorCanvas>());
@@ -3600,6 +3632,171 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                         } else if (sub_part == 2) {
                             tokens[token_idx].target_digit = -1;
                         }
+                        selector.sentence_template = tokens_to_template(tokens);
+                        selector.dirty = true;
+                        recreate_annotation_entities(selector);
+                        handled = true;
+                    }
+                }
+            });
+            if (handled) return;
+        }
+
+        // E key - bind to entity with first available ID, or convert entity back to text
+        if (key == GLFW_KEY_E)
+        {
+            bool handled = false;
+            annotation_query.each([&](flecs::entity e, WordAnnotationSelector& selector) {
+                if (selector.active && !selector.sentence_template.empty()) {
+                    auto tokens = parse_sentence_template(selector.sentence_template);
+                    if (tokens.empty()) return;
+
+                    // Find token at selection
+                    int expanded_pos = 0;
+                    int token_idx = -1;
+                    for (size_t ti = 0; ti < tokens.size(); ti++) {
+                        int width = tokens[ti].selection_width();
+                        if (selector.start_index >= expanded_pos && selector.start_index < expanded_pos + width) {
+                            token_idx = (int)ti;
+                            break;
+                        }
+                        expanded_pos += width;
+                    }
+                    if (token_idx < 0) return;
+
+                    // If already an entity, convert back to plain text
+                    if (tokens[token_idx].type == TokenType::Entity) {
+                        tokens[token_idx].type = TokenType::PlainText;
+                        tokens[token_idx].binding_digit = -1;
+                        selector.sentence_template = tokens_to_template(tokens);
+                        selector.dirty = true;
+                        recreate_annotation_entities(selector);
+                        handled = true;
+                        return;
+                    }
+
+                    // If relationship, bind source to closest entity before, target to closest entity after
+                    if (tokens[token_idx].type == TokenType::Relationship) {
+                        int source_digit = -1;
+                        int target_digit = -1;
+
+                        // Find closest entity with lower index
+                        for (int i = token_idx - 1; i >= 0; i--) {
+                            if (tokens[i].type == TokenType::Entity && tokens[i].binding_digit >= 0) {
+                                source_digit = tokens[i].binding_digit;
+                                break;
+                            }
+                        }
+
+                        // Find closest entity with higher index
+                        for (int i = token_idx + 1; i < (int)tokens.size(); i++) {
+                            if (tokens[i].type == TokenType::Entity && tokens[i].binding_digit >= 0) {
+                                target_digit = tokens[i].binding_digit;
+                                break;
+                            }
+                        }
+
+                        tokens[token_idx].source_digit = source_digit;
+                        tokens[token_idx].target_digit = target_digit;
+                        selector.sentence_template = tokens_to_template(tokens);
+                        selector.dirty = true;
+                        recreate_annotation_entities(selector);
+                        handled = true;
+                        return;
+                    }
+
+                    // Collect all used digits
+                    std::set<int> used_digits;
+                    for (const auto& tok : tokens) {
+                        if (tok.type == TokenType::Entity && tok.binding_digit >= 0) {
+                            used_digits.insert(tok.binding_digit);
+                        }
+                        if (tok.type == TokenType::Relationship) {
+                            if (tok.source_digit >= 0) used_digits.insert(tok.source_digit);
+                            if (tok.target_digit >= 0) used_digits.insert(tok.target_digit);
+                        }
+                    }
+
+                    // Find first available digit (0-9)
+                    int available_digit = -1;
+                    for (int d = 0; d <= 9; d++) {
+                        if (used_digits.find(d) == used_digits.end()) {
+                            available_digit = d;
+                            break;
+                        }
+                    }
+                    if (available_digit < 0) return; // All digits used
+
+                    int end_token_idx = -1;
+                    expanded_pos = 0;
+                    for (size_t ti = 0; ti < tokens.size(); ti++) {
+                        int width = tokens[ti].selection_width();
+                        if (selector.end_index >= expanded_pos && selector.end_index < expanded_pos + width) {
+                            end_token_idx = (int)ti;
+                            break;
+                        }
+                        expanded_pos += width;
+                    }
+
+                    // Combine selected tokens into entity binding
+                    std::string combined_text;
+                    int start_tok = token_idx;
+                    int end_tok = end_token_idx >= 0 ? end_token_idx : token_idx;
+                    for (int i = start_tok; i <= end_tok; i++) {
+                        if (!combined_text.empty()) combined_text += " ";
+                        combined_text += tokens[i].text;
+                    }
+
+                    std::vector<SentenceToken> new_tokens;
+                    int new_sel_start = 0;
+                    for (int i = 0; i < start_tok; i++) {
+                        new_sel_start += tokens[i].selection_width();
+                        new_tokens.push_back(tokens[i]);
+                    }
+                    new_tokens.push_back({combined_text, available_digit, -1, -1, TokenType::Entity});
+                    for (int i = end_tok + 1; i < (int)tokens.size(); i++) {
+                        new_tokens.push_back(tokens[i]);
+                    }
+
+                    selector.sentence_template = tokens_to_template(new_tokens);
+                    selector.dirty = true;
+                    selector.start_index = new_sel_start;
+                    selector.end_index = new_sel_start;
+                    recreate_annotation_entities(selector);
+                    handled = true;
+                }
+            });
+            if (handled) return;
+        }
+
+        // X key - convert entity or relationship back to plain text
+        if (key == GLFW_KEY_X)
+        {
+            bool handled = false;
+            annotation_query.each([&](flecs::entity e, WordAnnotationSelector& selector) {
+                if (selector.active && !selector.sentence_template.empty()) {
+                    auto tokens = parse_sentence_template(selector.sentence_template);
+                    if (tokens.empty()) return;
+
+                    // Find token at selection
+                    int expanded_pos = 0;
+                    int token_idx = -1;
+                    for (size_t ti = 0; ti < tokens.size(); ti++) {
+                        int width = tokens[ti].selection_width();
+                        if (selector.start_index >= expanded_pos && selector.start_index < expanded_pos + width) {
+                            token_idx = (int)ti;
+                            break;
+                        }
+                        expanded_pos += width;
+                    }
+                    if (token_idx < 0) return;
+
+                    if (tokens[token_idx].type == TokenType::Entity ||
+                        tokens[token_idx].type == TokenType::Relationship) {
+                        tokens[token_idx].type = TokenType::PlainText;
+                        tokens[token_idx].binding_digit = -1;
+                        tokens[token_idx].source_digit = -1;
+                        tokens[token_idx].target_digit = -1;
                         selector.sentence_template = tokens_to_template(tokens);
                         selector.dirty = true;
                         recreate_annotation_entities(selector);
@@ -6353,15 +6550,15 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
             flecs::entity ent = selector.selection_entities[i];
             if (!ent.is_valid()) continue;
 
-            // Try UIElementBounds first
+            // Try UIElementBounds first (skip if bounds not yet computed)
             const UIElementBounds* bounds = ent.try_get<UIElementBounds>();
-            if (bounds) {
+            if (bounds && (bounds->xmax > bounds->xmin) && (bounds->ymax > bounds->ymin)) {
                 combined_xmin = std::min(combined_xmin, bounds->xmin);
                 combined_ymin = std::min(combined_ymin, bounds->ymin);
                 combined_xmax = std::max(combined_xmax, bounds->xmax);
                 combined_ymax = std::max(combined_ymax, bounds->ymax);
                 has_valid_bounds = true;
-            } else {
+            } else if (!bounds) {
                 // Fall back to Position<World> + size from renderable
                 const Position* world_pos = ent.try_get<Position, World>();
                 if (world_pos) {
@@ -6390,11 +6587,13 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
 
         if (has_valid_bounds) {
             // Set world position directly (annotation selector has no parent)
-            pos.x = combined_xmin;
-            pos.y = combined_ymin;
-            rect.width = combined_xmax - combined_xmin;
-            rect.height = combined_ymax - combined_ymin;
-            rect.color = selector.highlight_color;
+            // Add 1 pixel padding on all sides
+            pos.x = combined_xmin - 1.0f;
+            pos.y = combined_ymin - 1.0f;
+            rect.width = combined_xmax - combined_xmin + 2.0f;
+            rect.height = combined_ymax - combined_ymin + 2.0f;
+            rect.stroke = true;
+            rect.color = 0xFFFFFFFF;
         }
     });
 
