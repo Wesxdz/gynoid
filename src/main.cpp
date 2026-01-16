@@ -4765,8 +4765,10 @@ void rotatePoint(float& x, float& y, float& z, float axisX, float axisY, float a
 // Screen tetrahedrons move with velocities, calculated to collide at their target positions
 void initializeParticles(Graphics& graphics, const std::vector<float>& targetVertices,
                          float width, float height, float duration = 3.0f) {
-    static std::random_device rd;
-    static std::mt19937 gen(rd());
+    // Re-seed each time for different pattern on every spawn
+    auto seed = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+    static std::mt19937 gen(seed);
+    gen.seed(seed);
 
     // Velocity distribution - coming from far away (negative Z) towards camera/grid (positive Z)
     std::uniform_real_distribution<float> vxDist(-0.3f, 0.3f);   // Small lateral drift
@@ -4851,41 +4853,95 @@ void initializeParticles(Graphics& graphics, const std::vector<float>& targetVer
             float baseTime = 1.2f + normalizedDist * 1.8f;  // 1.2s to 3.0s range
             collisionTime = baseTime + jitterDist(gen);
 
-            // Calculate spawn position on toroidal (donut) ring with thorns
-            // Torus tilted like a planetary ring - triangles stick out like thorns
-            float angle = atan2(centroidY, centroidX);  // Angle of target from center
+            // Calculate spawn position on thorny stem torus around central triangle
+            // Triangles cluster at discrete thorn positions to form visible spikes
 
             // Torus parameters
-            float majorRadius = width * 0.9f;   // Main ring radius
-            float minorRadius = height * 0.25f; // Tube thickness
-            float thornLength = height * 0.35f; // How far thorns stick out
+            float majorRadius = width * 0.7f;   // Main ring radius
+            float minorRadius = height * 0.1f;  // Stem tube thickness
 
-            // Map target angle to position around the torus (u parameter)
-            float u = angle;  // Position around the main ring
+            // Number of thorns around the torus
+            int numThorns = 16;
 
-            // Random position around the tube cross-section (v parameter)
-            std::uniform_real_distribution<float> vDist(0.0f, 2.0f * M_PI);
-            float v = vDist(gen);
+            // Decide if this triangle is part of stem or a thorn
+            std::uniform_real_distribution<float> partDist(0.0f, 1.0f);
+            bool isStem = partDist(gen) < 0.25f;  // 25% form the stem, 75% form thorns
 
-            // Torus surface position (before tilt)
-            float torusX = (majorRadius + minorRadius * cos(v)) * cos(u);
-            float torusY = (majorRadius + minorRadius * cos(v)) * sin(u);
-            float torusZ = minorRadius * sin(v);
+            float torusX, torusY, torusZ;
 
-            // Normal direction at this point on torus (points outward from tube surface)
-            float normalX = cos(v) * cos(u);
-            float normalY = cos(v) * sin(u);
-            float normalZ = sin(v);
+            if (isStem) {
+                // Stem triangles - distributed along the torus surface
+                std::uniform_real_distribution<float> uDist(0.0f, 2.0f * M_PI);
+                std::uniform_real_distribution<float> vDist(0.0f, 2.0f * M_PI);
+                float u = uDist(gen);
+                float v = vDist(gen);
 
-            // Extend outward along normal to create thorn effect
-            std::uniform_real_distribution<float> thornJitter(0.7f, 1.3f);
-            float thisThornLength = thornLength * thornJitter(gen);
-            torusX += normalX * thisThornLength;
-            torusY += normalY * thisThornLength;
-            torusZ += normalZ * thisThornLength;
+                torusX = (majorRadius + minorRadius * cos(v)) * cos(u);
+                torusY = (majorRadius + minorRadius * cos(v)) * sin(u);
+                torusZ = minorRadius * sin(v);
+            } else {
+                // Thorn triangles - cluster at discrete thorn positions
+                std::uniform_real_distribution<float> thornIndexDist(0.0f, (float)numThorns);
+                int thornIndex = (int)thornIndexDist(gen);
 
-            // Tilt the torus around the X-axis (makes it look like a planetary ring seen at an angle)
-            // Tilt angle: negative tilts front down, back up
+                // Various thorn sizes - some small, some large
+                std::uniform_real_distribution<float> thornSizeDist(0.1f, 0.35f);
+                float thornLength = thornSizeDist(gen) * height;
+
+                // Thorn profile: 0 = spikey isosceles, 1 = fat equilateral
+                std::uniform_real_distribution<float> profileDist(0.0f, 1.0f);
+                float thornProfile = profileDist(gen);
+
+                // Position around main ring for this thorn
+                float u = (thornIndex / (float)numThorns) * 2.0f * M_PI;
+
+                // Each thorn has a fixed outward direction (v angle)
+                std::uniform_real_distribution<float> vVariation(-0.2f, 0.2f);
+                float v = (thornIndex % 6) * (M_PI / 3.0f) + vVariation(gen);  // 6 directions
+
+                // Base position on torus surface
+                float baseX = (majorRadius + minorRadius * cos(v)) * cos(u);
+                float baseY = (majorRadius + minorRadius * cos(v)) * sin(u);
+                float baseZ = minorRadius * sin(v);
+
+                // Thorn direction (outward from tube surface)
+                float thornDirX = cos(v) * cos(u);
+                float thornDirY = cos(v) * sin(u);
+                float thornDirZ = sin(v);
+
+                // Position along the thorn (0 = base, 1 = tip)
+                std::uniform_real_distribution<float> alongThorn(0.0f, 1.0f);
+                float tPos = alongThorn(gen);
+
+                // Thorn profile affects spread vs length ratio
+                // Spikey (profile=0): narrow spread, elongated
+                // Equilateral (profile=1): wide spread, shorter effective length
+                float baseSpread = 0.03f + thornProfile * 0.12f;  // 0.03 to 0.15
+                float lengthScale = 1.0f - thornProfile * 0.4f;   // 1.0 to 0.6
+                thornLength *= lengthScale;
+
+                // Thorn tapers - spread decreases toward tip (more dramatic for spikey)
+                float taperPower = 1.0f + (1.0f - thornProfile) * 1.5f;  // 1.0 to 2.5
+                float spread = pow(1.0f - tPos, taperPower) * baseSpread * height;
+                std::uniform_real_distribution<float> spreadDist(-1.0f, 1.0f);
+
+                // Calculate perpendicular directions for spread
+                float perpX1 = -sin(u);
+                float perpY1 = cos(u);
+                float perpZ1 = 0.0f;
+                float perpX2 = thornDirY * perpZ1 - thornDirZ * perpY1;
+                float perpY2 = thornDirZ * perpX1 - thornDirX * perpZ1;
+                float perpZ2 = thornDirX * perpY1 - thornDirY * perpX1;
+
+                float spreadOffset1 = spreadDist(gen) * spread;
+                float spreadOffset2 = spreadDist(gen) * spread;
+
+                torusX = baseX + thornDirX * tPos * thornLength + perpX1 * spreadOffset1 + perpX2 * spreadOffset2;
+                torusY = baseY + thornDirY * tPos * thornLength + perpY1 * spreadOffset1 + perpY2 * spreadOffset2;
+                torusZ = baseZ + thornDirZ * tPos * thornLength + perpZ1 * spreadOffset1 + perpZ2 * spreadOffset2;
+            }
+
+            // Tilt the torus around the X-axis (planetary ring angle)
             float tiltAngle = -0.45f;  // About 25 degrees
             float cosT = cos(tiltAngle);
             float sinT = sin(tiltAngle);
@@ -4893,16 +4949,11 @@ void initializeParticles(Graphics& graphics, const std::vector<float>& targetVer
             float arcY = torusY * cosT - torusZ * sinT;
             float arcZ = torusY * sinT + torusZ * cosT;
 
-            // Offset to position the ring (65% up from bottom at the sides)
+            // Offset to position the ring
             arcY += height * 0.15f;
 
             // Z position - push spawn further back
             float spawnZ = arcZ - 4.0f;
-
-            // Add small jitter for natural variation
-            std::uniform_real_distribution<float> arcJitter(-0.05f, 0.05f);
-            arcX += arcJitter(gen);
-            arcY += arcJitter(gen) * 0.3f;
 
             // Calculate velocity to travel from arc spawn to target in collision time
             vx = (centroidX - arcX) / collisionTime;
