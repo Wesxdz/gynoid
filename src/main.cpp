@@ -943,6 +943,8 @@ struct Graphics {
     int uiWidth;
     int uiHeight;
     bool useGridMode;
+    float gridModeTransitionTimer;  // Timer for delayed transition to plane mode
+    bool allParticlesLocked;        // Track if all particles are locked
     int gridVertexCount;
 
     // Particle system data
@@ -4826,16 +4828,17 @@ void initializeParticles(Graphics& graphics, const std::vector<float>& targetVer
             isInCentralTriangle = false;  // Exclude from central triangle
         }
 
-        // Generate velocity for this triangle (all vertices share same velocity)
-        float vx = vxDist(gen);
-        float vy = vyDist(gen);
-        float vz = vzDist(gen);
-
         // Calculate collision time based on position
         float collisionTime;
+        float vx, vy, vz;
+
         if (isInCentralTriangle) {
             // Central triangle loads first with random timing
             collisionTime = collisionTimeDist(gen);
+            // Random velocity for central triangles
+            vx = vxDist(gen);
+            vy = vyDist(gen);
+            vz = vzDist(gen);
         } else {
             // Outer triangles impact based on radial distance from center
             float distFromCenter = sqrt(centroidX * centroidX + centroidY * centroidY);
@@ -4847,6 +4850,64 @@ void initializeParticles(Graphics& graphics, const std::vector<float>& targetVer
             std::uniform_real_distribution<float> jitterDist(-0.08f, 0.08f);
             float baseTime = 1.2f + normalizedDist * 1.8f;  // 1.2s to 3.0s range
             collisionTime = baseTime + jitterDist(gen);
+
+            // Calculate spawn position on toroidal (donut) ring with thorns
+            // Torus tilted like a planetary ring - triangles stick out like thorns
+            float angle = atan2(centroidY, centroidX);  // Angle of target from center
+
+            // Torus parameters
+            float majorRadius = width * 0.9f;   // Main ring radius
+            float minorRadius = height * 0.25f; // Tube thickness
+            float thornLength = height * 0.35f; // How far thorns stick out
+
+            // Map target angle to position around the torus (u parameter)
+            float u = angle;  // Position around the main ring
+
+            // Random position around the tube cross-section (v parameter)
+            std::uniform_real_distribution<float> vDist(0.0f, 2.0f * M_PI);
+            float v = vDist(gen);
+
+            // Torus surface position (before tilt)
+            float torusX = (majorRadius + minorRadius * cos(v)) * cos(u);
+            float torusY = (majorRadius + minorRadius * cos(v)) * sin(u);
+            float torusZ = minorRadius * sin(v);
+
+            // Normal direction at this point on torus (points outward from tube surface)
+            float normalX = cos(v) * cos(u);
+            float normalY = cos(v) * sin(u);
+            float normalZ = sin(v);
+
+            // Extend outward along normal to create thorn effect
+            std::uniform_real_distribution<float> thornJitter(0.7f, 1.3f);
+            float thisThornLength = thornLength * thornJitter(gen);
+            torusX += normalX * thisThornLength;
+            torusY += normalY * thisThornLength;
+            torusZ += normalZ * thisThornLength;
+
+            // Tilt the torus around the X-axis (makes it look like a planetary ring seen at an angle)
+            // Tilt angle: negative tilts front down, back up
+            float tiltAngle = -0.45f;  // About 25 degrees
+            float cosT = cos(tiltAngle);
+            float sinT = sin(tiltAngle);
+            float arcX = torusX;
+            float arcY = torusY * cosT - torusZ * sinT;
+            float arcZ = torusY * sinT + torusZ * cosT;
+
+            // Offset to position the ring (65% up from bottom at the sides)
+            arcY += height * 0.15f;
+
+            // Z position - push spawn further back
+            float spawnZ = arcZ - 4.0f;
+
+            // Add small jitter for natural variation
+            std::uniform_real_distribution<float> arcJitter(-0.05f, 0.05f);
+            arcX += arcJitter(gen);
+            arcY += arcJitter(gen) * 0.3f;
+
+            // Calculate velocity to travel from arc spawn to target in collision time
+            vx = (centroidX - arcX) / collisionTime;
+            vy = (centroidY - arcY) / collisionTime;
+            vz = (0.0f - spawnZ) / collisionTime;  // Target Z is 0
         }
 
         // Random rotation axis (normalized) for initial orientation
@@ -4940,8 +5001,8 @@ void updateParticles(Graphics& graphics, float deltaTime) {
 
             // Impact overshoot effect - deflects backward then bounces back
             // Central triangles have stronger overshoot (debris impact on shield)
-            float overshootAmount = p.isCentral ? 0.225f : 0.012f;
-            float overshootDuration = p.isCentral ? 0.25f : 0.18f;
+            float overshootAmount = p.isCentral ? 0.425f : 0.112f;
+            float overshootDuration = p.isCentral ? 1.0f : 0.48f;
             float overshootZ = 0.0f;
 
             if (timeSinceHit < overshootDuration) {
@@ -4974,10 +5035,22 @@ void updateParticles(Graphics& graphics, float deltaTime) {
                 }
             } else {
                 // Normal glow for outer triangles
-                float glowDuration = 0.8f;
-                if (timeSinceHit < glowDuration) {
-                    glow = exp(-3.0f * timeSinceHit / glowDuration);
-                }
+                // float glowDuration = 0.8f;
+                // if (timeSinceHit < glowDuration) {
+                //     glow = exp(-3.0f * timeSinceHit / glowDuration);
+                // }
+                glow = 0.0f;
+                // float pulseDuration = 0.1f;
+                // if (timeSinceHit < pulseDuration) {
+                //     float pulseProgress = timeSinceHit / pulseDuration;
+                //     float scaleEnc = (p.pulseScale - 0.6f) * 1.0f;  // 0-4
+                //     glow = 30.0f + scaleEnc + pulseProgress * 0.5f;
+                // } else {
+                //     glow = 0.0f;  // Pulse complete
+                // }
+                float glowDuration = 0.5f;
+                glow = exp(-5.0f * timeSinceHit / glowDuration);
+
             }
         } else {
             // Flying towards collision point along velocity trajectory
@@ -5298,6 +5371,8 @@ void initialize3DRendering(Graphics& graphics, int width, int height) {
 
     graphics.gridVertexCount = gridIndices.size();
     graphics.useGridMode = true; // Start with grid mode to show particle animation
+    graphics.gridModeTransitionTimer = 0.0f;
+    graphics.allParticlesLocked = false;
 
     glGenVertexArrays(1, &graphics.gridVAO);
     glGenBuffers(1, &graphics.gridVBO);
@@ -5514,7 +5589,7 @@ void resize3DRendering(Graphics& graphics, int width, int height) {
     graphics.gridVertexCount = gridIndices.size();
 
     // Reinitialize particles for new grid dimensions
-    initializeParticles(graphics, gridVertices, planeWidth, planeHeight, 3.0f);
+    initializeParticles(graphics, gridVertices, planeWidth, planeHeight, 4.0f);
 
     glBindBuffer(GL_ARRAY_BUFFER, graphics.gridVBO);
     glBufferData(GL_ARRAY_BUFFER, graphics.gridVertices.size() * sizeof(float), graphics.gridVertices.data(), GL_DYNAMIC_DRAW);
@@ -7130,14 +7205,21 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
         
         auto window = it.field<Window>(0);
         auto cursor_state = it.field<CursorState>(1);
-        
+
+        // Hide cursor while in grid mode (3D triangle animation)
+        const Graphics* graphics = world->lookup("Graphics").try_get<Graphics>();
+        if (graphics && graphics->useGridMode) {
+            glfwSetInputMode(window->handle, GLFW_CURSOR, GLFW_CURSOR_HIDDEN);
+            return;
+        }
+        glfwSetInputMode(window->handle, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
 
         // DEBUG BOUNDS
         // for (EditorShiftRegion& shift_region : editor_root->shift_regions)
         // {
         //     RenderQueue& queue = world->ensure<RenderQueue>();
         //     RectRenderable debug_rect;
-        //     debug_rect.width = shift_region.bounds.xmax - shift_region.bounds.xmin; 
+        //     debug_rect.width = shift_region.bounds.xmax - shift_region.bounds.xmin;
         //     debug_rect.height = shift_region.bounds.ymax - shift_region.bounds.ymin;
         //     debug_rect.color = 0xFF00FFFF;
         //     debug_rect.stroke = true;
@@ -7209,7 +7291,7 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
                 updateParticles(graphics, deltaTime);
                 uploadParticleVertices(graphics);
 
-                // Check if all triangles are locked - switch to plane mode
+                // Check if all triangles are locked - switch to plane mode after delay
                 if (graphics.useGridMode) {
                     bool allLocked = true;
                     for (const auto& p : graphics.particles) {
@@ -7219,7 +7301,14 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
                         }
                     }
                     if (allLocked) {
-                        graphics.useGridMode = false;
+                        if (!graphics.allParticlesLocked) {
+                            graphics.allParticlesLocked = true;
+                            graphics.gridModeTransitionTimer = 0.0f;
+                        }
+                        graphics.gridModeTransitionTimer += deltaTime;
+                        if (graphics.gridModeTransitionTimer >= 1.0f) {
+                            graphics.useGridMode = false;
+                        }
                     }
                 }
             }
