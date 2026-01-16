@@ -389,6 +389,8 @@ struct CustomRenderable
     float width, height;
     bool stroke;
     uint32_t color;
+    uint32_t gradient_start = 0;
+    uint32_t gradient_end = 0;
 
     std::function<void(NVGcontext*, const RenderCommand*, const CustomRenderable&)> render_function;
 };
@@ -859,6 +861,20 @@ std::string tokens_to_template(const std::vector<SentenceToken>& tokens) {
 }
 
 // Word annotation selector - highlights words for annotation
+// Stored message data for annotation
+struct StoredMessage {
+    std::string sentence_template;
+    flecs::entity parent_entity;
+    std::vector<flecs::entity> ui_entities;
+    std::vector<flecs::entity> selection_entities;
+    int token_count = 0;
+};
+
+// Global list of annotatable messages
+std::vector<StoredMessage> g_annotatable_messages;
+int g_current_message_idx = -1;  // -1 means no message selected
+
+// Single annotation selector - moves between messages
 struct WordAnnotationSelector {
     std::string sentence_template;              // Template string with {{entity, n}} bindings
     std::vector<flecs::entity> ui_entities;     // Current UI entities (recreated from template)
@@ -893,6 +909,9 @@ struct TriangleParticle {
     float baryX, baryY, baryZ;  // Barycentric coordinates for edge detection
     int vertexIndex;  // Which vertex in the buffer
     bool locked;  // Has reached target
+    bool isCentral;  // Part of central triangle (for impact glow intensity)
+    float pulseScale;  // Random scale variation for pulse (0.6 - 1.4)
+    float pulseRotation;  // Random rotation for pulse asymmetry
 };
 
 // Noise tetrahedron that flies past without joining grid
@@ -1685,40 +1704,51 @@ struct RenderCommand {
 };
 
 
-void draw_double_arrow(NVGcontext* vg, const RenderCommand* cmd, const CustomRenderable& data) 
+void draw_double_arrow(NVGcontext* vg, const RenderCommand* cmd, const CustomRenderable& data)
 {
-    float x = cmd->pos.x; 
+    float x = cmd->pos.x;
     float y = cmd->pos.y;
-    
+
     float leftArrowStartX = x + data.height/2.0f;
     float rightArrowStartX = x + data.width-data.height/2.0f;
     float midY = y + data.height / 2.0f;
 
     nvgBeginPath(vg);
-    
-    nvgMoveTo(vg, leftArrowStartX, y); 
-    nvgLineTo(vg, x, midY); 
-    nvgLineTo(vg, leftArrowStartX, y+data.height); 
-    nvgLineTo(vg, rightArrowStartX, y+data.height); 
-    nvgLineTo(vg, x+data.width, midY); 
-    nvgLineTo(vg, rightArrowStartX, y); 
-    
+
+    nvgMoveTo(vg, leftArrowStartX, y);
+    nvgLineTo(vg, x, midY);
+    nvgLineTo(vg, leftArrowStartX, y+data.height);
+    nvgLineTo(vg, rightArrowStartX, y+data.height);
+    nvgLineTo(vg, x+data.width, midY);
+    nvgLineTo(vg, rightArrowStartX, y);
+
     nvgClosePath(vg);
 
-    // Convert uint32_t color to NVGcolor (assuming ARGB or RGBA)
-    // This example assumes RGBA: 0xRRGGBBAA
-    unsigned char r = (data.color >> 24) & 0xFF;
-    unsigned char g = (data.color >> 16) & 0xFF;
-    unsigned char b = (data.color >> 8) & 0xFF;
-    unsigned char a = (data.color) & 0xFF;
-    NVGcolor color = nvgRGBA(r, g, b, a);
-
     if (data.stroke) {
-        nvgStrokeColor(vg, color);
+        // Stroke with outline color
+        unsigned char r = (data.color >> 24) & 0xFF;
+        unsigned char g = (data.color >> 16) & 0xFF;
+        unsigned char b = (data.color >> 8) & 0xFF;
+        unsigned char a = (data.color) & 0xFF;
+        nvgStrokeColor(vg, nvgRGBA(r, g, b, a));
         nvgStrokeWidth(vg, 1.0f);
         nvgStroke(vg);
     } else {
-        nvgFillColor(vg, color);
+        // Fill with horizontal gradient if gradient colors are set
+        if (data.gradient_start != 0 || data.gradient_end != 0) {
+            uint32_t start = data.gradient_start ? data.gradient_start : data.color;
+            uint32_t end = data.gradient_end ? data.gradient_end : data.color;
+            NVGcolor startColor = nvgRGBA((start >> 24) & 0xFF, (start >> 16) & 0xFF, (start >> 8) & 0xFF, start & 0xFF);
+            NVGcolor endColor = nvgRGBA((end >> 24) & 0xFF, (end >> 16) & 0xFF, (end >> 8) & 0xFF, end & 0xFF);
+            NVGpaint gradient = nvgLinearGradient(vg, x, midY, x + data.width, midY, startColor, endColor);
+            nvgFillPaint(vg, gradient);
+        } else {
+            unsigned char r = (data.color >> 24) & 0xFF;
+            unsigned char g = (data.color >> 16) & 0xFF;
+            unsigned char b = (data.color >> 8) & 0xFF;
+            unsigned char a = (data.color) & 0xFF;
+            nvgFillColor(vg, nvgRGBA(r, g, b, a));
+        }
         nvgFill(vg);
     }
 }
@@ -1805,7 +1835,7 @@ flecs::entity create_badge_impl(flecs::entity parent, flecs::entity UIElement,
         badge = world->entity()
             .is_a(UIElement)
             .child_of(parent)
-            .set<CustomRenderable>({100.0f, 25.0f, true, outline_color, draw_double_arrow})
+            .set<CustomRenderable>({100.0f, 25.0f, true, outline_color, 0, 0, draw_double_arrow})
             .set<RenderGradient>({dark, very_dark}) // Vertical gradient
             .set<UIContainer>({xPad, 3})
             .set<ZIndex>({20});
@@ -1947,8 +1977,30 @@ void recreate_annotation_entities(WordAnnotationSelector& selector) {
             // Create relationship badge with source/target images as children
             // Note: ImageCreator observer prepends "../assets/" so paths are relative to that
 
+            // Look up source and target entity colors first for outline averaging
+            uint32_t src_color = 0xc72783FF; // default pink
+            uint32_t tgt_color = 0xc72783FF;
+            if (token.source_digit >= 0) {
+                auto it = entity_color_cache.find(token.source_digit);
+                if (it != entity_color_cache.end()) {
+                    src_color = it->second;
+                }
+            }
+            if (token.target_digit >= 0) {
+                auto it = entity_color_cache.find(token.target_digit);
+                if (it != entity_color_cache.end()) {
+                    tgt_color = it->second;
+                }
+            }
+
+            // Average the RGB components for outline color
+            uint8_t avg_r = (((src_color >> 24) & 0xFF) + ((tgt_color >> 24) & 0xFF)) / 2;
+            uint8_t avg_g = (((src_color >> 16) & 0xFF) + ((tgt_color >> 16) & 0xFF)) / 2;
+            uint8_t avg_b = (((src_color >> 8) & 0xFF) + ((tgt_color >> 8) & 0xFF)) / 2;
+            uint32_t avg_color = (avg_r << 24) | (avg_g << 16) | (avg_b << 8) | 0xFF;
+
             // 1. Create the double arrow badge container
-            uint32_t base_color = 0xc72783FF;
+            uint32_t base_color = avg_color;
             uint32_t dark = base_color;
             uint32_t very_dark = scale_color(base_color, 0.2f);
             uint32_t light = scale_color(base_color, 1.3f);
@@ -1958,7 +2010,7 @@ void recreate_annotation_entities(WordAnnotationSelector& selector) {
             flecs::entity badge = world->entity()
                 .is_a(UIElement)
                 .child_of(selector.parent_entity)
-                .set<CustomRenderable>({100.0f, 25.0f, true, outline_color, draw_double_arrow})
+                .set<CustomRenderable>({100.0f, 25.0f, true, outline_color, 0, 0, draw_double_arrow})
                 .set<RenderGradient>({dark, very_dark})
                 .set<UIContainer>({xPad, 0})
                 .set<ZIndex>({20});
@@ -1975,15 +2027,8 @@ void recreate_annotation_entities(WordAnnotationSelector& selector) {
             std::string src_path = token.source_digit >= 0
                 ? "mnist/set_0/" + std::to_string(token.source_digit) + ".png"
                 : "wildcard.png";
-            // Tint with entity color if bound
-            NVGcolor src_tint = nvgRGBA(255, 255, 255, 255);
-            if (token.source_digit >= 0) {
-                auto it = entity_color_cache.find(token.source_digit);
-                if (it != entity_color_cache.end()) {
-                    uint32_t c = it->second;
-                    src_tint = nvgRGBA((c >> 24) & 0xFF, (c >> 16) & 0xFF, (c >> 8) & 0xFF, 255);
-                }
-            }
+            // Tint with entity color if bound (reuse src_color from earlier lookup)
+            NVGcolor src_tint = nvgRGBA((src_color >> 24) & 0xFF, (src_color >> 16) & 0xFF, (src_color >> 8) & 0xFF, 255);
             flecs::entity source_ent = world->entity()
                 .is_a(UIElement)
                 .child_of(badge_content)
@@ -2045,15 +2090,8 @@ void recreate_annotation_entities(WordAnnotationSelector& selector) {
             std::string tgt_path = token.target_digit >= 0
                 ? "mnist/set_0/" + std::to_string(token.target_digit) + ".png"
                 : "wildcard.png";
-            // Tint with entity color if bound
-            NVGcolor tgt_tint = nvgRGBA(255, 255, 255, 255);
-            if (token.target_digit >= 0) {
-                auto it = entity_color_cache.find(token.target_digit);
-                if (it != entity_color_cache.end()) {
-                    uint32_t c = it->second;
-                    tgt_tint = nvgRGBA((c >> 24) & 0xFF, (c >> 16) & 0xFF, (c >> 8) & 0xFF, 255);
-                }
-            }
+            // Tint with entity color if bound (reuse tgt_color from earlier lookup)
+            NVGcolor tgt_tint = nvgRGBA((tgt_color >> 24) & 0xFF, (tgt_color >> 16) & 0xFF, (tgt_color >> 8) & 0xFF, 255);
             flecs::entity target_ent = world->entity()
                 .is_a(UIElement)
                 .child_of(badge_content)
@@ -2198,7 +2236,7 @@ std::vector<std::string> editor_types =
     "Void",
     // "ECS Graph", // Entity component relationship
     "Peach Core",
-    "Interlocutor", // Queue or Stream
+    "In-Situ Interlocutor", // Queue or Stream
     "VNC Stream",
     "Healthbar",
     // "Gynoid",
@@ -2912,7 +2950,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
             world->entity()
             .is_a(UIElement)
             .set<Align>({0.0f, 0.0f, 0.8f, 0.0f})
-            .set<CustomRenderable>({24*3, 24*3, false, i % 2 == 1 ? 0x222327FF : 0x121212FF, draw_diamond})
+            .set<CustomRenderable>({24*3, 24*3, false, i % 2 == 1 ? 0x222327FF : 0x121212FF, 0, 0, draw_diamond})
             .set<ZIndex>({14})
             .add<ScissorContainer>(leaf.target<EditorCanvas>())
             .child_of(channels_2);
@@ -2948,13 +2986,6 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         
 
         // std::vector<std::string> bfo_categories = {"entity", "continuant", "occurrent", "process_boundary", "process", "spatiotemporal_region", "temporal_interval", "independent_continuant", "material"entity, "fiat_object_part", "specifically_dependent_continuant", "generically_dependent_continuant", "object_aggregate", "object", "site", "spatial_region", "immaterial_entity"};
-    } else if (editor_type == EditorType::Void)
-    {
-        auto test = world->entity()
-        .is_a(UIElement)
-        .set<CustomRenderable>({100.0f, 25.0f, true, 0xFFFFFFFF, draw_double_arrow}) // Support custom arrow badge
-        .set<ZIndex>({30})
-        .child_of(leaf.target<EditorCanvas>());
     } else if (editor_type == EditorType::SceneGraph)
     {
         flecs::entity root = world->entity()
@@ -2968,12 +2999,12 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
     }
     else
     {
-        auto editor_icon_bkg_square = world->entity()
-        .is_a(UIElement)
-        .child_of(leaf.target<EditorCanvas>())
-        .set<Position, Local>({4.0f, 12.0f})
-        .set<TextRenderable>({editor_types[(int)editor_type].c_str(), "Inter", 16.0f, 0xFFFFFFFF})
-        .set<ZIndex>({1000});
+        // auto editor_icon_bkg_square = world->entity()
+        // .is_a(UIElement)
+        // .child_of(leaf.target<EditorCanvas>())
+        // .set<Position, Local>({4.0f, 12.0f})
+        // .set<TextRenderable>({editor_types[(int)editor_type].c_str(), "Inter", 16.0f, 0xFFFFFFFF})
+        // .set<ZIndex>({1000});
     }
 }
 
@@ -3635,6 +3666,14 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
         if (key == GLFW_KEY_TAB)
         {
             annotation_query.each([](flecs::entity e, WordAnnotationSelector& selector) {
+                // Save full state before toggling
+                if (selector.active && g_current_message_idx >= 0 && g_current_message_idx < (int)g_annotatable_messages.size()) {
+                    auto& msg = g_annotatable_messages[g_current_message_idx];
+                    msg.sentence_template = selector.sentence_template;
+                    msg.ui_entities = selector.ui_entities;  // Keep copy, don't move - entities stay visible
+                    msg.selection_entities = selector.selection_entities;
+                    msg.token_count = selector.token_count;
+                }
                 selector.active = !selector.active;
                 if (selector.active && !selector.sentence_template.empty()) {
                     selector.start_index = 0;  // Reset to first word when activating
@@ -3690,6 +3729,55 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                 }
             });
             if (handled) return;
+        }
+
+        // Up/Down arrows - cycle between message annotations
+        if (key == GLFW_KEY_UP || key == GLFW_KEY_DOWN)
+        {
+            if (g_annotatable_messages.size() > 1) {
+                annotation_query.each([&](flecs::entity e, WordAnnotationSelector& selector) {
+                    if (!selector.active) return;
+
+                    // Save current message state back to storage (don't move, just copy refs)
+                    if (g_current_message_idx >= 0 && g_current_message_idx < (int)g_annotatable_messages.size()) {
+                        auto& msg = g_annotatable_messages[g_current_message_idx];
+                        msg.sentence_template = selector.sentence_template;
+                        msg.ui_entities = selector.ui_entities;
+                        msg.selection_entities = selector.selection_entities;
+                        msg.token_count = selector.token_count;
+                    }
+
+                    // Calculate next message index
+                    int next_idx;
+                    if (key == GLFW_KEY_UP) {
+                        next_idx = (g_current_message_idx - 1 + (int)g_annotatable_messages.size()) % (int)g_annotatable_messages.size();
+                    } else {
+                        next_idx = (g_current_message_idx + 1) % (int)g_annotatable_messages.size();
+                    }
+
+                    // Switch to new message - point to its state
+                    g_current_message_idx = next_idx;
+                    auto& new_msg = g_annotatable_messages[next_idx];
+                    selector.sentence_template = new_msg.sentence_template;
+                    selector.parent_entity = new_msg.parent_entity;
+                    selector.ui_entities = new_msg.ui_entities;
+                    selector.selection_entities = new_msg.selection_entities;
+                    selector.token_count = new_msg.token_count;
+                    selector.start_index = 0;
+                    selector.end_index = 0;
+
+                    // If no UI entities yet for this message, create them
+                    if (selector.ui_entities.empty() && !selector.sentence_template.empty()) {
+                        selector.dirty = true;
+                        recreate_annotation_entities(selector);
+                        // Save newly created entities back
+                        new_msg.ui_entities = selector.ui_entities;
+                        new_msg.selection_entities = selector.selection_entities;
+                        new_msg.token_count = selector.token_count;
+                    }
+                });
+                return;
+            }
         }
 
         // Number keys (0-9) - assign digit to selected token/part
@@ -4353,9 +4441,30 @@ void main()
     vec3 pos = aPos;
 
     // In glow pass, expand vertices outward from centroid
+    // Glow encoding: 0-2 = normal glow, 10+ = central pulse (10 = start, 12 = fully expanded)
     if (glowPass == 1 && aGlow > 0.0) {
         vec2 expandDir = normalize(aCentroidOffset);
-        float expandAmount = glowExpand * aGlow;
+        float expandAmount;
+
+        if (aGlow >= 10.0) {
+            // Central pulse: decode scale and progress
+            // Format: glow = 10.0 + (scale-0.6)*5.0 + progress*0.5
+            float encoded = aGlow - 10.0;
+            float scaleEnc = floor(encoded / 0.5) * 0.5;  // Quantized scale portion
+            float pulseProgress = clamp((encoded - scaleEnc) / 0.5, 0.0, 1.0);
+            float pulseScale = scaleEnc / 5.0 + 0.6;  // Recover 0.6-1.4 range
+
+            // Ease out for smooth deceleration as it expands
+            float easedProgress = 1.0 - (1.0 - pulseProgress) * (1.0 - pulseProgress);
+
+            // Add rotational asymmetry using centroid offset angle
+            float angle = atan(aCentroidOffset.y, aCentroidOffset.x);
+            float wobble = 1.0 + 0.3 * sin(angle * 3.0 + pulseScale * 10.0);  // Asymmetric shape
+
+            expandAmount = glowExpand * pulseScale * 2.0 * easedProgress * 20.0 * wobble;
+        } else {
+            expandAmount = glowExpand * aGlow;
+        }
         pos.xy += expandDir * expandAmount;
     }
 
@@ -4387,19 +4496,57 @@ void main()
         // Distance from center using barycentric (0.33 at center, 0 at edges)
         float minBary = min(min(Bary.x, Bary.y), Bary.z);
 
-        // Soft radial falloff - bright at outer edge, fading inward
-        // minBary is ~0 at edges, ~0.33 at center
-        float edgeness = 1.0 - minBary * 3.0;  // 1 at edges, 0 at center
+        // Check if this is a central pulse (glow >= 10.0)
+        if (Glow >= 10.0) {
+            // Central pulse with rounded corners - decode scale and progress
+            float encoded = Glow - 10.0;
+            float scaleEnc = floor(encoded / 0.5) * 0.5;
+            float pulseProgress = clamp((encoded - scaleEnc) / 0.5, 0.0, 1.0);
+            float pulseScale = scaleEnc / 5.0 + 0.6;
 
-        // Very gentle cubic falloff for soft blur
-        float t = clamp(edgeness, 0.0, 1.0);
-        float glowIntensity = t * t * (3.0 - 2.0 * t);  // Smooth hermite
-        glowIntensity *= Glow * 0.35;  // Subtle intensity
+            // Create rounded corners by using a smooth distance from edges
+            // Transform barycentric to a rounded shape - vary by scale
+            float cornerRadius = 0.1 + pulseScale * 0.1;  // Bigger pulses = rounder corners
+            float smoothEdge = smoothstep(0.0, cornerRadius, minBary);
 
-        // Soft warm yellow glow
-        vec3 glowColor = vec3(1.0, 0.92, 0.6);
+            // Radial falloff from center for soft edge blur
+            float centerDist = 1.0 - minBary * 3.0;  // 0 at center, 1 at edges
+            float edgeSoftness = 0.3;
+            float radialFalloff = 1.0 - smoothstep(1.0 - edgeSoftness, 1.0, centerDist);
 
-        FragColor = vec4(glowColor * glowIntensity, glowIntensity * 0.6);
+            // Combine rounded corners with radial falloff
+            float shapeMask = smoothEdge * radialFalloff;
+
+            // Intensity fades as pulse expands outward - vary by scale
+            float fadeIntensity = 1.0 - pulseProgress * (0.5 + pulseScale * 0.3);
+            // Add a bright leading edge that travels outward - vary ring width by scale
+            float ringWidth = 0.15 + pulseScale * 0.15;
+            float ringPos = pulseProgress;
+            float normalizedDist = centerDist;
+            float ringIntensity = exp(-pow((normalizedDist - ringPos) / ringWidth, 2.0) * 2.0);
+
+            float glowIntensity = (fadeIntensity * 0.15 + ringIntensity * 0.3) * shapeMask;
+            glowIntensity *= 0.5;  // Subtle enough to see character beneath
+
+            // Warm shield pulse color (slightly cyan-shifted for energy feel)
+            vec3 glowColor = mix(vec3(1.0, 0.95, 0.7), vec3(0.7, 0.95, 1.0), pulseProgress * 0.3);
+
+            FragColor = vec4(glowColor * glowIntensity, glowIntensity * 0.4);
+        } else {
+            // Normal glow for outer triangles
+            // Soft radial falloff - bright at outer edge, fading inward
+            float edgeness = 1.0 - minBary * 3.0;  // 1 at edges, 0 at center
+
+            // Very gentle cubic falloff for soft blur
+            float t = clamp(edgeness, 0.0, 1.0);
+            float glowIntensity = t * t * (3.0 - 2.0 * t);  // Smooth hermite
+            glowIntensity *= Glow * 0.35;  // Subtle intensity
+
+            // Soft warm yellow glow
+            vec3 glowColor = vec3(1.0, 0.92, 0.6);
+
+            FragColor = vec4(glowColor * glowIntensity, glowIntensity * 0.6);
+        }
     } else {
         // Normal pass: render textured triangle
         // Use transparency for UVs outside the 0-1 range (edge triangles)
@@ -4760,6 +4907,13 @@ void initializeParticles(Graphics& graphics, const std::vector<float>& targetVer
             p.hitTime = -1.0f;  // Not hit yet
             p.vertexIndex = i;
             p.locked = false;
+            p.isCentral = isInCentralTriangle;
+
+            // Pulse variation based on debris velocity magnitude and rotation
+            float velocityMag = sqrt(vx*vx + vy*vy + vz*vz);
+            p.pulseScale = 0.6f + (velocityMag / 4.0f) * 0.8f;  // Faster debris = bigger pulse
+            p.pulseScale = std::min(p.pulseScale, 1.4f);
+            p.pulseRotation = rotAngle;  // Use debris rotation for pulse asymmetry
 
             graphics.particles.push_back(p);
         }
@@ -4775,23 +4929,55 @@ void updateParticles(Graphics& graphics, float deltaTime) {
         float glow = 0.0f;
 
         if (p.locked || p.elapsedTime >= p.collisionTime) {
-            // Collision happened - locked at target position
-            x = p.targetX;
-            y = p.targetY;
-            z = p.targetZ;
-
             // Track first hit time for glow effect
             if (!p.locked) {
                 p.hitTime = p.elapsedTime;
             }
             p.locked = true;
 
-            // Compute glow: starts at 1.0 on hit, fades out over ~0.8 seconds
+            // Time since impact
             float timeSinceHit = p.elapsedTime - p.hitTime;
-            float glowDuration = 0.8f;
-            if (timeSinceHit < glowDuration) {
-                // Smooth fade out with exponential decay for soft look
-                glow = exp(-3.0f * timeSinceHit / glowDuration);
+
+            // Impact overshoot effect - deflects backward then bounces back
+            // Central triangles have stronger overshoot (debris impact on shield)
+            float overshootAmount = p.isCentral ? 0.225f : 0.012f;
+            float overshootDuration = p.isCentral ? 0.25f : 0.18f;
+            float overshootZ = 0.0f;
+
+            if (timeSinceHit < overshootDuration) {
+                // Damped spring oscillation for bounce-back effect
+                // z(t) = A * sin(ωt) * e^(-bt) where ω gives ~1.5 oscillations
+                float t = timeSinceHit / overshootDuration;
+                float omega = 4.5f * M_PI;  // ~1.5 oscillations
+                float damping = 4.0f;
+                overshootZ = overshootAmount * sin(omega * t) * exp(-damping * t);
+            }
+
+            // Position with overshoot (negative Z = pushed back toward viewer)
+            x = p.targetX;
+            y = p.targetY;
+            z = p.targetZ - overshootZ;
+
+            // Compute glow based on triangle type
+            if (p.isCentral) {
+                // Central pulse: encode scale and progress in glow value
+                // Format: glow = 10.0 + (scale-0.6)*5.0 + progress*0.5
+                // Scale range 0.6-1.4 -> 0-4, progress 0-1 -> 0-0.5
+                // Total range: 10.0 to 14.5
+                float pulseDuration = 0.8f;
+                if (timeSinceHit < pulseDuration) {
+                    float pulseProgress = timeSinceHit / pulseDuration;
+                    float scaleEnc = (p.pulseScale - 0.6f) * 5.0f;  // 0-4
+                    glow = 10.0f + scaleEnc + pulseProgress * 0.5f;
+                } else {
+                    glow = 0.0f;  // Pulse complete
+                }
+            } else {
+                // Normal glow for outer triangles
+                float glowDuration = 0.8f;
+                if (timeSinceHit < glowDuration) {
+                    glow = exp(-3.0f * timeSinceHit / glowDuration);
+                }
             }
         } else {
             // Flying towards collision point along velocity trajectory
@@ -7850,26 +8036,53 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
                             .add(flecs::OrderedChildren)
                             .child_of(pending->message_list);
 
-                        // Create annotation selector with template string
-                        auto annotation_entity = world->entity()
-                            .set<WordAnnotationSelector>({
-                                pending->draft,           // sentence_template
-                                {},                       // ui_entities (empty, created below)
-                                {},                       // selection_entities (empty, created below)
-                                meta_response_data,       // parent_entity
-                                0, 0,                     // start_index, end_index
-                                0,                        // token_count (set by recreate)
-                                false,                    // active
-                                true,                     // dirty
-                                0x4488FFAA                // highlight_color
-                            })
-                            .set<Position, World>({0, 0})
-                            .set<RectRenderable>({0, 0, false, 0x4488FFAA})
-                            .set<RenderStatus>({true})
-                            .set<ZIndex>({15});
+                        // Register message in global list
+                        g_annotatable_messages.push_back({pending->draft, meta_response_data});
+                        int msg_idx = (int)g_annotatable_messages.size() - 1;
 
-                        // Create UI entities immediately (not in a per-frame system)
-                        WordAnnotationSelector& selector = annotation_entity.ensure<WordAnnotationSelector>();
+                        // Create or update the single global annotation selector
+                        static flecs::entity g_annotation_entity = flecs::entity::null();
+                        if (!g_annotation_entity.is_valid() || !g_annotation_entity.is_alive()) {
+                            g_annotation_entity = world->entity()
+                                .set<WordAnnotationSelector>({
+                                    pending->draft,           // sentence_template
+                                    {},                       // ui_entities
+                                    {},                       // selection_entities
+                                    meta_response_data,       // parent_entity
+                                    0, 0,                     // start_index, end_index
+                                    0,                        // token_count
+                                    false,                    // active
+                                    true,                     // dirty
+                                    0x4488FFAA                // highlight_color
+                                })
+                                .set<Position, World>({0, 0})
+                                .set<RectRenderable>({0, 0, false, 0x4488FFAA})
+                                .set<RenderStatus>({true})
+                                .set<ZIndex>({15});
+                        } else {
+                            // Save current message state before switching
+                            WordAnnotationSelector& selector = g_annotation_entity.ensure<WordAnnotationSelector>();
+                            if (g_current_message_idx >= 0 && g_current_message_idx < (int)g_annotatable_messages.size()) {
+                                auto& old_msg = g_annotatable_messages[g_current_message_idx];
+                                old_msg.sentence_template = selector.sentence_template;
+                                old_msg.ui_entities = selector.ui_entities;
+                                old_msg.selection_entities = selector.selection_entities;
+                                old_msg.token_count = selector.token_count;
+                            }
+                            // Point selector to new message (don't destroy old entities!)
+                            selector.ui_entities.clear();
+                            selector.selection_entities.clear();
+                            selector.sentence_template = pending->draft;
+                            selector.parent_entity = meta_response_data;
+                            selector.start_index = 0;
+                            selector.end_index = 0;
+                            selector.dirty = true;
+                        }
+
+                        g_current_message_idx = msg_idx;
+
+                        // Create UI entities immediately
+                        WordAnnotationSelector& selector = g_annotation_entity.ensure<WordAnnotationSelector>();
                         recreate_annotation_entities(selector);
                     } else {
                     // Parse JSON and create dynamic badges
