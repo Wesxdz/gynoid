@@ -924,7 +924,12 @@ struct NoiseTetrahedron {
     float rotAngle;
 };
 
-struct TimeEventRowChannel {};
+struct TimeEventRowChannel 
+{   
+    int scaleForMinimumCount;
+};
+
+struct CopyChildHeight {};
 
 struct Graphics {
     NVGcontext* vg;
@@ -1068,6 +1073,9 @@ struct Expand
     // (after applying ImageRenderable.scaleX/scaleY).
     bool cap_to_intrinsic = false;
 };
+
+// This is a special system tag to reduce UIElementBounds for LayoutBox
+struct ContractBoundsPostLayout {};
 
 struct UIContainer
 {
@@ -3163,6 +3171,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         auto frameChannel = world->entity()
         .is_a(UIElement)
         .set<FilmstripData>({7, {}})
+        .set<TimeEventRowChannel>({7})
         .add<FitChildren>()
         .set<Expand>({true, 0, 0, 1, false, 0, 0, 1.0})
         .set<LayoutBox>({LayoutBox::Horizontal})
@@ -3171,16 +3180,25 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         .add<ScissorContainer>(leaf.target<EditorCanvas>())
         .child_of(channels);
 
+        // TODO: Framespacer should have a component which copies the height of the maximum frameChannel child...
+        auto frameSpacer = world->entity()
+        .is_a(UIElement)
+        .set<Expand>({true, 0, 0, 1, false, 0, 0, 0})
+        .set<RectRenderable>({10.0f, 100.0f, false, 0xFFFF00FF })
+        .add<CopyChildHeight>(frameChannel)
+        .add<DebugRenderBounds>()
+        .child_of(channels);
+
         leaf.target<EditorCanvas>().add<FilmstripChannel>(frameChannel);
 
         // Mel spectrogram channel (24 seconds of system audio)
-        auto melSpecChannel = world->entity()
-        .is_a(UIElement)
-        .set<Expand>({true, 0, 0, 1, false, 0, 0, 0})
-        .set<LayoutBox>({LayoutBox::Horizontal})
-        .add(flecs::OrderedChildren)
-        .child_of(channels)
-        .add<ScissorContainer>(leaf.target<EditorCanvas>());
+        // auto melSpecChannel = world->entity()
+        // .is_a(UIElement)
+        // .set<Expand>({true, 0, 0, 1, false, 0, 0, 0})
+        // .set<LayoutBox>({LayoutBox::Horizontal})
+        // .add(flecs::OrderedChildren)
+        // .child_of(channels)
+        // .add<ScissorContainer>(leaf.target<EditorCanvas>());
         
 
         // Look up the system audio mel spec renderer
@@ -3195,11 +3213,10 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
             // Create mel spec display element
             world->entity()
                 .is_a(UIElement)
-                .child_of(melSpecChannel)
-                .set<ImageRenderable>({melSpec.nvgTextureHandle, 1.0f, 1.0f, (float)melSpec.width, (float)melSpec.height})
+                .child_of(channels)
+                .set<ImageRenderable>({melSpec.nvgTextureHandle, 1.0f, 1.0f, (float)melSpec.width, (float)melSpec.height/1})
                 .set<Expand>({true, 0.0f, 0.0f, 1.0f, false, 0.0f, 0.0f, 0.0f})
-                .set<Constrain>({true, true})
-                .set<Position, Local>({0.0f, 164.0f})
+                // .set<Constrain>({true, true})
                 .set<ZIndex>({18});
             std::cout << "[Episodic] Created mel spec display in channel" << std::endl;
         }
@@ -3209,7 +3226,6 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         }
 
         // TODO: Implement scissors/vertical scrollbar
-
 
         for (size_t i = 0; i < 12; i++)
         {
@@ -6698,11 +6714,12 @@ int main(int, char *[]) {
             });
         });
 
-    world->system<const UIElementBounds, LayoutBox, FitChildren, Graphics>()
+    world->system<const UIElementBounds, LayoutBox, FitChildren, TimeEventRowChannel*, Graphics>()
     .kind(flecs::PreUpdate)
     .term_at(0).parent()
+    .term_at(3).optional()
     .with<FitChildren>()
-    .each([](flecs::entity e, const UIElementBounds& container_bounds, LayoutBox& box, FitChildren& fit, Graphics& graphics) {
+    .each([](flecs::entity e, const UIElementBounds& container_bounds, LayoutBox& box, FitChildren& fit, TimeEventRowChannel* timeEvent, Graphics& graphics) {
         float container_w = container_bounds.xmax - container_bounds.xmin;
         float container_h = container_bounds.ymax - container_bounds.ymin;
         
@@ -6722,6 +6739,12 @@ int main(int, char *[]) {
         });
 
         if (child_count == 0 || total_intrinsic_w <= 0) return;
+
+        if (timeEvent)
+        {
+            total_intrinsic_w *= timeEvent->scaleForMinimumCount/child_count;
+            child_count = std::max(child_count, timeEvent->scaleForMinimumCount);
+        }
 
         // Pass 2: Calculate Scale Factors
         float total_padding = box.padding * (child_count - 1);
@@ -7186,8 +7209,8 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
     .term_at(0).parent()
     .term_at(3).optional()
     .kind(flecs::PreUpdate)
-    .each([&](flecs::entity e, UIElementBounds* bounds, ImageRenderable& sprite, Expand& expand, Constrain* constrain, Graphics& graphics) {        
-        if (!bounds) return;
+    .each([&](flecs::entity e, UIElementBounds* parent_bounds, ImageRenderable& sprite, Expand& expand, Constrain* constrain, Graphics& graphics) {        
+        if (!parent_bounds) return;
 
         int img_width, img_height;
         nvgImageSize(graphics.vg, sprite.imageHandle, &img_width, &img_height);
@@ -7205,8 +7228,8 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
         } 
         else {
             // PRIORITY 2: Fallback to standard Expand/Constrain logic
-            float avail_w = (bounds->xmax - bounds->xmin) - (expand.pad_left + expand.pad_right);
-            float avail_h = (bounds->ymax - bounds->ymin) - (expand.pad_top + expand.pad_bottom);
+            float avail_w = (parent_bounds->xmax - parent_bounds->xmin) - (expand.pad_left + expand.pad_right);
+            float avail_h = (parent_bounds->ymax - parent_bounds->ymin) - (expand.pad_top + expand.pad_bottom);
 
             if (expand.x_enabled) {
                 float target_w = avail_w;
@@ -7904,7 +7927,7 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
 
     auto spaceframeSelector = world->system<FilmstripData>()
     .kind(flecs::PreFrame)
-    .immediate()
+    // .immediate()
     .each([&](flecs::entity e, FilmstripData& data)
     {
         e.children([&](flecs::entity child)
@@ -7917,6 +7940,19 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
             data.frames[i].child_of(e);
             data.frames[i].ensure<RenderStatus>().visible = true;
         }
+    });
+
+    world->system<RectRenderable>()
+    .kind(flecs::PostLoad)
+    .with<CopyChildHeight>(flecs::Wildcard)
+    .each([&](flecs::entity e, RectRenderable& rect)
+    {
+        flecs::entity target = e.target<CopyChildHeight>();
+        target.children([&](flecs::entity child)
+        {
+            UIElementBounds& bounds = child.ensure<UIElementBounds>();
+            rect.height = bounds.ymax - bounds.ymin;
+        });
     });
 
     auto vncTextureUpdateSystem = world->system<VNCClientHandle>()
@@ -8131,7 +8167,13 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
                                 .set<Expand>({false, 4.0f, 4.0f, 1.0f, true, 0.0f, 0.0f, 1.0f, true});
                                  
                                 // .child_of(leaf.target<EditorCanvas>().target<FilmstripChannel>());
-                                leaf.target<EditorCanvas>().target<FilmstripChannel>().ensure<FilmstripData>().frames.push_back(frame);
+                                FilmstripData& filmstripData = leaf.target<EditorCanvas>().target<FilmstripChannel>().ensure<FilmstripData>();
+                                filmstripData.frames.push_back(frame);
+                                if (filmstripData.frames.size() > filmstripData.frame_limit)
+                                {
+                                    filmstripData.frames[0].destruct();
+                                    filmstripData.frames.erase(filmstripData.frames.begin());
+                                }
                             }
                         });
 
