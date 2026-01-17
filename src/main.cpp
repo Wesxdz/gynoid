@@ -1167,9 +1167,9 @@ void propagate_world_positions(flecs::entity entity) {
     });
 }
 
-// Calculate total extent of children using Position Local + UIElementSize
-// Returns the bounding box in LOCAL coordinates relative to parent
-void calculate_children_extent(flecs::entity parent, float& max_x, float& max_y, bool& found) {
+// Calculate bounding box of children using Position Local + UIElementSize
+// Returns min/max in LOCAL coordinates relative to parent
+void calculate_children_local_bounds(flecs::entity parent, float& min_x, float& min_y, float& max_x, float& max_y, bool& found) {
     parent.children([&](flecs::entity child) {
         if (child.has<Expand>()) return; // Skip expand entities
 
@@ -1177,14 +1177,20 @@ void calculate_children_extent(flecs::entity parent, float& max_x, float& max_y,
         const UIElementSize* size = child.try_get<UIElementSize>();
 
         if (local && size && size->width > 0 && size->height > 0) {
+            float child_xmin = local->x;
+            float child_ymin = local->y;
             float child_xmax = local->x + size->width;
             float child_ymax = local->y + size->height;
 
             if (!found) {
+                min_x = child_xmin;
+                min_y = child_ymin;
                 max_x = child_xmax;
                 max_y = child_ymax;
                 found = true;
             } else {
+                min_x = std::min(min_x, child_xmin);
+                min_y = std::min(min_y, child_ymin);
                 max_x = std::max(max_x, child_xmax);
                 max_y = std::max(max_y, child_ymax);
             }
@@ -1193,23 +1199,28 @@ void calculate_children_extent(flecs::entity parent, float& max_x, float& max_y,
 }
 
 // Forward declaration for mutual recursion
-void process_layout_recursive(flecs::entity e);
+void process_layout_recursive(flecs::entity e, float available_width = 10000.0f);
 
-// Update UIContainer size from children's extent
+// Update UIContainer size from children's local bounds
+// Children are assumed to already be positioned (e.g., by LayoutBox or manually)
+// Padding is applied: left/top padding is implicit in children positions,
+// right/bottom padding is added to max extent
 void update_ui_container_size(flecs::entity e) {
     UIContainer* container = e.try_get_mut<UIContainer>();
     if (!container) return;
 
-    float max_x = 0.0f, max_y = 0.0f;
+    float min_x = 0.0f, min_y = 0.0f, max_x = 0.0f, max_y = 0.0f;
     bool found = false;
-    calculate_children_extent(e, max_x, max_y, found);
+    calculate_children_local_bounds(e, min_x, min_y, max_x, max_y, found);
 
     if (found) {
+        // Container encompasses children extent plus padding on right/bottom
+        // Left/top padding is expected to be in children's positions already
         UIElementSize& size = e.ensure<UIElementSize>();
-        size.width = max_x + (container->pad_horizontal * 2);
-        size.height = max_y + (container->pad_vertical * 2);
+        size.width = max_x + container->pad_horizontal;
+        size.height = max_y + container->pad_vertical;
 
-        // Also update renderable if present
+        // Update renderable if present
         if (RoundedRectRenderable* rr = e.try_get_mut<RoundedRectRenderable>()) {
             rr->width = size.width;
             rr->height = size.height;
@@ -1221,12 +1232,119 @@ void update_ui_container_size(flecs::entity e) {
     }
 }
 
+// Process FlowLayoutBox - positions children with wrapping
+void process_flow_layout(flecs::entity e, float container_width) {
+    FlowLayoutBox& box = e.ensure<FlowLayoutBox>();
+    UIElementSize& container_size = e.ensure<UIElementSize>();
+
+    box.x_progress = 0.0f;
+    box.y_progress = 0.0f;
+    box.line_height = 0.0f;
+
+    float max_width = 0.0f;
+
+    // Collect children info and determine line breaks
+    struct ChildInfo {
+        flecs::entity entity;
+        float width;
+        float height;
+    };
+    std::vector<std::vector<ChildInfo>> lines;
+    std::vector<ChildInfo> current_line;
+    float current_line_width = 0.0f;
+    float current_line_height = 0.0f;
+
+    e.children([&](flecs::entity child) {
+        const UIElementSize* child_size = child.try_get<UIElementSize>();
+        if (!child_size || child_size->width <= 0 || child_size->height <= 0) return;
+
+        float child_width = child_size->width;
+        float child_height = child_size->height;
+
+        float needed_width = current_line_width + child_width;
+        if (!current_line.empty()) {
+            needed_width += box.padding;
+        }
+
+        if (!current_line.empty() && needed_width > container_width) {
+            lines.push_back(current_line);
+            current_line.clear();
+            current_line_width = 0.0f;
+            current_line_height = 0.0f;
+        }
+
+        current_line.push_back({child, child_width, child_height});
+        if (current_line.size() > 1) {
+            current_line_width += box.padding;
+        }
+        current_line_width += child_width;
+        current_line_height = std::max(current_line_height, child_height);
+    });
+
+    if (!current_line.empty()) {
+        lines.push_back(current_line);
+    }
+
+    // Position children with vertical centering
+    box.y_progress = 0.0f;
+    for (const auto& line : lines) {
+        float line_height = 0.0f;
+        for (const auto& child_info : line) {
+            line_height = std::max(line_height, child_info.height);
+        }
+
+        box.x_progress = 0.0f;
+        for (const auto& child_info : line) {
+            Position& pos = child_info.entity.ensure<Position, Local>();
+            pos.x = box.x_progress;
+            float y_offset = (line_height - child_info.height) * 0.5f;
+            pos.y = box.y_progress + y_offset;
+
+            propagate_world_positions(child_info.entity);
+
+            box.x_progress += child_info.width + box.padding;
+        }
+
+        max_width = std::max(max_width, box.x_progress - box.padding);
+        box.y_progress += line_height + box.line_spacing;
+    }
+
+    // Update container size
+    const Expand* expand = e.try_get<Expand>();
+    if (!expand || !expand->x_enabled) {
+        container_size.width = max_width;
+    }
+    if (!expand || !expand->y_enabled) {
+        float total_height = box.y_progress;
+        if (!lines.empty()) {
+            total_height -= box.line_spacing;
+        }
+        container_size.height = total_height;
+    }
+}
+
 // Recursively process layout bottom-up: children first, then parent
-// Handles both LayoutBox and UIContainer in correct order
-void process_layout_recursive(flecs::entity e) {
+// Handles LayoutBox, UIContainer, and FlowLayoutBox in correct order
+void process_layout_recursive(flecs::entity e, float available_width) {
+    // For FlowLayoutBox with Expand, get width from parent bounds if available
+    float my_width = available_width;
+    if (e.has<FlowLayoutBox>()) {
+        const Expand* expand = e.try_get<Expand>();
+        if (expand && expand->x_enabled) {
+            // Use parent bounds for available width
+            flecs::entity parent = e.parent();
+            if (parent.is_valid()) {
+                const UIElementBounds* parent_bounds = parent.try_get<UIElementBounds>();
+                if (parent_bounds && parent_bounds->xmax > parent_bounds->xmin) {
+                    my_width = (parent_bounds->xmax - parent_bounds->xmin) * expand->x_percent;
+                }
+            }
+        }
+    }
+
     // First, recursively process all children (bottom-up)
-    e.children([](flecs::entity child) {
-        process_layout_recursive(child);
+    e.children([my_width](flecs::entity child) {
+        process_layout_recursive(child, my_width);
     });
 
     // Then update this entity's size based on its type
@@ -1274,6 +1392,9 @@ void process_layout_recursive(flecs::entity e) {
             if (!expand || !expand->y_enabled) container_size.height = main_size;
             if (!expand || !expand->x_enabled) container_size.width = cross_max;
         }
+    }
+    else if (e.has<FlowLayoutBox>()) {
+        process_flow_layout(e, my_width);
     }
     else if (e.has<UIContainer>()) {
         update_ui_container_size(e);
@@ -1984,7 +2105,7 @@ flecs::entity create_badge_impl(flecs::entity parent, flecs::entity UIElement,
             .child_of(parent)
             .set<CustomRenderable>({100.0f, 25.0f, true, outline_color, 0, 0, draw_double_arrow})
             .set<RenderGradient>({dark, very_dark}) // Vertical gradient
-            .set<UIContainer>({xPad, 3})
+            .set<UIContainer>({xPad, 0})
             .set<ZIndex>({20});
 
     } else
@@ -1994,7 +2115,7 @@ flecs::entity create_badge_impl(flecs::entity parent, flecs::entity UIElement,
             .child_of(parent)
             .set<RoundedRectRenderable>({100.0f, badge_height, corner_radius, false, 0x000000FF})
             .set<RenderGradient>({dark, very_dark}) // Vertical gradient
-            .set<UIContainer>({xPad, 3})
+            .set<UIContainer>({xPad, 0})
             .set<ZIndex>({20});
 
         // Outline Overlay
@@ -6762,6 +6883,9 @@ int main(int, char *[]) {
                     float y_offset = (line_height - child_info.height) * 0.5f;
                     pos.y = box.y_progress + y_offset;
 
+                    // Propagate world positions to child and all descendants
+                    propagate_world_positions(child_info.entity);
+
                     box.x_progress += child_info.width + box.padding;
                 }
 
@@ -8243,8 +8367,9 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
                     if (pending->result.empty()) {
                         auto meta_response_data = world->entity()
                             .is_a(UIElement)
-                            .set<FlowLayoutBox>({0.0f, 0.0f, 2.0f, 0.0f, 2.0f})
-                            .set<Expand>({true, 0, 0, 1, false, 0, 0, 0})
+                            // .set<FlowLayoutBox>({0.0f, 0.0f, 2.0f, 0.0f, 2.0f})
+                            .set<LayoutBox>({LayoutBox::Horizontal, 0.0f})
+                            // .set<Expand>({true, 0, 0, 1, false, 0, 0, 0})
                             .add(flecs::OrderedChildren)
                             .child_of(pending->message_list);
 
