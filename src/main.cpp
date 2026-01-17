@@ -340,23 +340,23 @@ struct RenderStatus {
     // float transparency = 1.0f;
 };
 
-struct HorizontalLayoutBox
+// Unified layout box - used for both horizontal and vertical layouts
+struct LayoutBox
 {
-  float x_progress;
+  enum Direction { Horizontal, Vertical };
+  Direction dir = Horizontal;
   float padding = 0.0f;
-  float move_dir = 1; // Right
+  float move_dir = 1.0f; // 1 = right/down, -1 = left/up
+};
+
+struct ColumnFitConstraint
+{
+    int count;
 };
 
 struct FitChildren 
 {
     float scale_factor;
-};
-
-struct VerticalLayoutBox
-{
-  float y_progress;
-  float padding;
-  float move_dir = 1; // Down
 };
 
 struct FlowLayoutBox
@@ -924,6 +924,8 @@ struct NoiseTetrahedron {
     float rotAngle;
 };
 
+struct TimeEventRowChannel {};
+
 struct Graphics {
     NVGcontext* vg;
 
@@ -1136,25 +1138,168 @@ enum class RenderType {
 
 flecs::world* world = nullptr;
 
-void calculate_recursive_bounds(flecs::entity parent, UIElementBounds& total_bounds, bool& first) {
-    // Iterate over all children of this entity
+// ============================================================================
+// LAYOUT SYSTEM PHASE HELPERS
+// ============================================================================
+
+// Propagate world positions from an entity down to all descendants
+// Called after setting a child's local position to update its world position
+void propagate_world_positions(flecs::entity entity) {
+    const Position* local = entity.try_get<Position, Local>();
+    const Position* parent_world = nullptr;
+
+    flecs::entity parent = entity.parent();
+    if (parent.is_valid()) {
+        parent_world = parent.try_get<Position, World>();
+    }
+
+    Position& world = entity.ensure<Position, World>();
+    world.x = local ? local->x : 0.0f;
+    world.y = local ? local->y : 0.0f;
+    if (parent_world) {
+        world.x += parent_world->x;
+        world.y += parent_world->y;
+    }
+
+    // Recursively update children
+    entity.children([](flecs::entity child) {
+        propagate_world_positions(child);
+    });
+}
+
+// Calculate total extent of children using Position Local + UIElementSize
+// Returns the bounding box in LOCAL coordinates relative to parent
+void calculate_children_extent(flecs::entity parent, float& max_x, float& max_y, bool& found) {
     parent.children([&](flecs::entity child) {
-        if (child.has<UIElementBounds>() && !child.has<Expand>()) {
-            const auto* child_bounds = child.try_get<UIElementBounds>();
-            
-            if (first) {
-                total_bounds = *child_bounds;
-                first = false;
+        if (child.has<Expand>()) return; // Skip expand entities
+
+        const Position* local = child.try_get<Position, Local>();
+        const UIElementSize* size = child.try_get<UIElementSize>();
+
+        if (local && size && size->width > 0 && size->height > 0) {
+            float child_xmax = local->x + size->width;
+            float child_ymax = local->y + size->height;
+
+            if (!found) {
+                max_x = child_xmax;
+                max_y = child_ymax;
+                found = true;
             } else {
-                if (child_bounds->xmin < total_bounds.xmin) total_bounds.xmin = child_bounds->xmin;
-                if (child_bounds->ymin < total_bounds.ymin) total_bounds.ymin = child_bounds->ymin;
-                if (child_bounds->xmax > total_bounds.xmax) total_bounds.xmax = child_bounds->xmax;
-                if (child_bounds->ymax > total_bounds.ymax) total_bounds.ymax = child_bounds->ymax;
+                max_x = std::max(max_x, child_xmax);
+                max_y = std::max(max_y, child_ymax);
             }
         }
-        
-        // Recurse deeper if the child itself has children
-        calculate_recursive_bounds(child, total_bounds, first);
+    });
+}
+
+// Forward declaration for mutual recursion
+void process_layout_recursive(flecs::entity e);
+
+// Update UIContainer size from children's extent
+void update_ui_container_size(flecs::entity e) {
+    UIContainer* container = e.try_get_mut<UIContainer>();
+    if (!container) return;
+
+    float max_x = 0.0f, max_y = 0.0f;
+    bool found = false;
+    calculate_children_extent(e, max_x, max_y, found);
+
+    if (found) {
+        UIElementSize& size = e.ensure<UIElementSize>();
+        size.width = max_x + (container->pad_horizontal * 2);
+        size.height = max_y + (container->pad_vertical * 2);
+
+        // Also update renderable if present
+        if (RoundedRectRenderable* rr = e.try_get_mut<RoundedRectRenderable>()) {
+            rr->width = size.width;
+            rr->height = size.height;
+        }
+        if (CustomRenderable* cr = e.try_get_mut<CustomRenderable>()) {
+            cr->width = size.width;
+            cr->height = size.height;
+        }
+    }
+}
+
+// Recursively process layout bottom-up: children first, then parent
+// Handles both LayoutBox and UIContainer in correct order
+void process_layout_recursive(flecs::entity e) {
+    // First, recursively process all children (bottom-up)
+    e.children([](flecs::entity child) {
+        process_layout_recursive(child);
+    });
+
+    // Then update this entity's size based on its type
+    if (e.has<LayoutBox>()) {
+        LayoutBox& box = e.ensure<LayoutBox>();
+        UIElementSize& container_size = e.ensure<UIElementSize>();
+
+        float main_progress = 0.0f;
+        float cross_max = 0.0f;
+        bool horiz = (box.dir == LayoutBox::Horizontal);
+
+        e.children([&](flecs::entity child) {
+            const UIElementSize* child_size = child.try_get<UIElementSize>();
+            if (!child_size || child_size->width <= 0 || child_size->height <= 0) return;
+
+            Position& local_pos = child.ensure<Position, Local>();
+
+            float child_main = horiz ? child_size->width : child_size->height;
+            float child_cross = horiz ? child_size->height : child_size->width;
+
+            if (box.move_dir < 0) {
+                main_progress -= (child_main + box.padding);
+            }
+
+            if (horiz) {
+                local_pos.x = main_progress;
+            } else {
+                local_pos.y = main_progress;
+            }
+
+            if (box.move_dir > 0) {
+                main_progress += child_main + box.padding;
+            }
+
+            cross_max = std::max(cross_max, child_cross);
+        });
+
+        const Expand* expand = e.try_get<Expand>();
+        float main_size = std::abs(main_progress);
+
+        if (horiz) {
+            if (!expand || !expand->x_enabled) container_size.width = main_size;
+            if (!expand || !expand->y_enabled) container_size.height = cross_max;
+        } else {
+            if (!expand || !expand->y_enabled) container_size.height = main_size;
+            if (!expand || !expand->x_enabled) container_size.width = cross_max;
+        }
+    }
+    else if (e.has<UIContainer>()) {
+        update_ui_container_size(e);
+    }
+}
+
+// Phase 3 helper: Propagate bounds containment from children to parent
+void propagate_bounds_containment(flecs::entity parent) {
+    UIElementBounds* parent_bounds = parent.try_get_mut<UIElementBounds>();
+    if (!parent_bounds) return;
+
+    parent.children([&](flecs::entity child) {
+        // First recurse to ensure children's bounds are set
+        propagate_bounds_containment(child);
+
+        // Skip Expand entities (they fill parent, not contribute to size)
+        if (child.has<Expand>()) return;
+
+        const UIElementBounds* child_bounds = child.try_get<UIElementBounds>();
+        if (!child_bounds) return;
+
+        // Expand parent bounds to contain child
+        parent_bounds->xmin = std::min(parent_bounds->xmin, child_bounds->xmin);
+        parent_bounds->ymin = std::min(parent_bounds->ymin, child_bounds->ymin);
+        parent_bounds->xmax = std::max(parent_bounds->xmax, child_bounds->xmax);
+        parent_bounds->ymax = std::max(parent_bounds->ymax, child_bounds->ymax);
     });
 }
 
@@ -1925,7 +2070,7 @@ flecs::entity create_badge_impl(flecs::entity parent, flecs::entity UIElement,
     {
         auto badge_content = world->entity()
             .is_a(UIElement)
-            .set<HorizontalLayoutBox>({0.0f, 0.0f})
+            .set<LayoutBox>({LayoutBox::Horizontal, 0.0f})
             .set<Position, Local>({xPad, 0.0f})
             .add(flecs::OrderedChildren)
             .child_of(badge);
@@ -2020,7 +2165,7 @@ void recreate_annotation_entities(WordAnnotationSelector& selector) {
             // 2. Create content container with horizontal layout
             flecs::entity badge_content = world->entity()
                 .is_a(UIElement)
-                .set<HorizontalLayoutBox>({0.0f, 0.0f})
+                .set<LayoutBox>({LayoutBox::Horizontal, 0.0f})
                 .set<Position, Local>({xPad, 0.0f})
                 .add(flecs::OrderedChildren)
                 .child_of(badge);
@@ -2043,14 +2188,14 @@ void recreate_annotation_entities(WordAnnotationSelector& selector) {
                 // Create vertical container for reified indicator + text
                 flecs::entity text_column = world->entity()
                     .is_a(UIElement)
-                    .set<VerticalLayoutBox>({0.0f, 0.0f})
+                    .set<LayoutBox>({LayoutBox::Vertical, 0.0f})
                     .add(flecs::OrderedChildren)
                     .child_of(badge_content);
 
                 // Reified indicator (3d_node + digit) above text
                 flecs::entity reified_row = world->entity()
                     .is_a(UIElement)
-                    .set<HorizontalLayoutBox>({0.0f, 0.0f})
+                    .set<LayoutBox>({LayoutBox::Horizontal, 0.0f})
                     .add(flecs::OrderedChildren)
                     .child_of(text_column);
 
@@ -2470,7 +2615,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
 
         auto server_hud = world->entity("ServerHUD")
         .is_a(UIElement)
-        .set<HorizontalLayoutBox>({0.0f, 0.0f})
+        .set<LayoutBox>({LayoutBox::Horizontal, 0.0f})
         .add<FitChildren>()
         .set<Expand>({true, 4.0f, 4.0f, 1.0f, true, 4.0f, 4.0f, 1.0f})
         .add(flecs::OrderedChildren)
@@ -2563,7 +2708,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
 
         auto badges = world->entity()
         .is_a(UIElement)
-        .set<HorizontalLayoutBox>({0.0f, 2.0f})
+        .set<LayoutBox>({LayoutBox::Horizontal, 2.0f})
         .set<Position, Local>({48.0f, 0.0f})
         .child_of(leaf.target<EditorHeader>());
         
@@ -2596,7 +2741,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
 
         auto badges = world->entity()
         .is_a(UIElement)
-        .set<HorizontalLayoutBox>({0.0f, 2.0f})
+        .set<LayoutBox>({LayoutBox::Horizontal, 2.0f})
         .set<Position, Local>({48.0f, 0.0f})
         .child_of(leaf.target<EditorHeader>());
         
@@ -2659,7 +2804,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
             .child_of(messages_panel)
             .add(flecs::OrderedChildren)
             .set<Position, Local>({12.0f, 16.0f})
-            .set<VerticalLayoutBox>({0.0f, 4.0f, 1.0f})
+            .set<LayoutBox>({LayoutBox::Vertical, 4.0f, 1.0f})
             .set<Expand>({true, 0.0f, 0.0f, 1.0f, false, 0.0f, 0.0f, 0.0f});
 
         auto msg_container = world->entity()
@@ -2669,7 +2814,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
 
         auto meta_input = world->entity()
         .is_a(UIElement)
-        .set<HorizontalLayoutBox>({0.0f, 2.0f})
+        .set<LayoutBox>({LayoutBox::Horizontal, 2.0f})
         .add(flecs::OrderedChildren)
         // .add<DebugRenderBounds>()
         .child_of(message_list);
@@ -2694,7 +2839,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         auto bookshelf_layer = world->entity()
             .is_a(UIElement)
             .child_of(leaf.target<EditorCanvas>())
-            .set<HorizontalLayoutBox>({0.0f, 8.0f})
+            .set<LayoutBox>({LayoutBox::Horizontal, 8.0f})
             .add<FitChildren>()
             .set<Expand>({true, 4.0f, 4.0f, 1.0f, true, 4.0f, 4.0f, 1.0f});
         
@@ -2733,7 +2878,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
 
         auto badges = world->entity()
         .is_a(UIElement)
-        .set<HorizontalLayoutBox>({0.0f, 2.0f})
+        .set<LayoutBox>({LayoutBox::Horizontal, 2.0f})
         .set<Position, Local>({48.0f, 0.0f})
         .child_of(leaf.target<EditorHeader>());
 
@@ -2744,7 +2889,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         auto hearing_layer = world->entity()
             .is_a(UIElement)
             .child_of(leaf.target<EditorCanvas>())
-            .set<VerticalLayoutBox>({0.0f, 4.0f})
+            .set<LayoutBox>({LayoutBox::Vertical, 4.0f})
             .set<Align>({-0.5f, -0.5f, 0.5f, 0.5f});
         // Look up the mel spec renderer entities
         auto micRenderer = world->lookup("MelSpecRenderer");
@@ -2805,7 +2950,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
     {
         auto badges = world->entity()
         .is_a(UIElement)
-        .set<HorizontalLayoutBox>({0.0f, 2.0f})
+        .set<LayoutBox>({LayoutBox::Horizontal, 2.0f})
         .set<Position, Local>({48.0f, 0.0f})
         .child_of(leaf.target<EditorHeader>());
 
@@ -2856,7 +3001,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
 
         auto badges = world->entity()
         .is_a(UIElement)
-        .set<HorizontalLayoutBox>({0.0f, 2.0f})
+        .set<LayoutBox>({LayoutBox::Horizontal, 2.0f})
         .set<Position, Local>({48.0f, 0.0f})
         .child_of(leaf.target<EditorHeader>());
 
@@ -2873,37 +3018,37 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         auto channels = world->entity()
         .is_a(UIElement)
         .set<Expand>({true, 0, 0, 1, false, 0, 0, 0})
-        .add<VerticalLayoutBox>()
+        .set<LayoutBox>({LayoutBox::Vertical})
         .add(flecs::OrderedChildren)
         .add<ScissorContainer>(leaf.target<EditorCanvas>())
         .child_of(leaf.target<EditorCanvas>());
 
-        auto channels_2 = world->entity()
-        .is_a(UIElement)
-        .set<Expand>({true, 0, 0, 1, false, 0, 0, 0})
-        .add<VerticalLayoutBox>()
-        .add(flecs::OrderedChildren)
-        .add<ScissorContainer>(leaf.target<EditorCanvas>())
-        .child_of(leaf.target<EditorCanvas>());
+        // auto channels_2 = world->entity()
+        // .is_a(UIElement)
+        // .set<Expand>({true, 0, 0, 1, false, 0, 0, 0})
+        // .set<LayoutBox>({LayoutBox::Vertical})
+        // .add(flecs::OrderedChildren)
+        // .add<ScissorContainer>(leaf.target<EditorCanvas>())
+        // .child_of(leaf.target<EditorCanvas>());
 
-        auto channels_3 = world->entity()
-        .is_a(UIElement)
-        .set<Expand>({true, 0, 0, 1, false, 0, 0, 0})
-        .add<VerticalLayoutBox>()
-        .add(flecs::OrderedChildren)
-        .add<ScissorContainer>(leaf.target<EditorCanvas>())
-        .child_of(leaf.target<EditorCanvas>());
+        // auto channels_3 = world->entity()
+        // .is_a(UIElement)
+        // .set<Expand>({true, 0, 0, 1, false, 0, 0, 0})
+        // .set<LayoutBox>({LayoutBox::Vertical})
+        // .add(flecs::OrderedChildren)
+        // .add<ScissorContainer>(leaf.target<EditorCanvas>())
+        // .child_of(leaf.target<EditorCanvas>());
 
         auto frameChannel = world->entity()
         .is_a(UIElement)
         .set<FilmstripData>({7, {}})
         .add<FitChildren>()
-        .set<Expand>({true, 0, 0, 1, true, 0, 0, 1.0})
-        .add<HorizontalLayoutBox>()
-        // .add<DebugRenderBounds>()
+        .set<Expand>({true, 0, 0, 1, false, 0, 0, 1.0})
+        .set<LayoutBox>({LayoutBox::Horizontal})
+        .add<DebugRenderBounds>()
         .add(flecs::OrderedChildren)
         .add<ScissorContainer>(leaf.target<EditorCanvas>())
-        .child_of(leaf.target<EditorCanvas>());
+        .child_of(channels);
 
         leaf.target<EditorCanvas>().add<FilmstripChannel>(frameChannel);
 
@@ -2911,10 +3056,11 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         auto melSpecChannel = world->entity()
         .is_a(UIElement)
         .set<Expand>({true, 0, 0, 1, false, 0, 0, 0})
-        .add<HorizontalLayoutBox>()
+        .set<LayoutBox>({LayoutBox::Horizontal})
         .add(flecs::OrderedChildren)
-        .add<ScissorContainer>(leaf.target<EditorCanvas>())
-        .child_of(leaf.target<EditorCanvas>());
+        .child_of(channels)
+        .add<ScissorContainer>(leaf.target<EditorCanvas>());
+        
 
         // Look up the system audio mel spec renderer
         auto sysAudioRenderer = world->lookup("SystemAudioRenderer");
@@ -2943,43 +3089,46 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
 
         // TODO: Implement scissors/vertical scrollbar
 
+
         for (size_t i = 0; i < 12; i++)
         {
+            // TODO: Interface/method to convert an ordinary event channel to a frame/melspec stream...
             world->entity()
                 .is_a(UIElement)
                 .child_of(channels)
                 .set<RectRenderable>({10.0f, 24.0f, false, i % 2 == 0 ? 0x222327FF : 0x121212FF })
                 .set<Expand>({true, 0, 0, 1, false, 0, 0, 0})
                 .add<ScissorContainer>(leaf.target<EditorCanvas>())
+                .add<TimeEventRowChannel>()
                 .set<ZIndex>({12});
         }
             
-        for (size_t i = 0; i < 4; i++)
-        {
-            world->entity()
-            .is_a(UIElement)
-            .set<Align>({0.0f, 0.0f, 0.8f, 0.0f})
-            .set<CustomRenderable>({24*3, 24*3, false, i % 2 == 1 ? 0x222327FF : 0x121212FF, 0, 0, draw_diamond})
-            .set<ZIndex>({14})
-            .add<ScissorContainer>(leaf.target<EditorCanvas>())
-            .child_of(channels_2);
-            // .child_of(leaf.target<EditorCanvas>());
+        // for (size_t i = 0; i < 4; i++)
+        // {
+        //     world->entity()
+        //     .is_a(UIElement)
+        //     .set<Align>({0.0f, 0.0f, 0.8f, 0.0f})
+        //     .set<CustomRenderable>({24*3, 24*3, false, i % 2 == 1 ? 0x222327FF : 0x121212FF, 0, 0, draw_diamond})
+        //     .set<ZIndex>({14})
+        //     .add<ScissorContainer>(leaf.target<EditorCanvas>())
+        //     .child_of(channels_2);
+        //     // .child_of(leaf.target<EditorCanvas>());
 
-            world->entity()
-            .is_a(UIElement)
-            .child_of(channels_3)
-            .set<Align>({0.0f, 0.0f, 0.8f, 0.0f})
-            // .add<DebugRenderBounds>()
-            .set<RectRenderable>({10.0f, 24.0f*3, false, i % 2 == 1 ? 0x222327FF : 0x121212FF })
-            .add<ScissorContainer>(leaf.target<EditorCanvas>())
-            .set<Expand>({true, 24*1.5f, 0, 0.2f, false, 0, 0, 0})
-            .set<ZIndex>({14});
-        }
+        //     world->entity()
+        //     .is_a(UIElement)
+        //     .child_of(channels_3)
+        //     .set<Align>({0.0f, 0.0f, 0.8f, 0.0f})
+        //     // .add<DebugRenderBounds>()
+        //     .set<RectRenderable>({10.0f, 24.0f*3, false, i % 2 == 1 ? 0x222327FF : 0x121212FF })
+        //     .add<ScissorContainer>(leaf.target<EditorCanvas>())
+        //     .set<Expand>({true, 24*1.5f, 0, 0.2f, false, 0, 0, 0})
+        //     .set<ZIndex>({14});
+        // }
     } else if (editor_type == EditorType::BFO)
     {
         auto bfo_editor = world->entity()
         .is_a(UIElement)
-        // .add<HorizontalLayoutBox>()
+        // .set<LayoutBox>({LayoutBox::Horizontal})
         // .add(flecs::OrderedChildren)
         .set<RectRenderable>({156.0f, 195.0f, false, 0x000000FF})
         .set<ZIndex>({30})
@@ -4228,7 +4377,7 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                     auto messageBox = world->entity()
                     .is_a(UIElement)
                     .child_of(chat_panel.message_list)
-                    .add<HorizontalLayoutBox>();
+                    .set<LayoutBox>({LayoutBox::Horizontal});
 
                     // Create the background bubble
                     auto example_message_bkg = world->entity()
@@ -4246,7 +4395,7 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                         // .child_of(example_message_bkg)
                         .child_of(example_message_bkg)
                         // .add<DebugRenderBounds>()
-                        .add<VerticalLayoutBox>();
+                        .set<LayoutBox>({LayoutBox::Vertical});
 
                     // Create the text content using the actual draft
                     auto example_message_text = world->entity()
@@ -5819,8 +5968,7 @@ int main(int, char *[]) {
 
     world->component<ParentClass>().add(flecs::Transitive);
 
-    world->component<HorizontalLayoutBox>();
-    world->component<VerticalLayoutBox>();
+    world->component<LayoutBox>();
     world->component<FlowLayoutBox>();
 
     world->component<DiurnalHour>();
@@ -6107,7 +6255,7 @@ int main(int, char *[]) {
         auto editor_type_list = world->entity()
         .is_a(UIElement)
         .child_of(editor_type_selector)
-        .set<VerticalLayoutBox>({0.0f, 2.0f})
+        .set<LayoutBox>({LayoutBox::Vertical, 2.0f})
         // .add<DebugRenderBounds>()
         .set<Position, Local>({4.0f, 4.0f});
 
@@ -6160,7 +6308,11 @@ int main(int, char *[]) {
             pos.y += vel.dy * deltaTime;
         });
 
-    // Hierarchical positioning system - computes world positions from local positions
+    // ========================================================================
+    // PHASE 1: Initialize sizes and propagate world positions
+    // ========================================================================
+
+    // Phase 1a: Hierarchical positioning - computes world positions from local positions
     auto hierarchicalQuery = world->query_builder<const Position, const Position*, Position>()
         .term_at(0).second<Local>()      // Local position
         .term_at(1).second<World>()      // Parent world position
@@ -6182,12 +6334,13 @@ int main(int, char *[]) {
             });
         });
 
+    // Phase 1b: Initial bounds calculation from world position + size
     auto boundsCalculationSystem = world->system<Position, UIElementBounds, UIElementSize>()
         .term_at(0).second<World>()
-        .kind(flecs::OnLoad) 
+        .kind(flecs::OnLoad)
         .each([&](flecs::entity e, Position& worldPos, UIElementBounds& bounds, UIElementSize& size) {
             ZoneScoped;
-            // Reset bounds to invalid state at start of each frame
+            // Set bounds from world position + size
             bounds.xmin = worldPos.x;
             bounds.ymin = worldPos.y;
             bounds.xmax = worldPos.x;
@@ -6320,6 +6473,7 @@ int main(int, char *[]) {
     });
 
 
+    // Phase 1c: Set UIElementSize from basic renderables
     auto sizeCalculationSystem = world->system<UIElementSize, Graphics>()
         .kind(flecs::PreFrame)
         .each([&](flecs::entity e, UIElementSize& size, Graphics& graphics) {
@@ -6423,11 +6577,11 @@ int main(int, char *[]) {
             });
         });
 
-    world->system<const UIElementBounds, HorizontalLayoutBox, FitChildren, Graphics>()
+    world->system<const UIElementBounds, LayoutBox, FitChildren, Graphics>()
     .kind(flecs::PreUpdate)
-    .term_at(0).parent() 
+    .term_at(0).parent()
     .with<FitChildren>()
-    .each([](flecs::entity e, const UIElementBounds& container_bounds, HorizontalLayoutBox& box, FitChildren& fit, Graphics& graphics) {
+    .each([](flecs::entity e, const UIElementBounds& container_bounds, LayoutBox& box, FitChildren& fit, Graphics& graphics) {
         float container_w = container_bounds.xmax - container_bounds.xmin;
         float container_h = container_bounds.ymax - container_bounds.ymin;
         
@@ -6480,13 +6634,13 @@ int main(int, char *[]) {
         // });
     });
 
-    world->system<const UIElementBounds, HorizontalLayoutBox, FitChildren, ImageRenderable, Graphics>()
+    world->system<const UIElementBounds, LayoutBox, FitChildren, ImageRenderable, Graphics>()
     .kind(flecs::PreUpdate)
     .term_at(0).parent()
     .term_at(1).parent()
     .term_at(2).parent()
     .immediate()
-    .each([](flecs::entity e, const UIElementBounds& container_bounds, HorizontalLayoutBox& box, FitChildren& fit, ImageRenderable& img, Graphics& graphics)
+    .each([](flecs::entity e, const UIElementBounds& container_bounds, LayoutBox& box, FitChildren& fit, ImageRenderable& img, Graphics& graphics)
     {
         float container_w = container_bounds.xmax - container_bounds.xmin;
         float container_h = container_bounds.ymax - container_bounds.ymin;
@@ -6513,86 +6667,18 @@ int main(int, char *[]) {
         e.set<ProportionalConstraint>({ target_w, target_h });
     });
 
-    world->system<HorizontalLayoutBox, UIElementSize>("ResetHProgress")
+    // ========================================================================
+    // PHASE 2: Layout - Process LayoutBox and UIContainer bottom-up
+    // Uses recursive function to ensure proper ordering:
+    // children sizes computed before parents position them
+    // ========================================================================
+    world->system<EditorRoot>("LayoutSystem")
         .kind(flecs::PostLoad)
-        .each([](flecs::entity e, HorizontalLayoutBox& box, UIElementSize& container_size)
-        {
-            box.x_progress = 0.0f;
-            float max_height = 0.0f; 
-
-            e.children([&](flecs::entity child)
-            {
-                Position& pos = child.ensure<Position, Local>();
-                pos.x = box.x_progress;
-                
-                const UIElementSize* child_size = child.try_get<UIElementSize>();
-                
-                if (child_size) {
-                    box.x_progress += child_size->width + box.padding;
-                    if (child_size->height > max_height) {
-                        max_height = child_size->height;
-                    }
-                }
-            });
-
-            // FIX: Check if we have an Expand component
-            const Expand* expand = e.try_get<Expand>();
-
-            // Only auto-resize WIDTH if not expanding in X
-            if (!expand || !expand->x_enabled) {
-                container_size.width = box.x_progress; 
-            }
-            
-            // Only auto-resize HEIGHT if not expanding in Y
-            // This allows the bookshelf to keep its parent's height
-            if (!expand || !expand->y_enabled) {
-                container_size.height = max_height;
-            }
+        .each([](flecs::entity root, EditorRoot&) {
+            // Process entire UI hierarchy from editor root
+            process_layout_recursive(root);
         });
 
-    world->system<VerticalLayoutBox, UIElementSize>("ResetVProgress")
-    .kind(flecs::PostLoad)
-    .each([](flecs::entity e, VerticalLayoutBox& box, UIElementSize& container_size) {
-        float current_y = 0.0f;
-        float max_width = 0.0f;
-
-        e.children([&](flecs::entity child) {
-            const UIElementSize* child_size = child.try_get<UIElementSize>();
-            if (!child_size) return;
-
-            Position& pos = child.ensure<Position, Local>();
-            
-            if (box.move_dir == -1.0f) {
-                // Stack upwards by moving the child into negative space 
-                // rather than moving the parent into positive space.
-                current_y -= (child_size->height + box.padding);
-                pos.y = current_y;
-            } else {
-                pos.y = current_y;
-                current_y += child_size->height + box.padding;
-            }
-
-            max_width = std::max(max_width, child_size->width);
-        });
-
-        // Update container size without shifting the container's own Position
-        const Expand* expand = e.try_get<Expand>();
-        if (!expand || !expand->y_enabled) container_size.height = std::abs(current_y);
-        if (!expand || !expand->x_enabled) container_size.width = max_width;
-
-        // Immediately recalculate bounds for dimensions VerticalLayoutBox controls
-        // so Expand systems see the updated size this frame (prevents flickering)
-        if (e.has<UIElementBounds>()) {
-            UIElementBounds& bounds = e.ensure<UIElementBounds>();
-            const Position& world_pos = e.get<Position, World>();
-            if (!expand || !expand->y_enabled) {
-                bounds.ymax = world_pos.y + container_size.height;
-            }
-            if (!expand || !expand->x_enabled) {
-                bounds.xmax = world_pos.x + container_size.width;
-            }
-        }
-    });
 
     world->system<FlowLayoutBox, UIElementSize, const UIElementBounds*, UIElementBounds*>("ResetFlowProgress")
         .kind(flecs::PreUpdate)
@@ -6870,46 +6956,10 @@ int main(int, char *[]) {
                 }
         });
 
-    world->system<UIElementBounds, UIContainer, RoundedRectRenderable, UIElementSize>()
-    .kind(flecs::PreFrame)
-    .each([&](flecs::entity e, UIElementBounds& bounds, UIContainer& container, RoundedRectRenderable& renderable, UIElementSize& size)
-    {
-        UIElementBounds children_aabb = {0, 0, 0, 0};
-        bool first = true;
-
-        // 1. Traverse children to find the collective bounding box
-        calculate_recursive_bounds(e, children_aabb, first);
-
-        // 2. If children were found, update the parent's bounds
-        if (!first) {
-            bounds = children_aabb;
-        }
-
-        // 3. Apply padding and update render/size components
-        renderable.width = (bounds.xmax - bounds.xmin) + (container.pad_horizontal * 2);
-        renderable.height = (bounds.ymax - bounds.ymin) + (container.pad_vertical * 2);
-        
-        size.width = renderable.width;
-        size.height = renderable.height;
-    });
-
-    world->system<UIElementBounds, UIContainer, CustomRenderable, UIElementSize>()
-    .kind(flecs::PreFrame)
-    .each([&](flecs::entity e, UIElementBounds& bounds, UIContainer& container, CustomRenderable& renderable, UIElementSize& size)
-    {
-        UIElementBounds children_aabb = {0, 0, 0, 0};
-        bool first = true;
-        calculate_recursive_bounds(e, children_aabb, first);
-        if (!first) {
-            bounds = children_aabb;
-        }
-        renderable.width = (bounds.xmax - bounds.xmin) + (container.pad_horizontal * 2);
-        renderable.height = (bounds.ymax - bounds.ymin) + (container.pad_vertical * 2);
-        
-        size.width = renderable.width;
-        size.height = renderable.height;
-    });
-
+    // ========================================================================
+    // PHASE 3: Bounds - Calculate bounds from world position + size
+    // Then propagate containment from children to parents
+    // ========================================================================
 
     auto bubbleUpBoundsSecondarySystem = world->system<UIElementBounds, UIElementBounds*, RenderStatus*>()
         .kind(flecs::PostLoad) 
@@ -6945,11 +6995,15 @@ int main(int, char *[]) {
     .kind(flecs::PreFrame)
     .each([&](flecs::entity e, Position& pos, UIElementBounds* parent_bounds, UIElementSize& ui_size, UIElementBounds& bounds, Align& align, Expand* expand)
     {
-        if (!e.parent().has<HorizontalLayoutBox>() && !e.parent().has<FlowLayoutBox>())
+        const LayoutBox* parent_layout = e.parent().try_get<LayoutBox>();
+        bool parent_controls_x = e.parent().has<FlowLayoutBox>() || (parent_layout && parent_layout->dir == LayoutBox::Horizontal);
+        bool parent_controls_y = e.parent().has<FlowLayoutBox>() || (parent_layout && parent_layout->dir == LayoutBox::Vertical);
+
+        if (!parent_controls_x)
         {
             pos.x = align.horizontal * (parent_bounds->xmax - parent_bounds->xmin) + ui_size.width * align.self_horizontal + (expand ? expand->pad_left : 0);
         }
-        if (!e.parent().has<VerticalLayoutBox>() && !e.parent().has<FlowLayoutBox>())
+        if (!parent_controls_y)
         {
             pos.y = align.vertical * (parent_bounds->ymax - parent_bounds->ymin) + ui_size.height * align.self_vertical;
         }
@@ -7947,9 +8001,11 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
                                 // .set<ProportionalConstraint>({800.0f, 200.0f})
                                 // hmmm....
                                 .set<ImageCreator>({"../build/" + frame_filename, 1.0f, 1.0f})
-                                .set<ZIndex>({15});
+                                .set<ZIndex>({15})
                                 //  .set<Constrain>({true, true})
-                                //  .set<Expand>({false, 4.0f, 4.0f, 1.0f, true, 0.0f, 0.0f, 1.0f, true})
+                                .add<DebugRenderBounds>() 
+                                .set<Expand>({false, 4.0f, 4.0f, 1.0f, true, 0.0f, 0.0f, 1.0f, true});
+                                 
                                 // .child_of(leaf.target<EditorCanvas>().target<FilmstripChannel>());
                                 leaf.target<EditorCanvas>().target<FilmstripChannel>().ensure<FilmstripData>().frames.push_back(frame);
                             }
@@ -8167,7 +8223,7 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
                     // Create "Heonae understands" header
                     auto meta_response = world->entity()
                         .is_a(UIElement)
-                        .set<HorizontalLayoutBox>({0.0f, 2.0f})
+                        .set<LayoutBox>({LayoutBox::Horizontal, 2.0f})
                         .add(flecs::OrderedChildren)
                         .child_of(pending->message_list);
 
