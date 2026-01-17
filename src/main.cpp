@@ -2238,7 +2238,7 @@ std::vector<std::string> editor_types =
     "Void",
     // "ECS Graph", // Entity component relationship
     "Peach Core",
-    "In-Situ Interlocutor", // Queue or Stream
+    "Interlocutor", // Queue or Stream
     "VNC Stream",
     "Healthbar",
     // "Gynoid",
@@ -2571,6 +2571,13 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
     }
     else if (editor_type == EditorType::Embodiment)
     {
+        auto grey_bkg = world->entity()
+        .is_a(UIElement)
+        .set<ZIndex>({9})
+        .set<Expand>({true, 0.0f, 0.0f, 1.0f, true, 0.0f, 0.0f, 1.0f})
+        .set<RectRenderable>({0.0f, 0.0f, false, 0x868485ff})
+        .child_of(leaf.target<EditorCanvas>());
+
         auto profile = world->entity()
         .is_a(UIElement)
         .child_of(leaf.target<EditorCanvas>())
@@ -2585,7 +2592,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         .set<ImageCreator>({"../assets/mnist_version.png", 1.0f, 1.0f})
         // .set<Align>({-0.5f, -0.5f, 1.0f, 0.0f})
         .set<ZIndex>({15})
-        .child_of(profile);
+        .child_of(grey_bkg);
 
         auto badges = world->entity()
         .is_a(UIElement)
@@ -4842,15 +4849,24 @@ void initializeParticles(Graphics& graphics, const std::vector<float>& targetVer
             vy = vyDist(gen);
             vz = vzDist(gen);
         } else {
-            // Outer triangles impact based on radial distance from center
+            // Outer triangles (torus/thorns) stay stable until central triangle forms
+            // Then "wither away" - triangles near center extract first like decay/fire
+
             float distFromCenter = sqrt(centroidX * centroidX + centroidY * centroidY);
             float maxDist = sqrt(width * width + height * height) * 0.5f;  // Half diagonal
             float normalizedDist = std::min(distFromCenter / maxDist, 1.0f);
 
-            // Map distance to time: closer triangles hit sooner, farther hit later
-            // Add small random variation for natural feel
-            std::uniform_real_distribution<float> jitterDist(-0.08f, 0.08f);
-            float baseTime = 1.2f + normalizedDist * 1.8f;  // 1.2s to 3.0s range
+            // Withering timing: wait for central triangle to form (1.5s), then decay
+            // Closer to center = extract sooner (inverse of before)
+            // Narrow time window (0.8s) for gradual peeling effect
+            float witherStart = 1.5f;  // Start after central triangle is mostly formed
+            float witherDuration = 0.8f;  // Narrow window for decay effect
+
+            // Invert: closer triangles (low normalizedDist) wither first
+            float witherOrder = 1.0f - normalizedDist;
+
+            std::uniform_real_distribution<float> jitterDist(-0.05f, 0.05f);
+            float baseTime = witherStart + witherOrder * witherDuration;
             collisionTime = baseTime + jitterDist(gen);
 
             // Calculate spawn position on thorny stem torus around central triangle
@@ -5747,7 +5763,7 @@ int main(int, char *[]) {
         return -1;
     }
 
-    glViewport(0, 0, 800, 600);
+    glViewport(0, 0, mode->width, mode->height);
     NVGcontext* vg = nvgCreateGL2(NVG_ANTIALIAS | NVG_STENCIL_STROKES);
     if (vg == NULL) {
         std::cerr << "Failed to initialize NanoVG" << std::endl;
