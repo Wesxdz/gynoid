@@ -14,6 +14,7 @@ struct MelSpecRender {
     float xOffset;         // X position offset from avatar
     float yOffset;         // Y position offset from avatar
     int zIndex;            // Render layer (above avatar = 310)
+    float fillProgress;    // 0.0 to 1.0, how much of the texture is filled
 };
 
 // Configuration component

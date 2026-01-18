@@ -117,6 +117,10 @@ struct IPCAudioState {
 
     // Batching: track if imageBuffer was modified this frame
     bool needsUpload;
+
+    // Fill tracking: how many columns have data (for positioning)
+    int columnsFilled;    // 0 to texWidth
+    bool isFullyFilled;   // true once we start receiving scroll commands
 };
 
 static IPCAudioState g_micState = {};
@@ -290,6 +294,10 @@ static void update_from_ipc(IPCAudioState* state) {
                 state->imageBuffer[dstIdx + 2] = colData[srcIdx + 2];
             }
 
+            // Mark as fully filled (receiving scroll commands means texture is full)
+            state->isFullyFilled = true;
+            state->columnsFilled = state->texWidth;
+
             // Mark for upload (batched, will upload once per frame)
             state->needsUpload = true;
 
@@ -325,6 +333,14 @@ static void update_from_ipc(IPCAudioState* state) {
             int dstRowStart = ((y + row) * state->texWidth + x) * 3;
             int srcRowStart = row * width * 3;
             memcpy(state->imageBuffer + dstRowStart, imageData + srcRowStart, width * 3);
+        }
+
+        // Track fill progress (rightmost column written + 1)
+        if (!state->isFullyFilled) {
+            int rightmostCol = x + width;
+            if (rightmostCol > state->columnsFilled) {
+                state->columnsFilled = rightmostCol;
+            }
         }
 
         // Upload region to GL texture
@@ -378,6 +394,19 @@ static void melSpecUpdateSystem(flecs::entity e, MelSpecRender& melSpec) {
     // Upload batched changes once per frame
     upload_if_needed(&g_micState);
     upload_if_needed(&g_sysAudioState);
+
+    // Update fill progress on the component
+    // Determine which IPC state corresponds to this entity's texture
+    IPCAudioState* state = nullptr;
+    if (melSpec.nvgTextureHandle == g_micState.nvgImageHandle) {
+        state = &g_micState;
+    } else if (melSpec.nvgTextureHandle == g_sysAudioState.nvgImageHandle) {
+        state = &g_sysAudioState;
+    }
+
+    if (state && state->texWidth > 0) {
+        melSpec.fillProgress = (float)state->columnsFilled / (float)state->texWidth;
+    }
 }
 
 void MelSpecRenderModule(flecs::world& world) {

@@ -56,6 +56,8 @@
 
 #include "spatial_index.h"
 #include "query_server.h"
+#include "dino_embedder.h"
+#include "frame_diff.h"
 
 #include <tracy/Tracy.hpp>
 #include <tracy/TracyC.h>
@@ -261,6 +263,9 @@ public:
 
 // Global vision processing job queue
 static VisionJobQueue g_visionQueue;
+
+// Global DINO embedder (runs async in background thread)
+static DinoEmbedder g_dinoEmbedder(10);  // Rolling average of 10 frames
 
 // PNG save job for background thread
 struct PNGSaveJob {
@@ -1189,6 +1194,8 @@ struct EditorLeafData
 struct FilmstripChannel{};
 // Tag to sync an entity's scroll position with a FilmstripData entity
 struct SyncScrollWithFilmstrip{};
+// Relationship tag to link mel spec display to its source renderer entity
+struct MelSpecSource{};
 // Determine how to chunk and choose which frames to display
 
 struct FilmstripData
@@ -3300,15 +3307,16 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
             std::cout << "[Episodic] MelSpec texture handle: " << melSpec.nvgTextureHandle
                       << " size: " << melSpec.width << "x" << melSpec.height << std::endl;
 
-            // Create mel spec display element - static, no scrolling
+            // Create mel spec display element - starts at right, slides left as it fills
             world->entity()
                 .is_a(UIElement)
                 .child_of(channels)
                 .set<ImageRenderable>({melSpec.nvgTextureHandle, 1.0f, 1.0f, (float)melSpec.width, (float)melSpec.height, nvgRGBA(255,255,255,255)})
                 .set<Expand>({true, 0.0f, 0.0f, 1.0f, false, 0.0f, 0.0f, 0.0f})
                 .add<ScissorContainer>(leaf.target<EditorCanvas>())
+                .add<MelSpecSource>(sysAudioRenderer)
                 .set<ZIndex>({18});
-            std::cout << "[Episodic] Created mel spec display in channel (static)" << std::endl;
+            std::cout << "[Episodic] Created mel spec display in channel (with fill-based positioning)" << std::endl;
         }
         else
         {
@@ -6106,6 +6114,17 @@ int main(int, char *[]) {
     // Start background PNG save queue
     g_pngSaveQueue.start();
 
+    // Load DINO embedding model
+    const char* dinoModelPath = getenv("DINO_MODEL_PATH");
+    if (!dinoModelPath) {
+        dinoModelPath = "models/dinov2-small.gguf";
+    }
+    if (g_dinoEmbedder.loadModel(dinoModelPath, 4)) {
+        std::cout << "[DINO] Embedder loaded successfully" << std::endl;
+    } else {
+        std::cout << "[DINO] Failed to load model from " << dinoModelPath << " (embeddings disabled)" << std::endl;
+    }
+
     // Initialize libssh2
     int rc = libssh2_init(0);
     if (rc) {
@@ -7498,7 +7517,15 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
         RenderQueue& queue = world->ensure<RenderQueue>();
         if (status.visible)
         {
-            queue.addImageCommand(pos, renderable, zIndex.layer);
+            // queue.addImageCommand(pos, renderable, zIndex.layer);
+                if (e.has<ScissorContainer>(flecs::Wildcard))
+                {
+                    flecs::entity scissorEntity = e.target<ScissorContainer>();
+                    queue.commands.push_back({pos, renderable, RenderType::Image, zIndex.layer, scissorEntity});
+                } else
+                {
+                    queue.commands.push_back({pos, renderable, RenderType::Image, zIndex.layer, 0});
+                }
         }
     });
 
@@ -8166,6 +8193,38 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
         propagate_world_positions(e);
     });
 
+    // Position mel spec based on fill progress - starts at right, slides left as it fills
+    world->system<ImageRenderable, UIElementBounds>("MelSpecFillPositionSystem")
+    .kind(flecs::PreUpdate)
+    .with<MelSpecSource>(flecs::Wildcard)
+    .each([&](flecs::entity e, ImageRenderable& img, UIElementBounds& bounds)
+    {
+        // Get the mel spec renderer entity this is linked to
+        flecs::entity melSpecEntity = e.target<MelSpecSource>();
+        if (!melSpecEntity.is_valid()) return;
+
+        const MelSpecRender* melSpec = melSpecEntity.try_get<MelSpecRender>();
+        if (!melSpec) return;
+
+        // Get parent bounds for sizing
+        flecs::entity parent = e.parent();
+        if (!parent.is_valid()) return;
+        const UIElementBounds* parent_bounds = parent.try_get<UIElementBounds>();
+        if (!parent_bounds) return;
+
+        float parent_width = parent_bounds->xmax - parent_bounds->xmin;
+
+        // Position based on fill progress:
+        // fillProgress 0.0 -> x = parent_width (fully offscreen right)
+        // fillProgress 1.0 -> x = 0 (fully visible)
+        float x_offset = parent_width * (1.0f - melSpec->fillProgress);
+
+        Position& local = e.ensure<Position, Local>();
+        local.x = x_offset;
+
+        propagate_world_positions(e);
+    });
+
     world->system<RectRenderable>()
     .kind(flecs::PostLoad)
     .with<CopyChildHeight>(flecs::Wildcard)
@@ -8222,6 +8281,11 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
                 g_visionQueue.submit(job);
                 LOG_TRACE(LogCategory::VNC_CLIENT, "Submitted vision processing job for quadrant {}", vnc.toString());
 
+                // Submit frame to DINO embedder (async, non-blocking)
+                if (g_dinoEmbedder.isLoaded()) {
+                    g_dinoEmbedder.submitFrame(job.pixelData.data(), job.width, job.height, job.pitch);
+                    // Results are printed by the worker thread
+                }
 
                 LOG_TRACE(LogCategory::VNC_CLIENT, "Processing {} dirty rectangles", newRects.size());
                 LOG_TRACE(LogCategory::VNC_CLIENT, "Surface info: {}x{}, format: {}", surface->w, surface->h, SDL_GetPixelFormatName(surface->format->format));
@@ -8377,14 +8441,16 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
                         {
                             if (leaf_data.editor_type == EditorType::Episodic)
                             {
+                                flecs::entity canvas = leaf.target<EditorCanvas>();
                                 auto frame = world->entity()
                                 .is_a(UIElement)
                                 .set<ImageRenderable>({imgHandle, 1.0f, 1.0f, (float)surface->w, (float)surface->h})
                                 .set<ZIndex>({15})
                                 // .add<DebugRenderBounds>()
+                                .add<ScissorContainer>(canvas)
                                 .set<Expand>({false, 4.0f, 4.0f, 1.0f, true, 0.0f, 0.0f, 1.0f, true});
 
-                                FilmstripData& filmstripData = leaf.target<EditorCanvas>().target<FilmstripChannel>().ensure<FilmstripData>();
+                                FilmstripData& filmstripData = canvas.target<FilmstripChannel>().ensure<FilmstripData>();
                                 filmstripData.frames.push_back(frame);
                                 filmstripData.total_frames_added++;  // Track for scroll sync
                                 filmstripData.elapsed_time = 0.0f;   // Reset immediately for seamless transition

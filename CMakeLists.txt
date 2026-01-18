@@ -4,7 +4,7 @@
 cmake_minimum_required(VERSION 3.18)
 project(project)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if(NOT CMAKE_BUILD_TYPE)
@@ -12,11 +12,13 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # add_definitions(AOTInductor_CUDA)
-add_executable(${PROJECT_NAME} src/main.cpp src/mel_spec_render.cpp src/glad.c src/vision_processor.cpp src/x11_outline.cpp)
+add_executable(${PROJECT_NAME} src/main.cpp src/mel_spec_render.cpp src/glad.c src/vision_processor.cpp src/x11_outline.cpp src/dino_embedder.cpp)
 # deps/tracy-0.13.1/public/TracyClient.cpp
 
 include_directories("src")
 include_directories("deps/mel_spec/src")
+include_directories("deps/dinov2.cpp")
+include_directories("deps/dinov2.cpp/ggml/include")
 include_directories("deps/mel_spec/deps/glad/include")
 include_directories("deps/spdlog/include")
 include_directories("deps/mel_spec/deps/fpng/src")
@@ -92,6 +94,17 @@ find_package(SDL2_image REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(LibVNCServer)
 
+# DINOv2.cpp / ggml for visual embeddings
+# Enable CUDA for ggml (much faster inference)
+set(GGML_CUDA ON CACHE BOOL "Enable CUDA for ggml" FORCE)
+set(CMAKE_CUDA_ARCHITECTURES "native" CACHE STRING "CUDA architectures" FORCE)
+add_subdirectory("deps/dinov2.cpp/ggml")
+add_library(dinov2 STATIC deps/dinov2.cpp/dinov2.cpp)
+target_include_directories(dinov2 PUBLIC deps/dinov2.cpp deps/dinov2.cpp/ggml/include)
+target_compile_definitions(dinov2 PUBLIC GGML_USE_CUDA)
+target_link_libraries(dinov2 PUBLIC ggml ${OpenCV_LIBS})
+set_target_properties(dinov2 PROPERTIES CXX_STANDARD 20)
+
 # add_subdirectory("deps/libssh2-1.11.1")
 find_package(libssh2 REQUIRED CONFIG)
 # include_directories("deps/libssh2-1.11.1/include")
@@ -109,10 +122,10 @@ set_target_properties(lmdb PROPERTIES
 # Build query server shared library (contains all query/socket/spatial logic)
 add_library(query_server SHARED src/query_server.cpp)
 target_link_libraries(query_server flecs spatialindex lmdb pthread)
-set_property(TARGET query_server PROPERTY CXX_STANDARD 17)
+set_property(TARGET query_server PROPERTY CXX_STANDARD 20)
 # ----
 
-target_link_libraries(${PROJECT_NAME} flecs glfw glad nanovg fpng X11 Xi Xtst SDL2 SDL2_image ${OpenCV_LIBS} query_server Tracy::TracyClient libssh2::libssh2)
+target_link_libraries(${PROJECT_NAME} flecs glfw glad nanovg fpng X11 Xi Xtst SDL2 SDL2_image ${OpenCV_LIBS} query_server Tracy::TracyClient libssh2::libssh2 dinov2)
 
 # Add audio stream client executable
 add_executable(audio_stream_client src/audio_stream_client.c)
@@ -136,4 +149,4 @@ if(LibVNCServer_FOUND)
     target_link_libraries(${PROJECT_NAME} LibVNCServer::vncserver)
 endif()
 
-set_property(TARGET ${PROJECT_NAME} PROPERTY CXX_STANDARD 17)
+set_property(TARGET ${PROJECT_NAME} PROPERTY CXX_STANDARD 20)
