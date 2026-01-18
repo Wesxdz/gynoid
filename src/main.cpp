@@ -1198,6 +1198,16 @@ struct SyncScrollWithFilmstrip{};
 struct MelSpecSource{};
 // Determine how to chunk and choose which frames to display
 
+enum class FilmstripMode {
+    Uniform,     // Frames added at fixed time intervals, adjacent layout
+    Stegosaurus  // Frames added on DINO spikes, time-based positioning with overlaps
+};
+
+// Component to track when a filmstrip frame was captured (for time-based positioning)
+struct FilmstripFrameTime {
+    double capture_time;  // glfwGetTime() when captured
+};
+
 struct FilmstripData
 {
     // TODO: This should probably be a dynamic value based on container width...
@@ -1209,7 +1219,18 @@ struct FilmstripData
     float elapsed_time = 0.0f;   // Time elapsed in current scroll cycle
     size_t total_frames_added = 0;  // Counter incremented each time a frame is pushed
     size_t last_seen_frame_count = 0;  // To detect when total_frames_added changes
-    static constexpr float SCROLL_DURATION = 24.0f;  // Seconds for full container to scroll (matches 24s audio window)
+    static constexpr float SCROLL_DURATION = 27.0f;  // Seconds for full container to scroll
+
+    // Mode selection
+    FilmstripMode mode = FilmstripMode::Uniform;
+
+    // Stegosaurus mode parameters
+    float spike_threshold = 0.15f;   // Minimum cosDiff to trigger a spike (0.0-1.0)
+    float last_dino_value = 0.0f;    // Last DINO cosDiff value seen
+    float spike_cooldown = 1.0f;     // Minimum seconds between spike captures
+    float time_since_spike = 0.0f;   // Time since last spike capture
+    bool pending_capture = false;    // Flag to signal capture should happen
+    double pending_spike_time = 0.0; // Time when the spike was detected (for accurate frame positioning)
 };
 
 // Line chart channel for streaming data visualization (e.g., DINO cosine similarity)
@@ -3310,7 +3331,13 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
 
         auto frameChannel = world->entity()
         .is_a(UIElement)
-        .set<FilmstripData>({8, {}})  // 8 visible frames × 3s = 24s to match audio window
+        .set<FilmstripData>({
+            .frame_limit = 8,
+            .frames = {},
+            .mode = FilmstripMode::Stegosaurus,  // Change to FilmstripMode::Uniform for fixed 3s intervals
+            .spike_threshold = 0.15f,          // Capture when cosDiff >= 0.15 (significant visual change)
+            .spike_cooldown = 1.0f             // Min 1 second between spike captures
+        })
         .set<TimeEventRowChannel>({8})
         // Custom scroll layout - no LayoutBox, positions set directly by FilmstripScrollSystem
         .set<Expand>({true, 0, 0, 1.0f, false, 0, 0, 1.0})
@@ -8281,61 +8308,128 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
     .each([&](flecs::entity e, FilmstripData& data, UIElementBounds& bounds)
     {
         Graphics& graphics = world->ensure<Graphics>();
+        double currentTime = glfwGetTime();
+
         // Visible container width (what fits in the panel)
         float container_width = bounds.xmax - bounds.xmin;
         float container_height = bounds.ymax - bounds.ymin;
         // Each frame width = visible width / number of visible frames
         float frame_width = container_width / data.frame_limit;
 
-        // Position each child frame directly based on index and scroll offset
-        // Right-aligned: frames start from the right side, newest frame at rightmost
-        int frame_index = 0;
-        int num_frames = 0;
-        e.children([&](flecs::entity) { num_frames++; });
+        if (data.mode == FilmstripMode::Uniform) {
+            // UNIFORM MODE: Position each child frame directly based on index and scroll offset
+            // Right-aligned: frames start from the right side, newest frame at rightmost
+            int frame_index = 0;
+            int num_frames = 0;
+            e.children([&](flecs::entity) { num_frames++; });
 
-        e.children([&](flecs::entity child)
-        {
-            // Right-align: offset so last frame is at position frame_limit * frame_width (rightmost)
-            // base_offset puts first frame at the right position when we have fewer than max frames
-            int base_offset = data.frame_limit + 1 - num_frames;
-            float x_pos = ((base_offset + frame_index) * frame_width) - (data.scroll_offset * frame_width);
+            e.children([&](flecs::entity child)
+            {
+                // Right-align: offset so last frame is at position frame_limit * frame_width (rightmost)
+                // base_offset puts first frame at the right position when we have fewer than max frames
+                int base_offset = data.frame_limit + 1 - num_frames;
+                float x_pos = ((base_offset + frame_index) * frame_width) - (data.scroll_offset * frame_width);
 
-            Position& local = child.ensure<Position, Local>();
-            local.x = x_pos;
-            local.y = 0.0f;
+                Position& local = child.ensure<Position, Local>();
+                local.x = x_pos;
+                local.y = 0.0f;
 
-            // Scale frame to fit within frame_width while maintaining aspect ratio
-            ImageRenderable* img = child.try_get_mut<ImageRenderable>();
-            if (img && img->imageHandle > 0) {
-                int native_w, native_h;
-                nvgImageSize(graphics.vg, img->imageHandle, &native_w, &native_h);
+                // Scale frame to fit within frame_width while maintaining aspect ratio
+                ImageRenderable* img = child.try_get_mut<ImageRenderable>();
+                if (img && img->imageHandle > 0) {
+                    int native_w, native_h;
+                    nvgImageSize(graphics.vg, img->imageHandle, &native_w, &native_h);
 
-                if (native_w > 0 && native_h > 0) {
-                    float aspect = (float)native_w / (float)native_h;
+                    if (native_w > 0 && native_h > 0) {
+                        float aspect = (float)native_w / (float)native_h;
 
-                    // Fit to frame_width, scale height to maintain aspect ratio
-                    float target_width = frame_width;
-                    float target_height = target_width / aspect;
+                        // Fit to frame_width, scale height to maintain aspect ratio
+                        float target_width = frame_width;
+                        float target_height = target_width / aspect;
 
-                    // If height exceeds container, fit to height instead
-                    if (target_height > container_height) {
-                        target_height = container_height;
-                        target_width = target_height * aspect;
+                        // If height exceeds container, fit to height instead
+                        if (target_height > container_height) {
+                            target_height = container_height;
+                            target_width = target_height * aspect;
+                        }
+
+                        img->width = target_width;
+                        img->height = target_height;
+
+                        // Update UIElementSize to match
+                        UIElementSize& size = child.ensure<UIElementSize>();
+                        size.width = target_width;
+                        size.height = target_height;
                     }
-
-                    img->width = target_width;
-                    img->height = target_height;
-
-                    // Update UIElementSize to match
-                    UIElementSize& size = child.ensure<UIElementSize>();
-                    size.width = target_width;
-                    size.height = target_height;
                 }
-            }
 
-            propagate_world_positions(child);
-            frame_index++;
-        });
+                propagate_world_positions(child);
+                frame_index++;
+            });
+        } else {
+            // STEGOSAURUS MODE: Position frames based on capture time, allowing overlaps
+            // Left edge = 24 seconds ago, right edge = now
+            // Frame's left edge aligns with its capture time position
+
+            e.children([&](flecs::entity child)
+            {
+                const FilmstripFrameTime* frameTime = child.try_get<FilmstripFrameTime>();
+                if (!frameTime) return;
+
+                // Calculate age of this frame (seconds ago it was captured)
+                double age = currentTime - frameTime->capture_time;
+
+                // Position based on age: 0 seconds ago = right edge, SCROLL_DURATION ago = left edge
+                // Normalize to 0.0 (oldest/left) to 1.0 (newest/right)
+                float normalizedTime = 1.0f - (float)(age / FilmstripData::SCROLL_DURATION);
+
+                // Frame's LEFT edge aligns with its time position
+                float x_pos = normalizedTime * container_width;
+
+                // Hide frames that have scrolled off the left edge
+                RenderStatus& renderStatus = child.ensure<RenderStatus>();
+                if (normalizedTime < -0.5f) {
+                    renderStatus.visible = false;
+                } else {
+                    renderStatus.visible = true;
+                }
+
+                Position& local = child.ensure<Position, Local>();
+                local.x = x_pos;
+                local.y = 0.0f;
+
+                // Scale frame to fit within frame_width while maintaining aspect ratio
+                ImageRenderable* img = child.try_get_mut<ImageRenderable>();
+                if (img && img->imageHandle > 0) {
+                    int native_w, native_h;
+                    nvgImageSize(graphics.vg, img->imageHandle, &native_w, &native_h);
+
+                    if (native_w > 0 && native_h > 0) {
+                        float aspect = (float)native_w / (float)native_h;
+
+                        // Fit to frame_width, scale height to maintain aspect ratio
+                        float target_width = frame_width;
+                        float target_height = target_width / aspect;
+
+                        // If height exceeds container, fit to height instead
+                        if (target_height > container_height) {
+                            target_height = container_height;
+                            target_width = target_height * aspect;
+                        }
+
+                        img->width = target_width;
+                        img->height = target_height;
+
+                        // Update UIElementSize to match
+                        UIElementSize& size = child.ensure<UIElementSize>();
+                        size.width = target_width;
+                        size.height = target_height;
+                    }
+                }
+
+                propagate_world_positions(child);
+            });
+        }
     });
 
     // Sync scroll position for entities linked to a FilmstripData (e.g., mel spectrogram)
@@ -8405,6 +8499,35 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
             float similarity = 1.0f - cosDiff;
             chart.push(similarity);  // This resets scroll_offset to 0
             chart.time_since_sample = 0.0f;
+        }
+    });
+
+    // Stegosaurus spike detection system - monitors DINO values and triggers filmstrip captures on spikes
+    world->system<FilmstripData>("StegosaurusSpikeDetectionSystem")
+    .kind(flecs::PreUpdate)
+    .each([&](flecs::iter& it, size_t index, FilmstripData& data) {
+        // Only run in Stegosaurus mode
+        if (data.mode != FilmstripMode::Stegosaurus) return;
+
+        float dt = it.delta_time();
+        data.time_since_spike += dt;
+
+        // Only check for spikes if DINO is loaded
+        if (!g_dinoEmbedder.isLoaded()) return;
+
+        // Get latest DINO result
+        float cosDiff = 0.0f;
+        int frameCount = 0;
+        if (g_dinoEmbedder.getResult(cosDiff, frameCount)) {
+            // Store the latest value for reference
+            data.last_dino_value = cosDiff;
+
+            // Check if this is a spike (exceeds threshold and past cooldown)
+            if (cosDiff >= data.spike_threshold && data.time_since_spike >= data.spike_cooldown) {
+                data.pending_capture = true;
+                data.pending_spike_time = glfwGetTime();  // Record when spike was detected for accurate positioning
+                std::cout << "[DINO SPIKE] cosDiff=" << cosDiff << " threshold=" << data.spike_threshold << std::endl;
+            }
         }
     });
 
@@ -8604,9 +8727,37 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
 
                 std::cout << "Updated VNC texture (async PBO)" << std::endl;
 
-                // Periodic frame capture every 3 seconds
+                // Frame capture - mode depends on FilmstripData settings
                 double currentTime = glfwGetTime();
-                if (currentTime - vnc.lastCaptureTime >= 3.0) {
+
+                // Check filmstrip mode to determine if we should capture
+                bool shouldCapture = false;
+                flecs::query q_editor_panels_check = world->query_builder<EditorLeafData>()
+                    .build();
+
+                q_editor_panels_check.each([&](flecs::entity leaf, EditorLeafData& leaf_data)
+                {
+                    if (leaf_data.editor_type == EditorType::Episodic)
+                    {
+                        flecs::entity canvas = leaf.target<EditorCanvas>();
+                        FilmstripData* filmstripData = canvas.target<FilmstripChannel>().try_get_mut<FilmstripData>();
+                        if (filmstripData) {
+                            if (filmstripData->mode == FilmstripMode::Uniform) {
+                                // Uniform mode: capture every 3 seconds
+                                shouldCapture = (currentTime - vnc.lastCaptureTime >= 3.0);
+                            } else if (filmstripData->mode == FilmstripMode::Stegosaurus) {
+                                // Stegosaurus mode: capture when pending_capture is set
+                                shouldCapture = filmstripData->pending_capture;
+                                if (shouldCapture) {
+                                    filmstripData->pending_capture = false;  // Clear the flag
+                                    filmstripData->time_since_spike = 0.0f;  // Reset cooldown
+                                }
+                            }
+                        }
+                    }
+                });
+
+                if (shouldCapture) {
                     // Prepare RGBA data buffer
                     std::vector<uint8_t> rgbaData(surface->w * surface->h * 4);
 
@@ -8657,15 +8808,26 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
                             if (leaf_data.editor_type == EditorType::Episodic)
                             {
                                 flecs::entity canvas = leaf.target<EditorCanvas>();
+                                FilmstripData& filmstripData = canvas.target<FilmstripChannel>().ensure<FilmstripData>();
+
+                                // ZIndex: base 15, increment for each frame so newer ones render on top
+                                int zIndex = 15 + (int)(filmstripData.total_frames_added % 100);
+
+                                // Use spike detection time for Stegosaurus mode (aligns with chart),
+                                // capture time for Uniform mode
+                                double frameTime = (filmstripData.mode == FilmstripMode::Stegosaurus)
+                                    ? filmstripData.pending_spike_time
+                                    : currentTime;
+
                                 auto frame = world->entity()
                                 .is_a(UIElement)
                                 .set<ImageRenderable>({imgHandle, 1.0f, 1.0f, (float)surface->w, (float)surface->h})
-                                .set<ZIndex>({15})
+                                .set<ZIndex>({zIndex})
+                                .set<FilmstripFrameTime>({frameTime})  // Track time for positioning
                                 // .add<DebugRenderBounds>()
                                 .add<ScissorContainer>(canvas)
                                 .set<Expand>({false, 4.0f, 4.0f, 1.0f, true, 0.0f, 0.0f, 1.0f, true});
 
-                                FilmstripData& filmstripData = canvas.target<FilmstripChannel>().ensure<FilmstripData>();
                                 filmstripData.frames.push_back(frame);
                                 filmstripData.total_frames_added++;  // Track for scroll sync
                                 filmstripData.elapsed_time = 0.0f;   // Reset immediately for seamless transition
