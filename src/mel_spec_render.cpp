@@ -215,8 +215,16 @@ static ssize_t try_read(int fd, void* buf, size_t count) {
 static void update_from_ipc(IPCAudioState* state) {
     if (state->socket_fd < 0) return;
 
+    // Ensure image buffer is allocated (for scroll handling)
+    int fullImageSize = state->texWidth * state->texHeight * 3;
+    if (state->imageBufferSize < fullImageSize) {
+        state->imageBuffer = (unsigned char*)realloc(state->imageBuffer, fullImageSize);
+        memset(state->imageBuffer, 0, fullImageSize);
+        state->imageBufferSize = fullImageSize;
+    }
+
     // Ensure receive buffer is allocated (header + max region data)
-    int maxMessageSize = 16 + (state->texWidth * state->texHeight * 3);
+    int maxMessageSize = 16 + fullImageSize;
     if (state->recvBufferSize < maxMessageSize * 2) {
         state->recvBuffer = (unsigned char*)realloc(state->recvBuffer, maxMessageSize * 2);
         state->recvBufferSize = maxMessageSize * 2;
@@ -243,15 +251,55 @@ static void update_from_ipc(IPCAudioState* state) {
         int width = header[2];
         int height = header[3];
 
-        // Check for scroll command (x = -1) - just skip it, client will send full shifted image
+        // Check for scroll command (x = -1) - legacy, skip it
         if (x == -1) {
-            // Remove scroll command from buffer
             memmove(state->recvBuffer, state->recvBuffer + 16, state->recvBufferUsed - 16);
             state->recvBufferUsed -= 16;
             continue;
         }
 
-        // Validate header
+        // Handle scroll + new column command (x = -2)
+        // Shift imageBuffer left by 1 column, add new column at right
+        if (x == -2) {
+            int colHeight = height;  // height from header
+            int dataSize = colHeight * 3;  // 1 column of RGB data
+            int messageSize = 16 + dataSize;
+
+            if (state->recvBufferUsed < messageSize) {
+                return;  // Need more data
+            }
+
+            unsigned char* colData = state->recvBuffer + 16;
+
+            // Shift imageBuffer left by 1 column
+            for (int row = 0; row < state->texHeight; row++) {
+                unsigned char* rowStart = state->imageBuffer + row * state->texWidth * 3;
+                memmove(rowStart, rowStart + 3, (state->texWidth - 1) * 3);
+            }
+
+            // Add new column at rightmost position
+            int rightX = state->texWidth - 1;
+            for (int row = 0; row < colHeight && row < state->texHeight; row++) {
+                int dstIdx = (row * state->texWidth + rightX) * 3;
+                int srcIdx = row * 3;
+                state->imageBuffer[dstIdx + 0] = colData[srcIdx + 0];
+                state->imageBuffer[dstIdx + 1] = colData[srcIdx + 1];
+                state->imageBuffer[dstIdx + 2] = colData[srcIdx + 2];
+            }
+
+            // Upload entire texture
+            glBindTexture(GL_TEXTURE_2D, state->glTexture);
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, state->texWidth, state->texHeight,
+                            GL_RGB, GL_UNSIGNED_BYTE, state->imageBuffer);
+
+            memmove(state->recvBuffer, state->recvBuffer + messageSize,
+                    state->recvBufferUsed - messageSize);
+            state->recvBufferUsed -= messageSize;
+            continue;
+        }
+
+        // Validate header for normal updates
         if (x < 0 || y < 0 || width <= 0 || height <= 0 ||
             x + width > state->texWidth || y + height > state->texHeight) {
             fprintf(stderr, "IPC: Invalid header x=%d y=%d w=%d h=%d, resetting buffer\n",
@@ -266,14 +314,20 @@ static void update_from_ipc(IPCAudioState* state) {
 
         // Check if we have the complete message
         if (state->recvBufferUsed < messageSize) {
-            // Need more data
-            return;
+            return;  // Need more data
         }
 
         // Process the complete message
         unsigned char* imageData = state->recvBuffer + 16;
 
-        // Upload region to GL texture using glTexSubImage2D
+        // Update imageBuffer with the received region
+        for (int row = 0; row < height; row++) {
+            int dstRowStart = ((y + row) * state->texWidth + x) * 3;
+            int srcRowStart = row * width * 3;
+            memcpy(state->imageBuffer + dstRowStart, imageData + srcRowStart, width * 3);
+        }
+
+        // Upload region to GL texture
         glBindTexture(GL_TEXTURE_2D, state->glTexture);
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
         glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, width, height,

@@ -74,28 +74,39 @@ void frame_callback(unsigned char* image_data, int width, int height, void* user
 
 check_rightmost:
     if (scrolled) {
-        // When scrolled, send the entire width but only rows that changed
-        // This avoids complex GPU-side scrolling in the parent
-        // Send full width update at x=0
-        int header[4] = {0, 0, width, height};
+        // When scrolled, only send the NEW rightmost column (not entire image)
+        // Header: x=-2 signals "scroll left by 1, then add this column at right"
+        // This reduces data from ~793KB to ~384 bytes per frame
+        int header[4] = {-2, 0, 1, height};  // x=-2 = scroll command, width=1 column
         ssize_t sent = send(g_socket_fd, header, sizeof(header), MSG_NOSIGNAL);
         if (sent != sizeof(header)) {
             fprintf(stderr, "[CLIENT] Frame %d: Failed to send scroll header\n", g_frame_count);
             return;
         }
 
-        // Send full image (shifted)
-        int size = width * height * 3;
-        sent = send(g_socket_fd, image_data, size, MSG_NOSIGNAL);
-        if (sent != size) {
-            fprintf(stderr, "[CLIENT] Frame %d: Failed to send scrolled image\n", g_frame_count);
+        // Send only the rightmost column
+        int col_size = height * 3;
+        unsigned char* col_data = (unsigned char*)malloc(col_size);
+        int rightmost_x = width - 1;
+        for (int y = 0; y < height; y++) {
+            int src_idx = (y * width + rightmost_x) * 3;
+            int dst_idx = y * 3;
+            col_data[dst_idx + 0] = image_data[src_idx + 0];
+            col_data[dst_idx + 1] = image_data[src_idx + 1];
+            col_data[dst_idx + 2] = image_data[src_idx + 2];
+        }
+
+        sent = send(g_socket_fd, col_data, col_size, MSG_NOSIGNAL);
+        free(col_data);
+        if (sent != col_size) {
+            fprintf(stderr, "[CLIENT] Frame %d: Failed to send scroll column\n", g_frame_count);
             return;
         }
 
         memcpy(g_prev_image, image_data, width * height * 3);
 
         if (g_frame_count % 100 == 0) {
-            // printf("[CLIENT] Frame %d: Sent scrolled full image\n", g_frame_count);
+            printf("[CLIENT] Frame %d: Sent scroll + 1 column (%d bytes)\n", g_frame_count, col_size);
         }
         return;
     }
