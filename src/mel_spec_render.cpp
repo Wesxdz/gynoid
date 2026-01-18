@@ -114,6 +114,9 @@ struct IPCAudioState {
     unsigned char* recvBuffer;
     int recvBufferSize;
     int recvBufferUsed;
+
+    // Batching: track if imageBuffer was modified this frame
+    bool needsUpload;
 };
 
 static IPCAudioState g_micState = {};
@@ -287,11 +290,8 @@ static void update_from_ipc(IPCAudioState* state) {
                 state->imageBuffer[dstIdx + 2] = colData[srcIdx + 2];
             }
 
-            // Upload entire texture
-            glBindTexture(GL_TEXTURE_2D, state->glTexture);
-            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, state->texWidth, state->texHeight,
-                            GL_RGB, GL_UNSIGNED_BYTE, state->imageBuffer);
+            // Mark for upload (batched, will upload once per frame)
+            state->needsUpload = true;
 
             memmove(state->recvBuffer, state->recvBuffer + messageSize,
                     state->recvBufferUsed - messageSize);
@@ -345,6 +345,23 @@ static void update_from_ipc(IPCAudioState* state) {
     }
 }
 
+// Upload batched texture changes (called once per frame after processing all IPC messages)
+static void upload_if_needed(IPCAudioState* state) {
+    if (!state->needsUpload || !state->imageBuffer) return;
+
+    glBindTexture(GL_TEXTURE_2D, state->glTexture);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, state->texWidth, state->texHeight,
+                    GL_RGB, GL_UNSIGNED_BYTE, state->imageBuffer);
+
+    GLenum err = glGetError();
+    if (err != GL_NO_ERROR) {
+        fprintf(stderr, "GL error in batched texture upload: 0x%x\n", err);
+    }
+
+    state->needsUpload = false;
+}
+
 // System to update textures from IPC
 static void melSpecUpdateSystem(flecs::entity e, MelSpecRender& melSpec) {
     static int update_count = 0;
@@ -354,14 +371,13 @@ static void melSpecUpdateSystem(flecs::entity e, MelSpecRender& melSpec) {
     try_accept_connection(&g_micState);
     try_accept_connection(&g_sysAudioState);
 
-    // if (update_count % 300 == 0) {
-    //     printf("[UPDATE] Frame %d: mic_fd=%d, sys_fd=%d\n",
-    //            update_count, g_micState.socket_fd, g_sysAudioState.socket_fd);
-    // }
-
-    // Update textures from IPC
+    // Process all pending IPC messages (may batch multiple scroll updates)
     update_from_ipc(&g_micState);
     update_from_ipc(&g_sysAudioState);
+
+    // Upload batched changes once per frame
+    upload_if_needed(&g_micState);
+    upload_if_needed(&g_sysAudioState);
 }
 
 void MelSpecRenderModule(flecs::world& world) {
@@ -403,6 +419,7 @@ void MelSpecRenderModule(flecs::world& world) {
     g_micState.recvBuffer = nullptr;
     g_micState.recvBufferSize = 0;
     g_micState.recvBufferUsed = 0;
+    g_micState.needsUpload = false;
 
     // Create GL texture for mic
     glGenTextures(1, &g_micState.glTexture);
@@ -429,6 +446,7 @@ void MelSpecRenderModule(flecs::world& world) {
     g_sysAudioState.recvBuffer = nullptr;
     g_sysAudioState.recvBufferSize = 0;
     g_sysAudioState.recvBufferUsed = 0;
+    g_sysAudioState.needsUpload = false;
 
     // Create GL texture for system audio
     glGenTextures(1, &g_sysAudioState.glTexture);

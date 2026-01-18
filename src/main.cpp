@@ -8387,6 +8387,7 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
                                 FilmstripData& filmstripData = leaf.target<EditorCanvas>().target<FilmstripChannel>().ensure<FilmstripData>();
                                 filmstripData.frames.push_back(frame);
                                 filmstripData.total_frames_added++;  // Track for scroll sync
+                                filmstripData.elapsed_time = 0.0f;   // Reset immediately for seamless transition
                                 // Keep frame_limit + 1 frames for smooth scrolling (extra frame offscreen)
                                 if (filmstripData.frames.size() > (size_t)(filmstripData.frame_limit + 1))
                                 {
