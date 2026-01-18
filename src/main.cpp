@@ -1224,6 +1224,7 @@ struct LineChartData
     uint32_t line_color = 0xFFFFFFFF;  // RGBA line color (solid white)
     float sample_interval = 0.0f;  // Seconds between samples (0 = every frame)
     float time_since_sample = 0.0f;  // Time accumulator for sampling
+    float scroll_offset = 0.0f;  // Smooth scroll offset (0.0 to 1.0 of one sample width)
     static constexpr float WINDOW_DURATION = 24.0f;  // Total time window in seconds (matches filmstrip)
 
     void push(float value) {
@@ -1234,6 +1235,7 @@ struct LineChartData
             values[write_pos] = value;
         }
         write_pos = (write_pos + 1) % capacity;
+        scroll_offset = 0.0f;  // Reset scroll when new sample is added
     }
 
     // Get value at index (0 = oldest, size-1 = newest)
@@ -7979,17 +7981,20 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
 
             size_t num_points = chart.size();
 
-            // Calculate point spacing - chart spans full parent width
-            float point_spacing = width / (float)(chart.capacity > 1 ? chart.capacity - 1 : 1);
+            // Calculate point spacing - chart extends one frame past each edge (left and right)
+            // Using capacity-3 makes capacity points span width + 2*point_spacing
+            float point_spacing = width / (float)(chart.capacity > 3 ? chart.capacity - 3 : 1);
 
             // If we have data, draw it
             if (num_points >= 1) {
                 // Build polygon path: start at bottom of first point, trace line, close at bottom
                 nvgBeginPath(graphics.vg);
 
-                // Calculate x offset so newest point is at the rightmost position
-                // As buffer fills, data slides in from the right
-                float x_offset = (float)(chart.capacity - num_points) * point_spacing;
+                // Calculate x offset:
+                // - Start one frame to the left of visible area (- point_spacing)
+                // - Adjust for partially filled buffer
+                // - Apply smooth scroll offset
+                float x_offset = (float)(chart.capacity - num_points) * point_spacing - chart.scroll_offset * point_spacing - point_spacing;
 
                 // Start at bottom of the first data point's x position
                 float first_data_x = base_x + x_offset;
@@ -8372,13 +8377,20 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
     });
 
     // DINO similarity score collection system - samples DINO cos diff and pushes to LineChartData
+    // Also updates smooth scroll offset every frame for continuous scrolling
     world->system<LineChartData>("DinoScoreCollectionSystem")
     .kind(flecs::PreUpdate)
     .each([&](flecs::iter& it, size_t index, LineChartData& chart) {
-        if (!g_dinoEmbedder.isLoaded()) return;
-
         float dt = it.delta_time();
         chart.time_since_sample += dt;
+
+        // Update smooth scroll offset every frame (0 to 1 over sample_interval)
+        if (chart.sample_interval > 0) {
+            chart.scroll_offset = std::min(1.0f, chart.time_since_sample / chart.sample_interval);
+        }
+
+        // Only sample DINO if loaded
+        if (!g_dinoEmbedder.isLoaded()) return;
 
         // Sample at the specified interval (or every frame if interval is 0)
         if (chart.sample_interval > 0 && chart.time_since_sample < chart.sample_interval) {
@@ -8391,7 +8403,7 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
             // cosDiff is 1.0 - cosineSimilarity, so higher = more different
             // We want to show similarity, so invert: similarity = 1.0 - cosDiff
             float similarity = 1.0f - cosDiff;
-            chart.push(similarity);
+            chart.push(similarity);  // This resets scroll_offset to 0
             chart.time_since_sample = 0.0f;
         }
     });
