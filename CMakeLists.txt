@@ -89,6 +89,9 @@ target_include_directories(fpng PUBLIC deps/mel_spec/deps/fpng/src)
 set_target_properties(fpng PROPERTIES CXX_STANDARD 11)
 target_compile_options(fpng PRIVATE -msse4.1 -mpclmul)
 
+# mel_spec libraries (audio streaming and mel spectrogram generation)
+add_subdirectory("deps/mel_spec")
+
 find_package(SDL2 REQUIRED)
 find_package(SDL2_image REQUIRED)
 find_package(OpenCV REQUIRED)
@@ -129,20 +132,10 @@ target_link_libraries(${PROJECT_NAME} flecs glfw glad nanovg fpng X11 Xi Xtst SD
 
 # Add audio stream client executable
 add_executable(audio_stream_client src/audio_stream_client.c)
-target_link_libraries(audio_stream_client
-    "${CMAKE_SOURCE_DIR}/deps/mel_spec/build/libaudio_stream.so"
-    "${CMAKE_SOURCE_DIR}/deps/mel_spec/build/libmelspec.so"
-)
-
-# Link mel_spec .so libraries
-link_directories("${CMAKE_SOURCE_DIR}/deps/mel_spec/build")
-link_directories("${CMAKE_SOURCE_DIR}/deps/mel_spec/build/deps/libsoundio")
+target_link_libraries(audio_stream_client audio_stream melspec)
 
 # Add mel_spec dependencies
-target_link_libraries(${PROJECT_NAME}
-    "${CMAKE_SOURCE_DIR}/deps/mel_spec/build/libaudio_stream.so"
-    "${CMAKE_SOURCE_DIR}/deps/mel_spec/build/libmelspec.so"
-)
+target_link_libraries(${PROJECT_NAME} audio_stream melspec)
 
 if(LibVNCServer_FOUND)
     target_link_libraries(${PROJECT_NAME} LibVNCServer::vncclient)

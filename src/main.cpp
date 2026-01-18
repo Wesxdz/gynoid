@@ -8194,36 +8194,36 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
     });
 
     // Position mel spec based on fill progress - starts at right, slides left as it fills
-    world->system<ImageRenderable, UIElementBounds>("MelSpecFillPositionSystem")
-    .kind(flecs::PreUpdate)
-    .with<MelSpecSource>(flecs::Wildcard)
-    .each([&](flecs::entity e, ImageRenderable& img, UIElementBounds& bounds)
-    {
-        // Get the mel spec renderer entity this is linked to
-        flecs::entity melSpecEntity = e.target<MelSpecSource>();
-        if (!melSpecEntity.is_valid()) return;
+    // world->system<ImageRenderable, UIElementBounds>("MelSpecFillPositionSystem")
+    // .kind(flecs::PreUpdate)
+    // .with<MelSpecSource>(flecs::Wildcard)
+    // .each([&](flecs::entity e, ImageRenderable& img, UIElementBounds& bounds)
+    // {
+    //     // Get the mel spec renderer entity this is linked to
+    //     flecs::entity melSpecEntity = e.target<MelSpecSource>();
+    //     if (!melSpecEntity.is_valid()) return;
 
-        const MelSpecRender* melSpec = melSpecEntity.try_get<MelSpecRender>();
-        if (!melSpec) return;
+    //     const MelSpecRender* melSpec = melSpecEntity.try_get<MelSpecRender>();
+    //     if (!melSpec) return;
 
-        // Get parent bounds for sizing
-        flecs::entity parent = e.parent();
-        if (!parent.is_valid()) return;
-        const UIElementBounds* parent_bounds = parent.try_get<UIElementBounds>();
-        if (!parent_bounds) return;
+    //     // Get parent bounds for sizing
+    //     flecs::entity parent = e.parent();
+    //     if (!parent.is_valid()) return;
+    //     const UIElementBounds* parent_bounds = parent.try_get<UIElementBounds>();
+    //     if (!parent_bounds) return;
 
-        float parent_width = parent_bounds->xmax - parent_bounds->xmin;
+    //     float parent_width = parent_bounds->xmax - parent_bounds->xmin;
 
-        // Position based on fill progress:
-        // fillProgress 0.0 -> x = parent_width (fully offscreen right)
-        // fillProgress 1.0 -> x = 0 (fully visible)
-        float x_offset = parent_width * (1.0f - melSpec->fillProgress);
+    //     // Position based on fill progress:
+    //     // fillProgress 0.0 -> x = parent_width (fully offscreen right)
+    //     // fillProgress 1.0 -> x = 0 (fully visible)
+    //     float x_offset = parent_width * (1.0f - melSpec->fillProgress);
 
-        Position& local = e.ensure<Position, Local>();
-        local.x = x_offset;
+    //     Position& local = e.ensure<Position, Local>();
+    //     local.x = x_offset;
 
-        propagate_world_positions(e);
-    });
+    //     propagate_world_positions(e);
+    // });
 
     world->system<RectRenderable>()
     .kind(flecs::PostLoad)
