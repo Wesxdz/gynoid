@@ -1212,6 +1212,45 @@ struct FilmstripData
     static constexpr float SCROLL_DURATION = 24.0f;  // Seconds for full container to scroll (matches 24s audio window)
 };
 
+// Line chart channel for streaming data visualization (e.g., DINO cosine similarity)
+struct LineChartData
+{
+    std::vector<float> values;  // Circular buffer of values (0.0 to 1.0 normalized)
+    size_t write_pos = 0;       // Current write position in circular buffer
+    size_t capacity = 0;        // Max number of data points
+    float min_value = 0.0f;     // Min value for normalization
+    float max_value = 1.0f;     // Max value for normalization
+    uint32_t fill_color = 0xFFFFFF40;  // RGBA fill color (semi-transparent white)
+    uint32_t line_color = 0xFFFFFFFF;  // RGBA line color (solid white)
+    float sample_interval = 0.0f;  // Seconds between samples (0 = every frame)
+    float time_since_sample = 0.0f;  // Time accumulator for sampling
+    static constexpr float WINDOW_DURATION = 24.0f;  // Total time window in seconds (matches filmstrip)
+
+    void push(float value) {
+        if (capacity == 0) return;
+        if (values.size() < capacity) {
+            values.push_back(value);
+        } else {
+            values[write_pos] = value;
+        }
+        write_pos = (write_pos + 1) % capacity;
+    }
+
+    // Get value at index (0 = oldest, size-1 = newest)
+    float get(size_t index) const {
+        if (values.empty() || index >= values.size()) return 0.0f;
+        if (values.size() < capacity) {
+            return values[index];
+        }
+        return values[(write_pos + index) % capacity];
+    }
+
+    size_t size() const { return values.size(); }
+};
+
+// Tag for LineChart channel type
+struct LineChartChannel{};
+
 enum class PanelSplitType
 {
     Horizontal,
@@ -3321,6 +3360,29 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         else
         {
             std::cout << "[Episodic] SystemAudioRenderer not found or missing MelSpecRender component!" << std::endl;
+        }
+
+        // DINO cosine similarity line chart channel
+        // Capacity: ~240 samples for 24 seconds at ~10 samples/second (matching DINO inference rate)
+        {
+            LineChartData chartData;
+            chartData.capacity = 240;
+            chartData.min_value = 0.0f;
+            chartData.max_value = 1.0f;
+            chartData.fill_color = 0xFFFFFF30;  // Semi-transparent white fill
+            chartData.line_color = 0xFFFFFFFF;  // Solid white line
+            chartData.sample_interval = 0.1f;   // Sample every 100ms
+
+            world->entity("DinoSimilarityChart")
+                .is_a(UIElement)
+                .child_of(channels)
+                .set<LineChartData>(chartData)
+                .set<Expand>({true, 0.0f, 0.0f, 1.0f, false, 0.0f, 0.0f, 0.0f})
+                .set<UIElementSize>({100.0f, 48.0f})  // Fixed height for the chart
+                .add<ScissorContainer>(leaf.target<EditorCanvas>())
+                .add<LineChartChannel>()
+                .set<ZIndex>({19});
+            std::cout << "[Episodic] Created DINO similarity line chart channel" << std::endl;
         }
 
         // TODO: Implement scissors/vertical scrollbar
@@ -6187,6 +6249,8 @@ int main(int, char *[]) {
     world->component<TextRenderable>();
     world->component<ImageCreator>();
     world->component<ImageRenderable>();
+    world->component<LineChartData>();
+    world->component<LineChartChannel>();
     world->component<ZIndex>()
     .member<int>("layer");
 
@@ -7872,6 +7936,120 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
             queue.clear();
         });
 
+    // LineChart rendering system - renders filled polygon for streaming data visualization
+    // Like mel spec: right edge is "now", data flows continuously from right to left
+    // No discrete frame snapping - points have no width unlike filmstrip frames
+    auto lineChartRenderSystem = world->system<LineChartData, UIElementBounds>("LineChartRenderSystem")
+        .kind(flecs::PostUpdate)
+        .each([&](flecs::entity e, LineChartData& chart, UIElementBounds& bounds) {
+            if (chart.capacity == 0) return;
+
+            Graphics& graphics = world->ensure<Graphics>();
+            if (!graphics.vg) return;
+
+            // Get parent bounds for full width
+            flecs::entity parent = e.parent();
+            if (!parent.is_valid()) return;
+            const UIElementBounds* parent_bounds = parent.try_get<UIElementBounds>();
+            if (!parent_bounds) return;
+
+            float parent_width = parent_bounds->xmax - parent_bounds->xmin;
+
+            // Apply scissor if entity has ScissorContainer
+            if (e.has<ScissorContainer>(flecs::Wildcard)) {
+                flecs::entity scissorEntity = e.target<ScissorContainer>();
+                if (scissorEntity.is_valid()) {
+                    const UIElementBounds* scissorBounds = scissorEntity.try_get<UIElementBounds>();
+                    if (scissorBounds) {
+                        nvgScissor(graphics.vg, scissorBounds->xmin, scissorBounds->ymin,
+                                   scissorBounds->xmax - scissorBounds->xmin,
+                                   scissorBounds->ymax - scissorBounds->ymin);
+                    }
+                }
+            }
+
+            // Use parent width for chart, bounds height for vertical
+            float width = parent_width;
+            float height = bounds.ymax - bounds.ymin;
+
+            // Base position: parent left edge (no scroll offset - data flows naturally via circular buffer)
+            // Right edge is always "now", newest data point at parent_bounds->xmax
+            float base_x = parent_bounds->xmin;
+            float y_bottom = bounds.ymax;
+
+            size_t num_points = chart.size();
+
+            // Calculate point spacing - chart spans full parent width
+            float point_spacing = width / (float)(chart.capacity > 1 ? chart.capacity - 1 : 1);
+
+            // If we have data, draw it
+            if (num_points >= 1) {
+                // Build polygon path: start at bottom of first point, trace line, close at bottom
+                nvgBeginPath(graphics.vg);
+
+                // Calculate x offset so newest point is at the rightmost position
+                // As buffer fills, data slides in from the right
+                float x_offset = (float)(chart.capacity - num_points) * point_spacing;
+
+                // Start at bottom of the first data point's x position
+                float first_data_x = base_x + x_offset;
+                nvgMoveTo(graphics.vg, first_data_x, y_bottom);
+
+                // Draw line through all data points (from oldest to newest)
+                for (size_t i = 0; i < num_points; i++) {
+                    float value = chart.get(i);
+                    // Normalize value to 0-1 range
+                    float normalized = (value - chart.min_value) / (chart.max_value - chart.min_value);
+                    normalized = std::max(0.0f, std::min(1.0f, normalized));
+
+                    float x = base_x + x_offset + i * point_spacing;
+                    float y = y_bottom - normalized * height;
+
+                    nvgLineTo(graphics.vg, x, y);
+                }
+
+                // Close polygon: line to bottom at last point, then back to start
+                float last_data_x = base_x + x_offset + (num_points - 1) * point_spacing;
+                nvgLineTo(graphics.vg, last_data_x, y_bottom);
+                nvgClosePath(graphics.vg);
+
+                // Fill with semi-transparent color
+                uint8_t fr = (chart.fill_color >> 24) & 0xFF;
+                uint8_t fg = (chart.fill_color >> 16) & 0xFF;
+                uint8_t fb = (chart.fill_color >> 8) & 0xFF;
+                uint8_t fa = (chart.fill_color) & 0xFF;
+                nvgFillColor(graphics.vg, nvgRGBA(fr, fg, fb, fa));
+                nvgFill(graphics.vg);
+
+                // Draw line on top
+                nvgBeginPath(graphics.vg);
+                for (size_t i = 0; i < num_points; i++) {
+                    float value = chart.get(i);
+                    float normalized = (value - chart.min_value) / (chart.max_value - chart.min_value);
+                    normalized = std::max(0.0f, std::min(1.0f, normalized));
+
+                    float x = base_x + x_offset + i * point_spacing;
+                    float y = y_bottom - normalized * height;
+
+                    if (i == 0) {
+                        nvgMoveTo(graphics.vg, x, y);
+                    } else {
+                        nvgLineTo(graphics.vg, x, y);
+                    }
+                }
+
+                uint8_t lr = (chart.line_color >> 24) & 0xFF;
+                uint8_t lg = (chart.line_color >> 16) & 0xFF;
+                uint8_t lb = (chart.line_color >> 8) & 0xFF;
+                uint8_t la = (chart.line_color) & 0xFF;
+                nvgStrokeColor(graphics.vg, nvgRGBA(lr, lg, lb, la));
+                nvgStrokeWidth(graphics.vg, 1.5f);
+                nvgStroke(graphics.vg);
+            }
+
+            nvgResetScissor(graphics.vg);
+        });
+
     auto vncInitSystem = world->system<VNCClientHandle>()
         .kind(flecs::PreUpdate)
         .each([](flecs::iter& it, size_t i, VNCClientHandle& handle) {
@@ -8191,6 +8369,31 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
         local.y = 0.0f;
 
         propagate_world_positions(e);
+    });
+
+    // DINO similarity score collection system - samples DINO cos diff and pushes to LineChartData
+    world->system<LineChartData>("DinoScoreCollectionSystem")
+    .kind(flecs::PreUpdate)
+    .each([&](flecs::iter& it, size_t index, LineChartData& chart) {
+        if (!g_dinoEmbedder.isLoaded()) return;
+
+        float dt = it.delta_time();
+        chart.time_since_sample += dt;
+
+        // Sample at the specified interval (or every frame if interval is 0)
+        if (chart.sample_interval > 0 && chart.time_since_sample < chart.sample_interval) {
+            return;
+        }
+
+        float cosDiff = 0.0f;
+        int frameCount = 0;
+        if (g_dinoEmbedder.getResult(cosDiff, frameCount)) {
+            // cosDiff is 1.0 - cosineSimilarity, so higher = more different
+            // We want to show similarity, so invert: similarity = 1.0 - cosDiff
+            float similarity = 1.0f - cosDiff;
+            chart.push(similarity);
+            chart.time_since_sample = 0.0f;
+        }
     });
 
     // Position mel spec based on fill progress - starts at right, slides left as it fills
