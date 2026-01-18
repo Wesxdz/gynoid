@@ -262,6 +262,90 @@ public:
 // Global vision processing job queue
 static VisionJobQueue g_visionQueue;
 
+// PNG save job for background thread
+struct PNGSaveJob {
+    std::vector<uint8_t> pixelData;
+    int width;
+    int height;
+    std::string filename;
+};
+
+class PNGSaveQueue {
+private:
+    std::deque<PNGSaveJob> jobs;
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::atomic<bool> shouldStop{false};
+    std::atomic<bool> isStopped{false};
+    std::thread worker;
+
+public:
+    void start() {
+        shouldStop = false;
+        isStopped = false;
+        worker = std::thread([this]() {
+            while (true) {
+                PNGSaveJob job;
+                {
+                    std::unique_lock<std::mutex> lock(mutex);
+                    cv.wait(lock, [this]() { return !jobs.empty() || shouldStop; });
+
+                    if (shouldStop && jobs.empty()) {
+                        return;
+                    }
+
+                    if (jobs.empty()) continue;
+
+                    job = std::move(jobs.front());
+                    jobs.pop_front();
+                }
+
+                // Save PNG outside the lock
+                if (fpng::fpng_encode_image_to_file(job.filename.c_str(), job.pixelData.data(),
+                                                     job.width, job.height, 4, 0)) {
+                    std::cout << "[PNG SAVE] Saved " << job.filename << " (background)" << std::endl;
+                } else {
+                    std::cerr << "[PNG SAVE ERROR] Failed to save " << job.filename << std::endl;
+                }
+            }
+        });
+        std::cout << "[PNG SAVE QUEUE] Started background worker thread" << std::endl;
+    }
+
+    void submit(PNGSaveJob&& job) {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            jobs.push_back(std::move(job));
+        }
+        cv.notify_one();
+    }
+
+    void stop() {
+        bool expected = false;
+        if (!isStopped.compare_exchange_strong(expected, true)) {
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            shouldStop = true;
+        }
+        cv.notify_all();
+
+        if (worker.joinable()) {
+            worker.join();
+        }
+        std::cout << "[PNG SAVE QUEUE] Worker thread stopped" << std::endl;
+    }
+
+    ~PNGSaveQueue() {
+        stop();
+    }
+};
+
+// Global PNG save queue
+static PNGSaveQueue g_pngSaveQueue;
+
 #include "vnc_struct.h"
 
 /*
@@ -1103,6 +1187,8 @@ struct EditorLeafData
 };
 
 struct FilmstripChannel{};
+// Tag to sync an entity's scroll position with a FilmstripData entity
+struct SyncScrollWithFilmstrip{};
 // Determine how to chunk and choose which frames to display
 
 struct FilmstripData
@@ -1111,6 +1197,12 @@ struct FilmstripData
     int frame_limit;
     // Should they be stored as entities or paths?
     std::vector<flecs::entity> frames;
+    // Scroll tracking for realtime left-to-right scroll over 24 seconds
+    float scroll_offset = 0.0f;  // Current scroll progress (0.0 to 1.0 of one frame width)
+    float elapsed_time = 0.0f;   // Time elapsed in current scroll cycle
+    size_t total_frames_added = 0;  // Counter incremented each time a frame is pushed
+    size_t last_seen_frame_count = 0;  // To detect when total_frames_added changes
+    static constexpr float SCROLL_DURATION = 24.0f;  // Seconds for full container to scroll (matches 24s audio window)
 };
 
 enum class PanelSplitType
@@ -3170,13 +3262,11 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
 
         auto frameChannel = world->entity()
         .is_a(UIElement)
-        .set<FilmstripData>({7, {}})
-        .set<TimeEventRowChannel>({7})
-        .add<FitChildren>()
-        .set<Expand>({true, 0, 0, 1, false, 0, 0, 1.0})
-        .set<LayoutBox>({LayoutBox::Horizontal})
-        .add<DebugRenderBounds>()
-        .add(flecs::OrderedChildren)
+        .set<FilmstripData>({8, {}})  // 8 visible frames × 3s = 24s to match audio window
+        .set<TimeEventRowChannel>({8})
+        // Custom scroll layout - no LayoutBox, positions set directly by FilmstripScrollSystem
+        .set<Expand>({true, 0, 0, 1.0f, false, 0, 0, 1.0})
+        // .add<DebugRenderBounds>()
         .add<ScissorContainer>(leaf.target<EditorCanvas>())
         .child_of(channels);
 
@@ -3186,7 +3276,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         .set<Expand>({true, 0, 0, 1, false, 0, 0, 0})
         .set<RectRenderable>({10.0f, 100.0f, false, 0xFFFF00FF })
         .add<CopyChildHeight>(frameChannel)
-        .add<DebugRenderBounds>()
+        // .add<DebugRenderBounds>()
         .child_of(channels);
 
         leaf.target<EditorCanvas>().add<FilmstripChannel>(frameChannel);
@@ -3210,15 +3300,15 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
             std::cout << "[Episodic] MelSpec texture handle: " << melSpec.nvgTextureHandle
                       << " size: " << melSpec.width << "x" << melSpec.height << std::endl;
 
-            // Create mel spec display element
+            // Create mel spec display element - static, no scrolling
             world->entity()
                 .is_a(UIElement)
                 .child_of(channels)
-                .set<ImageRenderable>({melSpec.nvgTextureHandle, 1.0f, 1.0f, (float)melSpec.width, (float)melSpec.height/1})
+                .set<ImageRenderable>({melSpec.nvgTextureHandle, 1.0f, 1.0f, (float)melSpec.width, (float)melSpec.height, nvgRGBA(255,255,255,255)})
                 .set<Expand>({true, 0.0f, 0.0f, 1.0f, false, 0.0f, 0.0f, 0.0f})
-                // .set<Constrain>({true, true})
+                .add<ScissorContainer>(leaf.target<EditorCanvas>())
                 .set<ZIndex>({18});
-            std::cout << "[Episodic] Created mel spec display in channel" << std::endl;
+            std::cout << "[Episodic] Created mel spec display in channel (static)" << std::endl;
         }
         else
         {
@@ -6013,6 +6103,9 @@ int main(int, char *[]) {
     // Initialize fpng for fast PNG encoding
     fpng::fpng_init();
 
+    // Start background PNG save queue
+    g_pngSaveQueue.start();
+
     // Initialize libssh2
     int rc = libssh2_init(0);
     if (rc) {
@@ -7706,8 +7799,8 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
                         const auto& image = std::get<ImageRenderable>(cmd.renderData);
                         if (image.imageHandle != -1) {
                             NVGpaint imgPaint = nvgImagePattern(graphics.vg, cmd.pos.x, cmd.pos.y,
-                                                              image.width, image.height, 0.0f,
-                                                              image.imageHandle, 1.0); // image.alpha
+                                image.width, image.height, 0.0f,
+                                image.imageHandle, 1.0);
                             nvgBeginPath(graphics.vg);
                             nvgRect(graphics.vg, cmd.pos.x, cmd.pos.y, image.width, image.height);
                             imgPaint.innerColor = imgPaint.outerColor = image.tint;
@@ -7928,18 +8021,149 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
     auto spaceframeSelector = world->system<FilmstripData>()
     .kind(flecs::PreFrame)
     // .immediate()
-    .each([&](flecs::entity e, FilmstripData& data)
+    .each([&](flecs::iter& it, size_t index, FilmstripData& data)
     {
+        flecs::entity e = it.entity(index);
+        float dt = it.delta_time();
+
+        // Detect when a new frame has been added and reset scroll for seamless transition
+        if (data.total_frames_added != data.last_seen_frame_count) {
+            data.elapsed_time = 0.0f;  // Reset scroll to start
+            data.last_seen_frame_count = data.total_frames_added;
+        }
+
+        // Update scroll timing
+        data.elapsed_time += dt;
+
+        // Time for one frame to scroll through = total duration / number of visible frames
+        float time_per_frame = FilmstripData::SCROLL_DURATION / data.frame_limit;
+
+        // Calculate scroll progress (0.0 to 1.0 for one frame width)
+        // Clamp at 1.0 if no new frame arrives in time
+        float scroll_progress = std::min(1.0f, data.elapsed_time / time_per_frame);
+
+        // Detach all current children
         e.children([&](flecs::entity child)
         {
             child.remove(flecs::ChildOf, e);
             child.ensure<RenderStatus>().visible = false;
         });
-        for (int i = std::max(0, (int)data.frames.size() - data.frame_limit); i < data.frames.size(); i++)
+
+        // Show frame_limit + 1 frames for smooth scrolling (extra frame on right side)
+        int display_count = data.frame_limit + 1;
+        int start_index = std::max(0, (int)data.frames.size() - display_count);
+        for (int i = start_index; i < (int)data.frames.size(); i++)
         {
             data.frames[i].child_of(e);
             data.frames[i].ensure<RenderStatus>().visible = true;
         }
+
+        // Store scroll offset to be applied after layout
+        // Offset moves frames left over time (0 to 1 representing one frame width)
+        // Resets to 0 when a new frame is added (seamless transition)
+        data.scroll_offset = scroll_progress;
+    });
+
+    // Custom scroll layout for filmstrip - directly positions frames based on scroll offset
+    // No LayoutBox - we handle all positioning here for smooth, stutter-free scrolling
+    world->system<FilmstripData, UIElementBounds>("FilmstripScrollSystem")
+    .kind(flecs::PreUpdate)
+    .each([&](flecs::entity e, FilmstripData& data, UIElementBounds& bounds)
+    {
+        Graphics& graphics = world->ensure<Graphics>();
+        // Visible container width (what fits in the panel)
+        float container_width = bounds.xmax - bounds.xmin;
+        float container_height = bounds.ymax - bounds.ymin;
+        // Each frame width = visible width / number of visible frames
+        float frame_width = container_width / data.frame_limit;
+
+        // Position each child frame directly based on index and scroll offset
+        // Right-aligned: frames start from the right side, newest frame at rightmost
+        int frame_index = 0;
+        int num_frames = 0;
+        e.children([&](flecs::entity) { num_frames++; });
+
+        e.children([&](flecs::entity child)
+        {
+            // Right-align: offset so last frame is at position frame_limit * frame_width (rightmost)
+            // base_offset puts first frame at the right position when we have fewer than max frames
+            int base_offset = data.frame_limit + 1 - num_frames;
+            float x_pos = ((base_offset + frame_index) * frame_width) - (data.scroll_offset * frame_width);
+
+            Position& local = child.ensure<Position, Local>();
+            local.x = x_pos;
+            local.y = 0.0f;
+
+            // Scale frame to fit within frame_width while maintaining aspect ratio
+            ImageRenderable* img = child.try_get_mut<ImageRenderable>();
+            if (img && img->imageHandle > 0) {
+                int native_w, native_h;
+                nvgImageSize(graphics.vg, img->imageHandle, &native_w, &native_h);
+
+                if (native_w > 0 && native_h > 0) {
+                    float aspect = (float)native_w / (float)native_h;
+
+                    // Fit to frame_width, scale height to maintain aspect ratio
+                    float target_width = frame_width;
+                    float target_height = target_width / aspect;
+
+                    // If height exceeds container, fit to height instead
+                    if (target_height > container_height) {
+                        target_height = container_height;
+                        target_width = target_height * aspect;
+                    }
+
+                    img->width = target_width;
+                    img->height = target_height;
+
+                    // Update UIElementSize to match
+                    UIElementSize& size = child.ensure<UIElementSize>();
+                    size.width = target_width;
+                    size.height = target_height;
+                }
+            }
+
+            propagate_world_positions(child);
+            frame_index++;
+        });
+    });
+
+    // Sync scroll position for entities linked to a FilmstripData (e.g., mel spectrogram)
+    // Apply same scroll offset as frames to keep mel spec visually synced
+    world->system<ImageRenderable, UIElementBounds>("SyncScrollWithFilmstripSystem")
+    .kind(flecs::PreUpdate)
+    .with<SyncScrollWithFilmstrip>(flecs::Wildcard)
+    .each([&](flecs::entity e, ImageRenderable& img, UIElementBounds& bounds)
+    {
+        // Get the filmstrip entity this is synced with
+        flecs::entity filmstrip = e.target<SyncScrollWithFilmstrip>();
+        if (!filmstrip.is_valid()) return;
+
+        const FilmstripData* data = filmstrip.try_get<FilmstripData>();
+        if (!data) return;
+
+        // Get parent bounds for sizing
+        flecs::entity parent = e.parent();
+        if (!parent.is_valid()) return;
+        const UIElementBounds* parent_bounds = parent.try_get<UIElementBounds>();
+        if (!parent_bounds) return;
+
+        float parent_width = parent_bounds->xmax - parent_bounds->xmin;
+        float frame_width = parent_width / data->frame_limit;
+
+        // Scale mel spec to match parent width
+        img.width = parent_width;
+        UIElementSize& size = e.ensure<UIElementSize>();
+        size.width = parent_width;
+
+        // Apply same scroll offset as frames (0 to 1 frame width, then resets)
+        float scroll_offset_px = data->scroll_offset * frame_width;
+
+        Position& local = e.ensure<Position, Local>();
+        local.x = -scroll_offset_px;
+        local.y = 0.0f;
+
+        propagate_world_positions(e);
     });
 
     world->system<RectRenderable>()
@@ -8101,10 +8325,10 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
 
                 std::cout << "Updated VNC texture (async PBO)" << std::endl;
 
-                // Periodic PNG capture every 3 seconds
+                // Periodic frame capture every 3 seconds
                 double currentTime = glfwGetTime();
                 if (currentTime - vnc.lastCaptureTime >= 3.0) {
-                    // Prepare RGBA data buffer for fpng (fpng expects RGBA format)
+                    // Prepare RGBA data buffer
                     std::vector<uint8_t> rgbaData(surface->w * surface->h * 4);
 
                     // Convert surface data to RGBA format
@@ -8134,51 +8358,52 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
                         }
                     }
 
-                    // Generate filename
-                    std::string frame_filename = "frame_" + std::to_string(vnc.framesCaptured) + ".png";
+                    // Create NVG image directly from pixel data (no PNG round-trip for display)
+                    int imgHandle = nvgCreateImageRGBA(graphics.vg, surface->w, surface->h, 0, rgbaData.data());
 
-                    // Save PNG using fpng
-                    // TODO: Save at smaller resolution? (Probably)
-                    if (fpng::fpng_encode_image_to_file(frame_filename.c_str(), rgbaData.data(),
-                                                         surface->w, surface->h, 4, 0)) {
-                        std::cout << "[VNC CAPTURE] Saved " << frame_filename << std::endl;
+                    if (imgHandle > 0) {
                         vnc.framesCaptured++;
                         vnc.lastCaptureTime = currentTime;
 
-                        // TODO: Now, we should load this as a 'Spaceframe' in the Episodic panel
+                        // Queue PNG save to background thread (non-blocking)
+                        std::string frame_filename = "frame_" + std::to_string(vnc.framesCaptured - 1) + ".png";
+                        g_pngSaveQueue.submit({std::move(rgbaData), surface->w, surface->h, frame_filename});
 
-                        // TODO: Find Episodic memory panel...
+                        // Create frame entity with direct ImageRenderable (skip ImageCreator)
                         flecs::query q_editor_panels = world->query_builder<EditorLeafData>()
                         .build();
 
-                        q_editor_panels.each([&](flecs::entity leaf, EditorLeafData& leaf_data) 
+                        q_editor_panels.each([&](flecs::entity leaf, EditorLeafData& leaf_data)
                         {
                             if (leaf_data.editor_type == EditorType::Episodic)
                             {
-                                // TODO: Check for rows that are designed for framespace render
                                 auto frame = world->entity()
                                 .is_a(UIElement)
-                                // .set<ProportionalConstraint>({800.0f, 200.0f})
-                                // hmmm....
-                                .set<ImageCreator>({"../build/" + frame_filename, 1.0f, 1.0f})
+                                .set<ImageRenderable>({imgHandle, 1.0f, 1.0f, (float)surface->w, (float)surface->h})
                                 .set<ZIndex>({15})
-                                //  .set<Constrain>({true, true})
-                                .add<DebugRenderBounds>() 
+                                // .add<DebugRenderBounds>()
                                 .set<Expand>({false, 4.0f, 4.0f, 1.0f, true, 0.0f, 0.0f, 1.0f, true});
-                                 
-                                // .child_of(leaf.target<EditorCanvas>().target<FilmstripChannel>());
+
                                 FilmstripData& filmstripData = leaf.target<EditorCanvas>().target<FilmstripChannel>().ensure<FilmstripData>();
                                 filmstripData.frames.push_back(frame);
-                                if (filmstripData.frames.size() > filmstripData.frame_limit)
+                                filmstripData.total_frames_added++;  // Track for scroll sync
+                                // Keep frame_limit + 1 frames for smooth scrolling (extra frame offscreen)
+                                if (filmstripData.frames.size() > (size_t)(filmstripData.frame_limit + 1))
                                 {
+                                    // Delete NVG image when removing old frame
+                                    ImageRenderable* oldImg = filmstripData.frames[0].try_get_mut<ImageRenderable>();
+                                    if (oldImg && oldImg->imageHandle > 0) {
+                                        nvgDeleteImage(graphics.vg, oldImg->imageHandle);
+                                    }
                                     filmstripData.frames[0].destruct();
                                     filmstripData.frames.erase(filmstripData.frames.begin());
                                 }
                             }
                         });
 
+                        std::cout << "[VNC CAPTURE] Created frame texture directly (handle: " << imgHandle << ")" << std::endl;
                     } else {
-                        std::cerr << "[VNC CAPTURE ERROR] Failed to save " << frame_filename << std::endl;
+                        std::cerr << "[VNC CAPTURE ERROR] Failed to create NVG image from pixel data" << std::endl;
                     }
                 }
             } else {
