@@ -1199,8 +1199,6 @@ struct EditorLeafData
 };
 
 struct FilmstripChannel{};
-// Tag to sync an entity's scroll position with a FilmstripData entity
-struct SyncScrollWithFilmstrip{};
 // Relationship tag to link mel spec display to its source renderer entity
 struct MelSpecSource{};
 // Determine how to chunk and choose which frames to display
@@ -1226,7 +1224,7 @@ struct FilmstripData
     float elapsed_time = 0.0f;   // Time elapsed in current scroll cycle
     size_t total_frames_added = 0;  // Counter incremented each time a frame is pushed
     size_t last_seen_frame_count = 0;  // To detect when total_frames_added changes
-    static constexpr float SCROLL_DURATION = 27.0f;  // Seconds for full container to scroll
+    static constexpr float SCROLL_DURATION = 24.0f;  // Seconds for full container to scroll
 
     // Mode selection
     FilmstripMode mode = FilmstripMode::Uniform;
@@ -3100,7 +3098,6 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
             .is_a(UIElement)
             .child_of(messages_panel)
             .add(flecs::OrderedChildren)
-            .add<DebugRenderBounds>()
             .set<Position, Local>({12.0f, 16.0f})
             .set<LayoutBox>({LayoutBox::Vertical, 4.0f, 1.0f})
             .set<Expand>({true, 0.0f, 0.0f, 1.0f, false, 0.0f, 0.0f, 0.0f});
@@ -7158,6 +7155,34 @@ int main(int, char *[]) {
                     own_bounds->ymax = world_pos.y + container_size.height;
                 }
             }
+
+            // Propagate wrapped height to ancestor vertical LayoutBoxes
+            flecs::entity ancestor = e.parent();
+            while (ancestor.is_valid()) {
+                LayoutBox* layout = ancestor.try_get_mut<LayoutBox>();
+                if (layout && layout->dir == LayoutBox::Vertical) {
+                    // Re-layout children with updated sizes
+                    float main_progress = 0.0f;
+                    ancestor.children([&](flecs::entity child) {
+                        const UIElementSize* child_size = child.try_get<UIElementSize>();
+                        if (!child_size || child_size->width <= 0 || child_size->height <= 0) return;
+
+                        Position& local_pos = child.ensure<Position, Local>();
+                        float child_main = child_size->height;
+
+                        if (layout->move_dir < 0) {
+                            main_progress -= (child_main + layout->padding);
+                        }
+
+                        local_pos.y = main_progress;
+
+                        if (layout->move_dir > 0) {
+                            main_progress += child_main + layout->padding;
+                        }
+                    });
+                }
+                ancestor = ancestor.parent();
+            }
         });
 
     auto cursorEvents = world->observer<CursorState, EditorRoot>()
@@ -8458,45 +8483,6 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
             });
         }
     });
-
-    // Sync scroll position for entities linked to a FilmstripData (e.g., mel spectrogram)
-    // Apply same scroll offset as frames to keep mel spec visually synced
-    world->system<ImageRenderable, UIElementBounds>("SyncScrollWithFilmstripSystem")
-    .kind(flecs::PreUpdate)
-    .with<SyncScrollWithFilmstrip>(flecs::Wildcard)
-    .each([&](flecs::entity e, ImageRenderable& img, UIElementBounds& bounds)
-    {
-        // Get the filmstrip entity this is synced with
-        flecs::entity filmstrip = e.target<SyncScrollWithFilmstrip>();
-        if (!filmstrip.is_valid()) return;
-
-        const FilmstripData* data = filmstrip.try_get<FilmstripData>();
-        if (!data) return;
-
-        // Get parent bounds for sizing
-        flecs::entity parent = e.parent();
-        if (!parent.is_valid()) return;
-        const UIElementBounds* parent_bounds = parent.try_get<UIElementBounds>();
-        if (!parent_bounds) return;
-
-        float parent_width = parent_bounds->xmax - parent_bounds->xmin;
-        float frame_width = parent_width / data->frame_limit;
-
-        // Scale mel spec to match parent width
-        img.width = parent_width;
-        UIElementSize& size = e.ensure<UIElementSize>();
-        size.width = parent_width;
-
-        // Apply same scroll offset as frames (0 to 1 frame width, then resets)
-        float scroll_offset_px = data->scroll_offset * frame_width;
-
-        Position& local = e.ensure<Position, Local>();
-        local.x = -scroll_offset_px;
-        local.y = 0.0f;
-
-        propagate_world_positions(e);
-    });
-
     // DINO similarity score collection system - samples DINO cos diff and pushes to LineChartData
     // Also updates smooth scroll offset every frame for continuous scrolling
     world->system<LineChartData>("DinoScoreCollectionSystem")
@@ -9107,7 +9093,6 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
                             .is_a(UIElement)
                             // .set<FlowLayoutBox>({0.0f, 0.0f, 2.0f, 0.0f, 2.0f})
                             // .set<LayoutBox>({LayoutBox::Horizontal, 0.0f})
-                            .add<DebugRenderBounds>()
                             .set<FlowLayoutBox>({0.0f, 0.0f, 2.0f, 0.0f, 2.0f})
                             // .set<Expand>({true, 0, 0, 1, false, 0, 0, 0})
                             .add(flecs::OrderedChildren)
