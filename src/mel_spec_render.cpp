@@ -6,6 +6,7 @@
 #include <variant>
 #include <algorithm>
 #include <glad/glad.h>
+#include <GLFW/glfw3.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -121,6 +122,10 @@ struct IPCAudioState {
     // Fill tracking: how many columns have data (for positioning)
     int columnsFilled;    // 0 to texWidth
     bool isFullyFilled;   // true once we start receiving scroll commands
+
+    // Time-based scroll synchronization
+    double scrollStartTime;       // Wall clock time when scroll mode started
+    size_t totalScrollCommands;   // Number of scroll commands since start
 };
 
 static IPCAudioState g_micState = {};
@@ -202,6 +207,13 @@ static void try_accept_connection(IPCAudioState* state) {
     int flags = fcntl(client_fd, F_GETFL, 0);
     fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
 
+    // Increase socket receive buffer to reduce lag during slow frames
+    // 256KB buffer can hold ~650 scroll messages (128 height * 3 bytes + 16 header = 400 bytes each)
+    int rcvbuf = 256 * 1024;
+    if (setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) < 0) {
+        perror("setsockopt SO_RCVBUF");
+    }
+
     state->socket_fd = client_fd;
     printf("IPC: Client connected to %s\n", state->socket_path.c_str());
 }
@@ -237,17 +249,21 @@ static void update_from_ipc(IPCAudioState* state) {
         state->recvBufferSize = maxMessageSize * 2;
     }
 
-    // Read new data into buffer
-    ssize_t n = try_read(state->socket_fd,
-                         state->recvBuffer + state->recvBufferUsed,
-                         state->recvBufferSize - state->recvBufferUsed);
-    if (n < 0) {
-        fprintf(stderr, "IPC: Socket error on %s\n", state->socket_path.c_str());
-        close(state->socket_fd);
-        state->socket_fd = -1;
-        return;
+    // Drain all pending data from socket to keep mel spec in sync with real-time
+    // This ensures scroll rate matches filmstrip even when frame rate drops
+    while (true) {
+        ssize_t n = try_read(state->socket_fd,
+                             state->recvBuffer + state->recvBufferUsed,
+                             state->recvBufferSize - state->recvBufferUsed);
+        if (n < 0) {
+            fprintf(stderr, "IPC: Socket error on %s\n", state->socket_path.c_str());
+            close(state->socket_fd);
+            state->socket_fd = -1;
+            return;
+        }
+        if (n == 0) break;  // No more data available
+        state->recvBufferUsed += n;
     }
-    state->recvBufferUsed += n;
 
     // Process complete messages from buffer
     while (state->recvBufferUsed >= 16) {
@@ -293,6 +309,14 @@ static void update_from_ipc(IPCAudioState* state) {
                 state->imageBuffer[dstIdx + 1] = colData[srcIdx + 1];
                 state->imageBuffer[dstIdx + 2] = colData[srcIdx + 2];
             }
+
+            // Track scroll timing for synchronization
+            if (!state->isFullyFilled) {
+                // First scroll command - record start time
+                state->scrollStartTime = glfwGetTime();
+                state->totalScrollCommands = 0;
+            }
+            state->totalScrollCommands++;
 
             // Mark as fully filled (receiving scroll commands means texture is full)
             state->isFullyFilled = true;
@@ -406,6 +430,38 @@ static void melSpecUpdateSystem(flecs::entity e, MelSpecRender& melSpec) {
 
     if (state && state->texWidth > 0) {
         melSpec.fillProgress = (float)state->columnsFilled / (float)state->texWidth;
+
+        // Calculate time-based render offset for synchronization with filmstrip
+        if (state->isFullyFilled && state->scrollStartTime > 0) {
+            double now = glfwGetTime();
+            double elapsedTime = now - state->scrollStartTime;
+
+            // Expected columns based on wall clock time
+            double expectedColumns = elapsedTime * MelSpecRender::COLUMNS_PER_SECOND;
+
+            // Actual columns received
+            double actualColumns = (double)state->totalScrollCommands;
+
+            // Lag in columns (positive = mel spec is behind)
+            double lagColumns = expectedColumns - actualColumns;
+
+            // Convert to normalized offset (0-1 representing fraction of 24-second window)
+            double totalColumnsInWindow = MelSpecRender::COLUMNS_PER_SECOND * MelSpecRender::SCROLL_DURATION;
+            float targetOffset = (float)(lagColumns / totalColumnsInWindow);
+
+            // Clamp to reasonable range
+            targetOffset = std::max(-0.5f, std::min(0.5f, targetOffset));
+
+            // Smooth interpolation toward target offset (no sudden jumps)
+            float smoothingFactor = 0.05f;  // Adjust for smoother/faster response
+            melSpec.renderOffset += (targetOffset - melSpec.renderOffset) * smoothingFactor;
+
+            // Copy timing info to component
+            melSpec.scrollStartTime = state->scrollStartTime;
+            melSpec.totalScrollCommands = state->totalScrollCommands;
+        } else {
+            melSpec.renderOffset = 0.0f;
+        }
     }
 }
 
@@ -528,14 +584,18 @@ void MelSpecRenderModule(flecs::world& world) {
     auto melSpecEntity = world.entity("MelSpecRenderer")
         .set<MelSpecRender>({
             .nvgTextureHandle = g_micState.nvgImageHandle,
-            .width = (float)texWidth,
-            .height = (float)texHeight,
+            .width = texWidth,
+            .height = texHeight,
             .imageData = nullptr,
             .hasUpdate = false,
             .enabled = false,  // Disabled - rendered in editor panel instead
             .xOffset = 0.0f,
             .yOffset = -10.0f,
-            .zIndex = 310
+            .zIndex = 310,
+            .fillProgress = 0.0f,
+            .scrollStartTime = 0.0,
+            .totalScrollCommands = 0,
+            .renderOffset = 0.0f
         });
 
     printf("MelSpecRender: Created MelSpecRenderer entity (handle=%d, size=%dx%d)\n",
@@ -546,14 +606,18 @@ void MelSpecRenderModule(flecs::world& world) {
     auto systemAudioEntity = world.entity("SystemAudioRenderer")
         .set<MelSpecRender>({
             .nvgTextureHandle = g_sysAudioState.nvgImageHandle,
-            .width = (float)texWidth,
-            .height = (float)texHeight,
+            .width = texWidth,
+            .height = texHeight,
             .imageData = nullptr,
             .hasUpdate = false,
             .enabled = false,  // Disabled - rendered in editor panel instead
             .xOffset = 0.0f,
             .yOffset = -150.0f,
-            .zIndex = 311
+            .zIndex = 311,
+            .fillProgress = 0.0f,
+            .scrollStartTime = 0.0,
+            .totalScrollCommands = 0,
+            .renderOffset = 0.0f
         });
 
     printf("MelSpecRender: Created SystemAudioRenderer entity (handle=%d, size=%dx%d)\n",

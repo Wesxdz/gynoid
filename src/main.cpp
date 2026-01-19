@@ -3339,7 +3339,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         .set<FilmstripData>({
             .frame_limit = 8,
             .frames = {},
-            .mode = FilmstripMode::Stegosaurus,  // Change to FilmstripMode::Uniform for fixed 3s intervals
+            .mode = FilmstripMode::Uniform,  // Change to FilmstripMode::Uniform for fixed 3s intervals
             .spike_threshold = 0.15f,          // Capture when cosDiff >= 0.15 (significant visual change)
             .spike_cooldown = 1.0f             // Min 1 second between spike captures
         })
@@ -8544,37 +8544,43 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
         }
     });
 
-    // Position mel spec based on fill progress - starts at right, slides left as it fills
-    // world->system<ImageRenderable, UIElementBounds>("MelSpecFillPositionSystem")
-    // .kind(flecs::PreUpdate)
-    // .with<MelSpecSource>(flecs::Wildcard)
-    // .each([&](flecs::entity e, ImageRenderable& img, UIElementBounds& bounds)
-    // {
-    //     // Get the mel spec renderer entity this is linked to
-    //     flecs::entity melSpecEntity = e.target<MelSpecSource>();
-    //     if (!melSpecEntity.is_valid()) return;
+    // Position mel spec with time-based sync - applies renderOffset to stay synced with filmstrip
+    world->system<ImageRenderable, UIElementBounds>("MelSpecSyncPositionSystem")
+    .kind(flecs::PreUpdate)
+    .with<MelSpecSource>(flecs::Wildcard)
+    .each([&](flecs::entity e, ImageRenderable& img, UIElementBounds& bounds)
+    {
+        // Get the mel spec renderer entity this is linked to
+        flecs::entity melSpecEntity = e.target<MelSpecSource>();
+        if (!melSpecEntity.is_valid()) return;
 
-    //     const MelSpecRender* melSpec = melSpecEntity.try_get<MelSpecRender>();
-    //     if (!melSpec) return;
+        const MelSpecRender* melSpec = melSpecEntity.try_get<MelSpecRender>();
+        if (!melSpec) return;
 
-    //     // Get parent bounds for sizing
-    //     flecs::entity parent = e.parent();
-    //     if (!parent.is_valid()) return;
-    //     const UIElementBounds* parent_bounds = parent.try_get<UIElementBounds>();
-    //     if (!parent_bounds) return;
+        // Get parent bounds for sizing
+        flecs::entity parent = e.parent();
+        if (!parent.is_valid()) return;
+        const UIElementBounds* parent_bounds = parent.try_get<UIElementBounds>();
+        if (!parent_bounds) return;
 
-    //     float parent_width = parent_bounds->xmax - parent_bounds->xmin;
+        float parent_width = parent_bounds->xmax - parent_bounds->xmin;
 
-    //     // Position based on fill progress:
-    //     // fillProgress 0.0 -> x = parent_width (fully offscreen right)
-    //     // fillProgress 1.0 -> x = 0 (fully visible)
-    //     float x_offset = parent_width * (1.0f - melSpec->fillProgress);
+        float x_offset = 0.0f;
 
-    //     Position& local = e.ensure<Position, Local>();
-    //     local.x = x_offset;
+        if (melSpec->fillProgress < 1.0f) {
+            // Initial fill phase: slide in from right
+            x_offset = parent_width * (1.0f - melSpec->fillProgress);
+        } else {
+            // Fully filled: apply smooth renderOffset to sync with filmstrip
+            // renderOffset > 0 means mel spec data is behind wall clock, shift left
+            x_offset = -melSpec->renderOffset * parent_width;
+        }
 
-    //     propagate_world_positions(e);
-    // });
+        Position& local = e.ensure<Position, Local>();
+        local.x = x_offset;
+
+        propagate_world_positions(e);
+    });
 
     world->system<RectRenderable>()
     .kind(flecs::PostLoad)
