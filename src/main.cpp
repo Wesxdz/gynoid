@@ -7311,8 +7311,11 @@ int main(int, char *[]) {
                 bool parent_locked_y = parent_expand && parent_expand->y_enabled;
 
                 if (!expand) {
-                    parent_bounds->xmin = std::min(parent_bounds->xmin, bounds.xmin);
-                    parent_bounds->xmax = std::max(parent_bounds->xmax, bounds.xmax);
+                    // FlowLayoutBox only propagates height, not width (allows wrapping)
+                    if (!e.has<FlowLayoutBox>()) {
+                        parent_bounds->xmin = std::min(parent_bounds->xmin, bounds.xmin);
+                        parent_bounds->xmax = std::max(parent_bounds->xmax, bounds.xmax);
+                    }
                     parent_bounds->ymin = std::min(parent_bounds->ymin, bounds.ymin);
                     parent_bounds->ymax = std::max(parent_bounds->ymax, bounds.ymax);
                 }
@@ -7343,8 +7346,11 @@ int main(int, char *[]) {
                 }
 
                 if (!expand) {
-                    parent_bounds->xmin = std::min(parent_bounds->xmin, bounds.xmin);
-                    parent_bounds->xmax = std::max(parent_bounds->xmax, bounds.xmax);
+                    // FlowLayoutBox only propagates height, not width (allows wrapping)
+                    if (!e.has<FlowLayoutBox>()) {
+                        parent_bounds->xmin = std::min(parent_bounds->xmin, bounds.xmin);
+                        parent_bounds->xmax = std::max(parent_bounds->xmax, bounds.xmax);
+                    }
                     parent_bounds->ymin = std::min(parent_bounds->ymin, bounds.ymin);
                     parent_bounds->ymax = std::max(parent_bounds->ymax, bounds.ymax);
                 }
