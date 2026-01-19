@@ -3408,10 +3408,11 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         }
 
         // DINO cosine similarity line chart channel
-        // Capacity: ~240 samples for 24 seconds at ~10 samples/second (matching DINO inference rate)
+        // Capacity: ~260 samples - 240 for 24 seconds visible + 20 extra for smooth scrolling
+        // Extra samples extend past the right edge so new data scrolls in smoothly
         {
             LineChartData chartData;
-            chartData.capacity = 240;
+            chartData.capacity = 260;
             chartData.min_value = 0.0f;
             chartData.max_value = 1.0f;
             chartData.fill_color = 0xFFFFFF30;  // Semi-transparent white fill
@@ -8077,6 +8078,7 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
             size_t num_points = chart.size();
 
             // Get mel spec render offset to sync with mel spec/filmstrip timing
+            // Note: renderOffset is already clamped to reasonable range in mel_spec_render.cpp
             float melSpecOffset = 0.0f;
             auto sysAudioRenderer = world->lookup("SystemAudioRenderer");
             if (sysAudioRenderer.is_valid()) {
@@ -8388,6 +8390,7 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
 
         // Get mel spec render offset to sync filmstrip with mel spec timing
         // renderOffset > 0 means mel spec is behind wall clock, so shift filmstrip right to match
+        // Note: renderOffset is already clamped to reasonable range in mel_spec_render.cpp
         float melSpecOffset = 0.0f;
         auto sysAudioRenderer = world->lookup("SystemAudioRenderer");
         if (sysAudioRenderer.is_valid()) {
@@ -8537,8 +8540,9 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
             // We want to show similarity, so invert: similarity = 1.0 - cosDiff
             float similarity = 1.0f - cosDiff;
 
-            // Push with current timestamp (like filmstrip's FilmstripFrameTime)
-            double captureTime = glfwGetTime();
+            // Push with timestamp adjusted for processing lag
+            // The DINO result is from a frame captured earlier, so subtract the lag
+            double captureTime = glfwGetTime() - chart.processing_lag;
             chart.push(similarity, captureTime);
 
             chart.time_since_sample = 0.0f;
