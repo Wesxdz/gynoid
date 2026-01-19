@@ -595,6 +595,13 @@ struct DiurnalHour
     size_t segment;
 };
 
+struct DynamicTextWrap 
+{
+    float pad;
+};
+
+struct DynamicTextWrapContainer {};
+
 struct TextRenderable {
     std::string text;
     std::string fontFace;
@@ -3093,6 +3100,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
             .is_a(UIElement)
             .child_of(messages_panel)
             .add(flecs::OrderedChildren)
+            .add<DebugRenderBounds>()
             .set<Position, Local>({12.0f, 16.0f})
             .set<LayoutBox>({LayoutBox::Vertical, 4.0f, 1.0f})
             .set<Expand>({true, 0.0f, 0.0f, 1.0f, false, 0.0f, 0.0f, 0.0f});
@@ -4728,7 +4736,10 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                         .is_a(UIElement)
                         .child_of(message_content)
                         .set<TextRenderable>({chat->draft.c_str(), "Inter", 16.0f, 0xFFFFFFFF})
+                        .add<DynamicTextWrapContainer>(chat_panel.messages_panel)
+                        .set<DynamicTextWrap>({48.0f})
                         .set<ZIndex>({17});
+                    // TODO: Set a wraparound width...
 
                     // I put it outside the message since it is a meta annotation
                     // This might only need to be visible during certain 'entity binding' interface modes...
@@ -6901,22 +6912,22 @@ int main(int, char *[]) {
                 .term_at(0).src(panel.messages_panel)
                 .build();
 
-            msg_views.each([&](flecs::entity, ChatMessageView& view, TextRenderable& tr, Position& pos)
-            {
-                int msg_index = start + view.index;
-                if (msg_index < total)
-                {
-                    const auto& msg = chat.messages[msg_index];
-                    tr.text = msg.author + ": " + msg.text;
-                    tr.wrapWidth = messages_rect.width - 12.0f;  // Wrap messages within panel
-                    pos.x = 6.0f;
-                    pos.y = 6.0f + view.index * 18.0f;
-                }
-                else
-                {
-                    tr.text.clear();
-                }
-            });
+            // msg_views.each([&](flecs::entity, ChatMessageView& view, TextRenderable& tr, Position& pos)
+            // {
+            //     int msg_index = start + view.index;
+            //     if (msg_index < total)
+            //     {
+            //         const auto& msg = chat.messages[msg_index];
+            //         tr.text = msg.author + ": " + msg.text;
+            //         tr.wrapWidth = messages_rect.width - 12.0f;  // Wrap messages within panel
+            //         pos.x = 6.0f;
+            //         pos.y = 6.0f + view.index * 18.0f;
+            //     }
+            //     else
+            //     {
+            //         tr.text.clear();
+            //     }
+            // });
         });
 
     world->system<const UIElementBounds, LayoutBox, FitChildren, TimeEventRowChannel*, Graphics>()
@@ -7593,6 +7604,16 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
                 }
             }
         });
+
+    world->system<TextRenderable, DynamicTextWrap>()
+    .kind(flecs::PreUpdate)
+    .with<DynamicTextWrapContainer>(flecs::Wildcard)
+    .each([&](flecs::entity e, TextRenderable& text, DynamicTextWrap& data)
+    {
+        UIElementSize& uiElementSize = e.target<DynamicTextWrapContainer>().ensure<UIElementSize>();
+        text.wrapWidth = uiElementSize.width - data.pad;
+        std::cout << "Set text wrap to " << text.wrapWidth;
+    });
 
     auto textQueueSystem = world->system<Position, TextRenderable, ZIndex, RenderGradient*>()
     .kind(flecs::PostUpdate)
@@ -9079,7 +9100,9 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
                         auto meta_response_data = world->entity()
                             .is_a(UIElement)
                             // .set<FlowLayoutBox>({0.0f, 0.0f, 2.0f, 0.0f, 2.0f})
-                            .set<LayoutBox>({LayoutBox::Horizontal, 0.0f})
+                            // .set<LayoutBox>({LayoutBox::Horizontal, 0.0f})
+                            .add<DebugRenderBounds>()
+                            .set<FlowLayoutBox>({0.0f, 0.0f, 2.0f, 0.0f, 2.0f})
                             // .set<Expand>({true, 0, 0, 1, false, 0, 0, 0})
                             .add(flecs::OrderedChildren)
                             .child_of(pending->message_list);
