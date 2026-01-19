@@ -626,6 +626,10 @@ struct ImageRenderable
 
     float width, height;
     NVGcolor tint = nvgRGBA(255, 255, 255, 255);
+
+    // Texture offset for smooth scrolling (shifts UV sampling, not element position)
+    float texOffsetX = 0.0f;
+    float texOffsetY = 0.0f;
 };
 
 struct ZIndex {
@@ -7970,7 +7974,11 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
                     case RenderType::Image: {
                         const auto& image = std::get<ImageRenderable>(cmd.renderData);
                         if (image.imageHandle != -1) {
-                            NVGpaint imgPaint = nvgImagePattern(graphics.vg, cmd.pos.x, cmd.pos.y,
+                            // Apply texture offset to pattern position (shifts UV sampling)
+                            // Rect stays at cmd.pos, pattern is offset to shift texture content
+                            NVGpaint imgPaint = nvgImagePattern(graphics.vg,
+                                cmd.pos.x - image.texOffsetX,
+                                cmd.pos.y - image.texOffsetY,
                                 image.width, image.height, 0.0f,
                                 image.imageHandle, 1.0);
                             nvgBeginPath(graphics.vg);
@@ -8368,6 +8376,17 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
         // Each frame width = visible width / number of visible frames
         float frame_width = container_width / data.frame_limit;
 
+        // Get mel spec render offset to sync filmstrip with mel spec timing
+        // renderOffset > 0 means mel spec is behind wall clock, so shift filmstrip right to match
+        float melSpecOffset = 0.0f;
+        auto sysAudioRenderer = world->lookup("SystemAudioRenderer");
+        if (sysAudioRenderer.is_valid()) {
+            const MelSpecRender* melSpec = sysAudioRenderer.try_get<MelSpecRender>();
+            if (melSpec && melSpec->fillProgress >= 1.0f) {
+                melSpecOffset = melSpec->renderOffset;
+            }
+        }
+
         if (data.mode == FilmstripMode::Uniform) {
             // UNIFORM MODE: Position each child frame directly based on index and scroll offset
             // Right-aligned: frames start from the right side, newest frame at rightmost
@@ -8380,7 +8399,8 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
                 // Right-align: offset so last frame is at position frame_limit * frame_width (rightmost)
                 // base_offset puts first frame at the right position when we have fewer than max frames
                 int base_offset = data.frame_limit + 1 - num_frames;
-                float x_pos = ((base_offset + frame_index) * frame_width) - (data.scroll_offset * frame_width);
+                // Apply mel spec offset (shift right when mel spec is behind to match its timing)
+                float x_pos = ((base_offset + frame_index) * frame_width) - (data.scroll_offset * frame_width) + (melSpecOffset * container_width);
 
                 Position& local = child.ensure<Position, Local>();
                 local.x = x_pos;
@@ -8435,8 +8455,9 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
                 // Normalize to 0.0 (oldest/left) to 1.0 (newest/right)
                 float normalizedTime = 1.0f - (float)(age / FilmstripData::SCROLL_DURATION);
 
-                // Frame's LEFT edge aligns with its time position
-                float x_pos = normalizedTime * container_width;
+                // Apply mel spec offset to sync with mel spec timing
+                // If mel spec is behind (renderOffset > 0), shift filmstrip right (add to position)
+                float x_pos = (normalizedTime + melSpecOffset) * container_width;
 
                 // Hide frames that have scrolled off the left edge
                 RenderStatus& renderStatus = child.ensure<RenderStatus>();
@@ -8544,7 +8565,9 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
         }
     });
 
-    // Position mel spec with time-based sync - applies renderOffset to stay synced with filmstrip
+    // Sync mel spec position during fill phase only
+    // After fill, mel spec stays anchored at rightmost position (no texture offset)
+    // Filmstrip scroll is offset instead to match mel spec timing
     world->system<ImageRenderable, UIElementBounds>("MelSpecSyncPositionSystem")
     .kind(flecs::PreUpdate)
     .with<MelSpecSource>(flecs::Wildcard)
@@ -8565,21 +8588,20 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
 
         float parent_width = parent_bounds->xmax - parent_bounds->xmin;
 
-        float x_offset = 0.0f;
-
         if (melSpec->fillProgress < 1.0f) {
-            // Initial fill phase: slide in from right
-            x_offset = parent_width * (1.0f - melSpec->fillProgress);
+            // Initial fill phase: slide element in from right
+            Position& local = e.ensure<Position, Local>();
+            local.x = parent_width * (1.0f - melSpec->fillProgress);
+            img.texOffsetX = 0.0f;
+            propagate_world_positions(e);
         } else {
-            // Fully filled: apply smooth renderOffset to sync with filmstrip
-            // renderOffset > 0 means mel spec data is behind wall clock, shift left
-            x_offset = -melSpec->renderOffset * parent_width;
+            // Fully filled: mel spec anchored at x=0 with no texture offset
+            // Filmstrip handles sync offset instead
+            Position& local = e.ensure<Position, Local>();
+            local.x = 0.0f;
+            img.texOffsetX = 0.0f;
+            propagate_world_positions(e);
         }
-
-        Position& local = e.ensure<Position, Local>();
-        local.x = x_offset;
-
-        propagate_world_positions(e);
     });
 
     world->system<RectRenderable>()
