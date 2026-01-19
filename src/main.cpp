@@ -1242,10 +1242,16 @@ struct FilmstripData
     double pending_spike_time = 0.0; // Time when the spike was detected (for accurate frame positioning)
 };
 
+// Timestamped data point for line chart
+struct LineChartPoint {
+    float value;
+    double capture_time;  // Wall clock time when this value was captured
+};
+
 // Line chart channel for streaming data visualization (e.g., DINO cosine similarity)
 struct LineChartData
 {
-    std::vector<float> values;  // Circular buffer of values (0.0 to 1.0 normalized)
+    std::vector<LineChartPoint> points;  // Circular buffer of timestamped values
     size_t write_pos = 0;       // Current write position in circular buffer
     size_t capacity = 0;        // Max number of data points
     float min_value = 0.0f;     // Min value for normalization
@@ -1254,30 +1260,31 @@ struct LineChartData
     uint32_t line_color = 0xFFFFFFFF;  // RGBA line color (solid white)
     float sample_interval = 0.0f;  // Seconds between samples (0 = every frame)
     float time_since_sample = 0.0f;  // Time accumulator for sampling
-    float scroll_offset = 0.0f;  // Smooth scroll offset (0.0 to 1.0 of one sample width)
+    float processing_lag = 0.0f;  // Additional lag in seconds (e.g., DINO inference time)
+
     static constexpr float WINDOW_DURATION = 24.0f;  // Total time window in seconds (matches filmstrip)
 
-    void push(float value) {
+    void push(float value, double timestamp) {
         if (capacity == 0) return;
-        if (values.size() < capacity) {
-            values.push_back(value);
+        LineChartPoint point = {value, timestamp};
+        if (points.size() < capacity) {
+            points.push_back(point);
         } else {
-            values[write_pos] = value;
+            points[write_pos] = point;
         }
         write_pos = (write_pos + 1) % capacity;
-        scroll_offset = 0.0f;  // Reset scroll when new sample is added
     }
 
-    // Get value at index (0 = oldest, size-1 = newest)
-    float get(size_t index) const {
-        if (values.empty() || index >= values.size()) return 0.0f;
-        if (values.size() < capacity) {
-            return values[index];
+    // Get point at index (0 = oldest, size-1 = newest)
+    LineChartPoint get(size_t index) const {
+        if (points.empty() || index >= points.size()) return {0.0f, 0.0};
+        if (points.size() < capacity) {
+            return points[index];
         }
-        return values[(write_pos + index) % capacity];
+        return points[(write_pos + index) % capacity];
     }
 
-    size_t size() const { return values.size(); }
+    size_t size() const { return points.size(); }
 };
 
 // Tag for LineChart channel type
@@ -3410,6 +3417,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
             chartData.fill_color = 0xFFFFFF30;  // Semi-transparent white fill
             chartData.line_color = 0xFFFFFFFF;  // Solid white line
             chartData.sample_interval = 0.1f;   // Sample every 100ms
+            chartData.processing_lag = 0.15f;   // ~150ms DINO inference lag
 
             world->entity("DinoSimilarityChart")
                 .is_a(UIElement)
@@ -8061,48 +8069,57 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
             float width = parent_width;
             float height = bounds.ymax - bounds.ymin;
 
-            // Base position: parent left edge (no scroll offset - data flows naturally via circular buffer)
-            // Right edge is always "now", newest data point at parent_bounds->xmax
+            // Time-based positioning (like filmstrip Stegosaurus mode)
             float base_x = parent_bounds->xmin;
             float y_bottom = bounds.ymax;
+            double currentTime = glfwGetTime();
 
             size_t num_points = chart.size();
 
-            // Calculate point spacing - chart extends one frame past each edge (left and right)
-            // Using capacity-3 makes capacity points span width + 2*point_spacing
-            float point_spacing = width / (float)(chart.capacity > 3 ? chart.capacity - 3 : 1);
+            // Get mel spec render offset to sync with mel spec/filmstrip timing
+            float melSpecOffset = 0.0f;
+            auto sysAudioRenderer = world->lookup("SystemAudioRenderer");
+            if (sysAudioRenderer.is_valid()) {
+                const MelSpecRender* melSpec = sysAudioRenderer.try_get<MelSpecRender>();
+                if (melSpec && melSpec->fillProgress >= 1.0f) {
+                    melSpecOffset = melSpec->renderOffset;
+                }
+            }
 
             // If we have data, draw it
             if (num_points >= 1) {
+                // Calculate x position for each point based on its capture time
+                // Like filmstrip: right edge = now, left edge = WINDOW_DURATION ago
+                auto calcX = [&](size_t i) -> float {
+                    LineChartPoint point = chart.get(i);
+                    double age = currentTime - point.capture_time;
+                    // Normalize: 1.0 = now (right), 0.0 = WINDOW_DURATION ago (left)
+                    float normalizedTime = 1.0f - (float)(age / LineChartData::WINDOW_DURATION);
+                    // Apply mel spec offset (shift right when mel spec is behind)
+                    return base_x + (normalizedTime + melSpecOffset) * width;
+                };
+
+                auto calcY = [&](size_t i) -> float {
+                    LineChartPoint point = chart.get(i);
+                    float normalized = (point.value - chart.min_value) / (chart.max_value - chart.min_value);
+                    normalized = std::max(0.0f, std::min(1.0f, normalized));
+                    return y_bottom - normalized * height;
+                };
+
                 // Build polygon path: start at bottom of first point, trace line, close at bottom
                 nvgBeginPath(graphics.vg);
 
-                // Calculate x offset:
-                // - Start one frame to the left of visible area (- point_spacing)
-                // - Adjust for partially filled buffer
-                // - Apply smooth scroll offset
-                float x_offset = (float)(chart.capacity - num_points) * point_spacing - chart.scroll_offset * point_spacing - point_spacing;
-
-                // Start at bottom of the first data point's x position
-                float first_data_x = base_x + x_offset;
-                nvgMoveTo(graphics.vg, first_data_x, y_bottom);
+                float first_x = calcX(0);
+                nvgMoveTo(graphics.vg, first_x, y_bottom);
 
                 // Draw line through all data points (from oldest to newest)
                 for (size_t i = 0; i < num_points; i++) {
-                    float value = chart.get(i);
-                    // Normalize value to 0-1 range
-                    float normalized = (value - chart.min_value) / (chart.max_value - chart.min_value);
-                    normalized = std::max(0.0f, std::min(1.0f, normalized));
-
-                    float x = base_x + x_offset + i * point_spacing;
-                    float y = y_bottom - normalized * height;
-
-                    nvgLineTo(graphics.vg, x, y);
+                    nvgLineTo(graphics.vg, calcX(i), calcY(i));
                 }
 
                 // Close polygon: line to bottom at last point, then back to start
-                float last_data_x = base_x + x_offset + (num_points - 1) * point_spacing;
-                nvgLineTo(graphics.vg, last_data_x, y_bottom);
+                float last_x = calcX(num_points - 1);
+                nvgLineTo(graphics.vg, last_x, y_bottom);
                 nvgClosePath(graphics.vg);
 
                 // Fill with semi-transparent color
@@ -8116,17 +8133,10 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
                 // Draw line on top
                 nvgBeginPath(graphics.vg);
                 for (size_t i = 0; i < num_points; i++) {
-                    float value = chart.get(i);
-                    float normalized = (value - chart.min_value) / (chart.max_value - chart.min_value);
-                    normalized = std::max(0.0f, std::min(1.0f, normalized));
-
-                    float x = base_x + x_offset + i * point_spacing;
-                    float y = y_bottom - normalized * height;
-
                     if (i == 0) {
-                        nvgMoveTo(graphics.vg, x, y);
+                        nvgMoveTo(graphics.vg, calcX(i), calcY(i));
                     } else {
-                        nvgLineTo(graphics.vg, x, y);
+                        nvgLineTo(graphics.vg, calcX(i), calcY(i));
                     }
                 }
 
@@ -8512,11 +8522,6 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
         float dt = it.delta_time();
         chart.time_since_sample += dt;
 
-        // Update smooth scroll offset every frame (0 to 1 over sample_interval)
-        if (chart.sample_interval > 0) {
-            chart.scroll_offset = std::min(1.0f, chart.time_since_sample / chart.sample_interval);
-        }
-
         // Only sample DINO if loaded
         if (!g_dinoEmbedder.isLoaded()) return;
 
@@ -8531,7 +8536,11 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
             // cosDiff is 1.0 - cosineSimilarity, so higher = more different
             // We want to show similarity, so invert: similarity = 1.0 - cosDiff
             float similarity = 1.0f - cosDiff;
-            chart.push(similarity);  // This resets scroll_offset to 0
+
+            // Push with current timestamp (like filmstrip's FilmstripFrameTime)
+            double captureTime = glfwGetTime();
+            chart.push(similarity, captureTime);
+
             chart.time_since_sample = 0.0f;
         }
     });
