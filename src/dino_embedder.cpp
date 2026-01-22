@@ -63,8 +63,8 @@ bool DinoEmbedder::loadModel(const std::string& modelPath, int numThreads) {
     params->classify = false;
 
     // Use small inference size for speed (position embedding will be interpolated)
-    inferenceWidth = 112;
-    inferenceHeight = 112;
+    inferenceWidth = 224;
+    inferenceHeight = 224;
     cv::Size inferenceSize(inferenceWidth, inferenceHeight);
 
     std::cout << "[DINO] Loading model from " << modelPath << std::endl;
@@ -120,7 +120,7 @@ bool DinoEmbedder::loadModel(const std::string& modelPath, int numThreads) {
     return true;
 }
 
-bool DinoEmbedder::submitFrame(const uint8_t* bgraPixels, int width, int height, int pitch) {
+bool DinoEmbedder::submitFrame(const uint8_t* bgraPixels, int width, int height, int pitch, bool writeEmbedding) {
     if (!modelLoaded) return false;
 
     // If busy, drop this frame
@@ -139,6 +139,7 @@ bool DinoEmbedder::submitFrame(const uint8_t* bgraPixels, int width, int height,
         pendingFrame.height = height;
         pendingFrame.pitch = pitch;
         pendingFrame.valid = true;
+        pendingFrame.writeEmbedding = writeEmbedding;
     }
 
     frameCV.notify_one();
@@ -189,6 +190,16 @@ void DinoEmbedder::workerLoop() {
             for (size_t i = 0; i < printCount; i++) {
                 if (i > 0) std::cout << ", ";
                 std::cout << embedding[i];
+            }
+            if (pendingFrame.writeEmbedding)
+            {
+                std::ofstream outputFile("dino_frames.emb", std::ios::app);
+                for (size_t i = 0; i < embedding.size(); i++) {
+                    outputFile << embedding[i] << ", ";
+                }
+                outputFile << std::endl;
+
+                outputFile.close();
             }
             if (embedding.size() > 10) {
                 std::cout << ", ... (+" << (embedding.size() - 10) << " more)";
@@ -264,15 +275,33 @@ std::vector<float> DinoEmbedder::extractEmbedding(const uint8_t* bgraPixels, int
         return result;
     }
 
-    // Extract mean embedding from patch tokens
-    const cv::Mat& patchTokens = output->patch_tokens.value();
-    cv::Mat meanEmbed;
-    cv::reduce(patchTokens, meanEmbed, 0, cv::REDUCE_AVG, CV_32F);
+    const cv::Mat& patches = output->patch_tokens.value();
 
-    result.resize(meanEmbed.cols);
-    for (int i = 0; i < meanEmbed.cols; i++) {
-        result[i] = meanEmbed.at<float>(0, i);
+    // CLS token is usually the first row (index 0) of the patch tokens
+    // Shape is typically [num_tokens, embedding_dim] where token 0 is CLS
+    if (patches.rows > 0) {
+        result.resize(patches.cols);
+        for (int i = 0; i < patches.cols; i++) {
+            result[i] = patches.at<float>(0, i);  // First token = CLS
+        }
     }
+
+
+    // Extract mean embedding from patch tokens
+    // const cv::Mat& patchTokens = output->patch_tokens.value();
+    // cv::Mat meanEmbed;
+    // cv::reduce(patchTokens, meanEmbed, 0, cv::REDUCE_AVG, CV_32F);
+
+    // result.resize(meanEmbed.cols);
+    // for (int i = 0; i < meanEmbed.cols; i++) {
+    //     result[i] = meanEmbed.at<float>(0, i);
+    // }
+
+    // L2 Normalization
+    float norm = 0;
+    for(float v : result) norm += v * v;
+    norm = std::sqrt(norm);
+    for(float &v : result) v /= (norm + 1e-8f);
 
     return result;
 }

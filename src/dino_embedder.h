@@ -43,7 +43,7 @@ public:
 
     // Submit frame for async processing (non-blocking)
     // Returns true if queued, false if busy (frame dropped)
-    bool submitFrame(const uint8_t* bgraPixels, int width, int height, int pitch);
+    bool submitFrame(const uint8_t* bgraPixels, int width, int height, int pitch, bool writeEmbedding);
 
     // Check if busy processing
     bool isBusy() const { return processing.load(); }
@@ -77,6 +77,7 @@ private:
         int height = 0;
         int pitch = 0;
         bool valid = false;
+        bool writeEmbedding = false;
     };
     PendingFrame pendingFrame;
     std::mutex frameMutex;

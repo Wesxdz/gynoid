@@ -1087,6 +1087,7 @@ enum class EditorType
     Episodic,
     BFO,
     SceneGraph,
+    DataFusion,
     // SystemNavigator,
 
     // Bookshelf,
@@ -1240,6 +1241,9 @@ struct FilmstripData
     float time_since_spike = 0.0f;   // Time since last spike capture
     bool pending_capture = false;    // Flag to signal capture should happen
     double pending_spike_time = 0.0; // Time when the spike was detected (for accurate frame positioning)
+
+    // Uniform mode: track mel spec scroll position for sync
+    size_t last_capture_scroll_commands = 0;  // totalScrollCommands at last frame capture
 };
 
 // Timestamped data point for line chart
@@ -2325,9 +2329,12 @@ flecs::entity create_badge_impl(flecs::entity parent, flecs::entity UIElement,
         if (symbol == "*") {
             // Wildcard - use wildcard.png
             image_path = "wildcard.png";
-        } else {
+        } else if (symbol.length() == 1 && std::isdigit(static_cast<unsigned char>(symbol[0]))) {
             // Standard MNIST digit
             image_path = "mnist/set_0/" + symbol + ".png";
+        } else
+        {
+            image_path = "letter_sets/set_01/" + symbol + ".png";
         }
 
         world->entity()
@@ -2699,8 +2706,9 @@ std::vector<std::string> editor_types =
     "Memory",
     "Bookshelf",
     "Episodic",
-    "BFO",
+    "Ontology",
     "Scene Graph",
+    "Data Fusion"
 };
 
 struct VNCData
@@ -3052,10 +3060,11 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         .child_of(leaf.target<EditorHeader>());
         
         
-        create_badge(badges, UIElement, "Heonae", 0xc72783ff);
+        // create_badge(badges, UIElement, "Heonae", 0xc72783ff);
         // create_badge(badges, UIElement, "Kahlo", 0x782910ff);
-        create_badge(badges, UIElement, "Virtual", 0xe575eeff);
-        create_badge(badges, UIElement, "Physical", 0x619393ff);
+        create_badge(badges, UIElement, "Heonae", 0xff75baff, false, false, {}, {0}, {"H"}, {0xff75baff});
+        create_badge(badges, UIElement, "Virtual", 0x619393ff);
+        // create_badge(badges, UIElement, "Physical", 0x619393ff);
         
     }
     else if (editor_type == EditorType::ImaginaryInterlocutor)
@@ -3132,7 +3141,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         .set<RectRenderable>({0.0f, 0.0f, false, 0x000000FF})
         .child_of(leaf.target<EditorCanvas>());
         
-        create_badge(meta_input, UIElement, "Wesley", 0xf5a652ff, false, false, "0");
+        create_badge(meta_input, UIElement, "Wesley", 0x6df0ffff, false, false, {}, {0}, {"W"}, {0x6df0ffff});
 
         create_badge(meta_input, UIElement, "types", 0xa34d1aff, false, true);
 
@@ -3152,10 +3161,13 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         // 2. Add books with 'Constrain' and 'cap_to_intrinsic'
         // This ensures they fit within the parent bounds while maintaining aspect ratios
         std::vector<std::string> covers = {
-            "cover_james.jpg", 
-            "cover_cognitive_theory.jpg", 
-            "cover_soar.jpg", 
-            "cover_readings_in_kr.jpg"
+            // "cover_james.jpg", 
+            // "cover_cognitive_theory.jpg", 
+            // "cover_soar.jpg", 
+            // "cover_readings_in_kr.jpg"
+            // "image00187.jpg",
+            "image00188.jpg",
+            "image00191.jpg"
         };
 
         for (const auto& cover : covers) {
@@ -8070,35 +8082,34 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
             float width = parent_width;
             float height = bounds.ymax - bounds.ymin;
 
-            // Time-based positioning (like filmstrip Stegosaurus mode)
+            // Time-based positioning using mel spec's actual timeline
             float base_x = parent_bounds->xmin;
             float y_bottom = bounds.ymax;
-            double currentTime = glfwGetTime();
 
-            size_t num_points = chart.size();
-
-            // Get mel spec render offset to sync with mel spec/filmstrip timing
-            // Note: renderOffset is already clamped to reasonable range in mel_spec_render.cpp
-            float melSpecOffset = 0.0f;
+            // Use mel spec's timeline so line chart moves at exactly mel spec's rate
+            double melSpecNow = glfwGetTime();  // Default to wall clock
             auto sysAudioRenderer = world->lookup("SystemAudioRenderer");
             if (sysAudioRenderer.is_valid()) {
                 const MelSpecRender* melSpec = sysAudioRenderer.try_get<MelSpecRender>();
-                if (melSpec && melSpec->fillProgress >= 1.0f) {
-                    melSpecOffset = melSpec->renderOffset;
+                if (melSpec && melSpec->fillProgress >= 1.0f && melSpec->scrollStartTime > 0) {
+                    // Mel spec's elapsed time based on actual columns received
+                    double melSpecElapsed = (double)melSpec->totalScrollCommands / MelSpecRender::COLUMNS_PER_SECOND;
+                    melSpecNow = melSpec->scrollStartTime + melSpecElapsed;
                 }
             }
+
+            size_t num_points = chart.size();
 
             // If we have data, draw it
             if (num_points >= 1) {
                 // Calculate x position for each point based on its capture time
-                // Like filmstrip: right edge = now, left edge = WINDOW_DURATION ago
+                // Uses mel spec's timeline so everything moves at the same rate
                 auto calcX = [&](size_t i) -> float {
                     LineChartPoint point = chart.get(i);
-                    double age = currentTime - point.capture_time;
+                    double age = melSpecNow - point.capture_time;
                     // Normalize: 1.0 = now (right), 0.0 = WINDOW_DURATION ago (left)
                     float normalizedTime = 1.0f - (float)(age / LineChartData::WINDOW_DURATION);
-                    // Apply mel spec offset (shift right when mel spec is behind)
-                    return base_x + (normalizedTime + melSpecOffset) * width;
+                    return base_x + normalizedTime * width;
                 };
 
                 auto calcY = [&](size_t i) -> float {
@@ -8401,19 +8412,44 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
         }
 
         if (data.mode == FilmstripMode::Uniform) {
-            // UNIFORM MODE: Position each child frame directly based on index and scroll offset
-            // Right-aligned: frames start from the right side, newest frame at rightmost
-            int frame_index = 0;
-            int num_frames = 0;
-            e.children([&](flecs::entity) { num_frames++; });
+            // UNIFORM MODE: Position frames based on capture time with fixed widths
+            // Use mel spec's actual timeline so filmstrip moves at exactly mel spec's rate
+
+            // Calculate mel spec's "effective now" based on how many columns it's actually received
+            double melSpecNow = currentTime;  // Default to wall clock
+            auto sysAudioRenderer = world->lookup("SystemAudioRenderer");
+            if (sysAudioRenderer.is_valid()) {
+                const MelSpecRender* melSpec = sysAudioRenderer.try_get<MelSpecRender>();
+                if (melSpec && melSpec->fillProgress >= 1.0f && melSpec->scrollStartTime > 0) {
+                    // Mel spec's elapsed time based on actual columns received
+                    double melSpecElapsed = (double)melSpec->totalScrollCommands / MelSpecRender::COLUMNS_PER_SECOND;
+                    melSpecNow = melSpec->scrollStartTime + melSpecElapsed;
+                }
+            }
 
             e.children([&](flecs::entity child)
             {
-                // Right-align: offset so last frame is at position frame_limit * frame_width (rightmost)
-                // base_offset puts first frame at the right position when we have fewer than max frames
-                int base_offset = data.frame_limit + 1 - num_frames;
-                // Apply mel spec offset (shift right when mel spec is behind to match its timing)
-                float x_pos = ((base_offset + frame_index) * frame_width) - (data.scroll_offset * frame_width) + (melSpecOffset * container_width);
+                const FilmstripFrameTime* frameTime = child.try_get<FilmstripFrameTime>();
+                if (!frameTime) return;
+
+                // Calculate age using mel spec's timeline, not wall clock
+                double age = melSpecNow - frameTime->capture_time;
+
+                // Position based on age: 0 seconds ago = right edge, SCROLL_DURATION ago = left edge
+                // Normalize to 0.0 (oldest/left) to 1.0 (newest/right)
+                float normalizedTime = 1.0f - (float)(age / FilmstripData::SCROLL_DURATION);
+
+                // Frame's LEFT edge aligns with capture time position
+                // New frames spawn one frame width to the right (off-screen) and scroll in
+                float x_pos = normalizedTime * container_width;
+
+                // Hide frames that have scrolled off the left edge
+                RenderStatus& renderStatus = child.ensure<RenderStatus>();
+                if (normalizedTime < -0.5f) {
+                    renderStatus.visible = false;
+                } else {
+                    renderStatus.visible = true;
+                }
 
                 Position& local = child.ensure<Position, Local>();
                 local.x = x_pos;
@@ -8449,7 +8485,6 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
                 }
 
                 propagate_world_positions(child);
-                frame_index++;
             });
         } else {
             // STEGOSAURUS MODE: Position frames based on capture time, allowing overlaps
@@ -8540,9 +8575,17 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
             // We want to show similarity, so invert: similarity = 1.0 - cosDiff
             float similarity = 1.0f - cosDiff;
 
-            // Push with timestamp adjusted for processing lag
-            // The DINO result is from a frame captured earlier, so subtract the lag
+            // Use mel spec timeline for timestamp (prevents drift from filmstrip/mel spec)
+            // Fall back to wall clock if mel spec not ready
             double captureTime = glfwGetTime() - chart.processing_lag;
+            auto sysAudioRenderer = world->lookup("SystemAudioRenderer");
+            if (sysAudioRenderer.is_valid()) {
+                const MelSpecRender* melSpec = sysAudioRenderer.try_get<MelSpecRender>();
+                if (melSpec && melSpec->fillProgress >= 1.0f && melSpec->scrollStartTime > 0) {
+                    double melSpecNow = melSpec->scrollStartTime + (double)melSpec->totalScrollCommands / MelSpecRender::COLUMNS_PER_SECOND;
+                    captureTime = melSpecNow - chart.processing_lag;
+                }
+            }
             chart.push(similarity, captureTime);
 
             chart.time_since_sample = 0.0f;
@@ -8655,9 +8698,10 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
             LOG_TRACE(LogCategory::VNC_CLIENT, "Updating OpenGL texture {} for quadrant {}", vnc.vncTexture, vnc.toString());
 
             SDL_Surface* surface = (SDL_Surface*)rfbClientGetClientData(vnc.client, (void*)VNC_SURFACE_TAG);
+            VisionProcessingJob job;
+            bool shouldCapture = false;
             if (surface && surface->pixels) {
                 // Submit vision processing job to background thread instead of blocking
-                VisionProcessingJob job;
                 job.quadrant = (int)e.raw_id(); // TODO: Fucking rename
                 job.paletteFile = "../assets/palettes/resurrect-64.hex";
                 job.outputPath = "/tmp/vision_" + std::to_string(e.raw_id()) + ".png";
@@ -8672,12 +8716,6 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
 
                 g_visionQueue.submit(job);
                 LOG_TRACE(LogCategory::VNC_CLIENT, "Submitted vision processing job for quadrant {}", vnc.toString());
-
-                // Submit frame to DINO embedder (async, non-blocking)
-                if (g_dinoEmbedder.isLoaded()) {
-                    g_dinoEmbedder.submitFrame(job.pixelData.data(), job.width, job.height, job.pitch);
-                    // Results are printed by the worker thread
-                }
 
                 LOG_TRACE(LogCategory::VNC_CLIENT, "Processing {} dirty rectangles", newRects.size());
                 LOG_TRACE(LogCategory::VNC_CLIENT, "Surface info: {}x{}, format: {}", surface->w, surface->h, SDL_GetPixelFormatName(surface->format->format));
@@ -8785,7 +8823,6 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
                 double currentTime = glfwGetTime();
 
                 // Check filmstrip mode to determine if we should capture
-                bool shouldCapture = false;
                 flecs::query q_editor_panels_check = world->query_builder<EditorLeafData>()
                     .build();
 
@@ -8797,8 +8834,21 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
                         FilmstripData* filmstripData = canvas.target<FilmstripChannel>().try_get_mut<FilmstripData>();
                         if (filmstripData) {
                             if (filmstripData->mode == FilmstripMode::Uniform) {
-                                // Uniform mode: capture every 3 seconds
-                                shouldCapture = (currentTime - vnc.lastCaptureTime >= 3.0);
+                                // Uniform mode: capture when mel spec has scrolled one frame width
+                                // This keeps filmstrip in sync with mel spec regardless of timing variations
+                                auto sysAudioRenderer = world->lookup("SystemAudioRenderer");
+                                if (sysAudioRenderer.is_valid()) {
+                                    const MelSpecRender* melSpec = sysAudioRenderer.try_get<MelSpecRender>();
+                                    if (melSpec && melSpec->fillProgress >= 1.0f) {
+                                        // Calculate columns per frame width
+                                        float frameWidthSeconds = FilmstripData::SCROLL_DURATION / filmstripData->frame_limit;
+                                        size_t columnsPerFrame = (size_t)(frameWidthSeconds * MelSpecRender::COLUMNS_PER_SECOND);
+
+                                        // Capture when mel spec has scrolled one frame width since last capture
+                                        size_t scrolledSinceCapture = melSpec->totalScrollCommands - filmstripData->last_capture_scroll_commands;
+                                        shouldCapture = (scrolledSinceCapture >= columnsPerFrame);
+                                    }
+                                }
                             } else if (filmstripData->mode == FilmstripMode::Stegosaurus) {
                                 // Stegosaurus mode: capture when pending_capture is set
                                 shouldCapture = filmstripData->pending_capture;
@@ -8868,10 +8918,21 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
                                 int zIndex = 15 + (int)(filmstripData.total_frames_added % 100);
 
                                 // Use spike detection time for Stegosaurus mode (aligns with chart),
-                                // capture time for Uniform mode
-                                double frameTime = (filmstripData.mode == FilmstripMode::Stegosaurus)
-                                    ? filmstripData.pending_spike_time
-                                    : currentTime;
+                                // mel spec timeline for Uniform mode (prevents drift)
+                                double frameTime = currentTime;  // Default to wall clock
+                                if (filmstripData.mode == FilmstripMode::Stegosaurus) {
+                                    frameTime = filmstripData.pending_spike_time;
+                                } else if (filmstripData.mode == FilmstripMode::Uniform) {
+                                    // Use mel spec's timeline so frame positioning matches
+                                    auto sysAudioRenderer = world->lookup("SystemAudioRenderer");
+                                    if (sysAudioRenderer.is_valid()) {
+                                        const MelSpecRender* melSpec = sysAudioRenderer.try_get<MelSpecRender>();
+                                        if (melSpec && melSpec->fillProgress >= 1.0f && melSpec->scrollStartTime > 0) {
+                                            double melSpecElapsed = (double)melSpec->totalScrollCommands / MelSpecRender::COLUMNS_PER_SECOND;
+                                            frameTime = melSpec->scrollStartTime + melSpecElapsed;
+                                        }
+                                    }
+                                }
 
                                 auto frame = world->entity()
                                 .is_a(UIElement)
@@ -8885,6 +8946,18 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
                                 filmstripData.frames.push_back(frame);
                                 filmstripData.total_frames_added++;  // Track for scroll sync
                                 filmstripData.elapsed_time = 0.0f;   // Reset immediately for seamless transition
+
+                                // Update mel spec scroll tracking for Uniform mode sync
+                                if (filmstripData.mode == FilmstripMode::Uniform) {
+                                    auto sysAudioRenderer = world->lookup("SystemAudioRenderer");
+                                    if (sysAudioRenderer.is_valid()) {
+                                        const MelSpecRender* melSpec = sysAudioRenderer.try_get<MelSpecRender>();
+                                        if (melSpec) {
+                                            filmstripData.last_capture_scroll_commands = melSpec->totalScrollCommands;
+                                        }
+                                    }
+                                }
+
                                 // Keep frame_limit + 1 frames for smooth scrolling (extra frame offscreen)
                                 if (filmstripData.frames.size() > (size_t)(filmstripData.frame_limit + 1))
                                 {
@@ -8906,6 +8979,15 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
                 }
             } else {
                 LOG_ERROR(LogCategory::VNC_CLIENT, "Surface or pixels is null");
+            }
+
+            // Submit frame to DINO embedder (async, non-blocking)
+            if (g_dinoEmbedder.isLoaded()) {
+                // TODO: Consider inclusion of embeddings for entity binding clustering at a different rate than uniform captures...
+                // and register it for entity binding
+                bool writeEmbedding = shouldCapture;
+                g_dinoEmbedder.submitFrame(job.pixelData.data(), job.width, job.height, job.pitch, writeEmbedding);
+                // Results are printed by the worker thread
             }
         });
 
