@@ -1,0 +1,70 @@
+THORNFIELD TODO
+
+Refactor
+    >All process initialization should occur through Tradewinds module rather than system calls
+    >All IPC should be replaced with ZeroMQ
+    >Communication with virtual containers should also occur through ZeroMQ (with the exception of)
+
+Embodiment->Physical
+    >Print updated barrel wheel supports and test new wheel x
+
+Display robot qualities:
+    Starboard and portside stepper motor power/encoder stream
+    Inference of vector and distance
+
+Locomotion
+    >Learn Guassian Splatting
+    >Learn Slang
+    >Learn ROS Nav2
+
+Mutlisensor Fusion
+    >Read C++ Concurrency in Action, Second Edition (Why? Integrating things like filmstrip and mel spectrogram get complicated, this is because both are occuring in parallel with variable processing times and need to 'line up' The initial prototype with Claude code failed to correctly render them accurately in realtime, instead leaning on the mel spec render as a bottleneck. This is unacceptable incompetence in commercial grade software for general intelligence systems)
+
+Memory->Episodic
+    Support for creating/deleting/resizing channels
+    Specification of channel types [property line chart, component, observer, filmstrip, mel spec]
+    Modify length of time represented
+    Generalize from streaming to time interval traversal
+    Parakeet ASR -> Process Interval Range
+
+VNC Stream
+    Audio passthrough x
+    Copy/paste passthrough
+    Visualize OCR bounds
+    Visualize contours (primal sketch/DBSCAN overlay or solo layers)
+    Integrate TAPIR server/overlay
+
+Interlocutor
+    Store entities and relationships
+    Invoke query at runtime, show results
+    Invoke simple imperative command with parameter binding from natural language ie 'move mouse up 10'
+    Invoke planner at runtime from two step command ie 'search for candy on Chrome', preview and execute plan
+    Persistent memory
+    Support annotation of sets in relationships
+    Support annotation of tags/component entities
+    Support annotation of queries as intension representations
+
+    Support image based data as component
+
+    Develop a plan for creating a dataset for tuning LLM based entity binding and benchmarking
+    Develop a plan for moving from LLM based entity binding to a neurosymbolic local approach
+    Design integration of syntatic tree visualization (and how it relates to 'badging')
+    Design a clear visual dichotomy for representing 'tag/component/prefab' entities vs instance entities
+    >Read Semantics in Generative Grammar
+    >Read Language (Bloomfield)
+    >Read Philosophical Investigations (Wittgenstein)
+
+Future Simulator
+    Design a panel which uses a graph neural network to predict likely new graph events such as new relationships and entity created/destroyed etc
+
+BSP Panels
+    Render edtior popup menu onscreen (above type selector if too low...)
+    Support integer values
+    On hover render red/green tinted diff of variables
+
+Peach Core
+    Implement design for server command HUD
+
+Planner
+    Implement state history timeline branching
+    Program continous MCTS fruit entrepreneur demo with double widening (Peach vs Apple)

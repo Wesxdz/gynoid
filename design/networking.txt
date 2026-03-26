@@ -1,0 +1,5 @@
+The original approach to inter process communication and networking generated a lot of technical debt.
+We are now refactoring to ZeroMQ.
+
+Particularly the model that Thornfield will follow is for services to always Bind in the main codebase, and other processes will connect.
+This way, Thornfield is always ready for sporadic connections of dependency processes.

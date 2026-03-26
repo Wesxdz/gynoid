@@ -62,6 +62,7 @@ struct VNCClient {
     std::atomic<bool> needsUpdate{false};
     std::vector<VNCUpdateRect> dirtyRects;
     bool eventPassthroughEnabled;
+    flecs::entity user_state_leaf;
 
     // Threading infrastructure
     std::thread messageThread;                      // Dedicated network I/O thread

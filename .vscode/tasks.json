@@ -1,0 +1,22 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "CMake: Configure & Build",
+            "type": "shell",
+            "command": "mkdir -p build && cd build && cmake .. && make -j16",
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": ["$gcc"]
+        },
+        {
+            "label": "Run Project",
+            "type": "shell",
+            "command": "./build/project",
+            "dependsOn": "CMake: Configure & Build",
+            "group": "test"
+        }
+    ]
+}

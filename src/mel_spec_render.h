@@ -11,8 +11,8 @@ struct MelSpecRender {
     unsigned char* imageData;  // RGB image data
     bool hasUpdate;        // Flag for pending texture update
     bool enabled;          // Whether to render
-    float xOffset;         // X position offset from avatar
-    float yOffset;         // Y position offset from avatar
+    float xOffset;
+    float yOffset;
     int zIndex;            // Render layer (above avatar = 310)
     float fillProgress;    // 0.0 to 1.0, how much of the texture is filled
 

@@ -1,0 +1,62 @@
+'Search Google for {robot valentines day gifts}'
+Goal regression prediconditions 'Browser window open' AND 'Searchbar empty'
+SSS
+>Open Chrome
+GR precon 'robot valentines day gifts' in search bar initiates query
+SSS
+>Click on search bar
+>Type candy cane
+>Type Enter
+
+'Move cursor up by 5 pixels'
+(Straightforward function call with parameters)
+>move_cursor((0, -5))
+
+'Move cursor over text 'n'
+found_text = find_text_position('n')
+if found_text:
+    move_cursor(found_text.text_pos)
+else:
+    respond("Cannot find 'n' on screen")
+
+Open output properties (Blender visible)
+
+On screen symbol search
+'Prepositional spatial search program' ie n below m
+
+(The question is how to go from these simple 'function calls' to more lengthy plans...)
+What's an example of a more complex plan?
+
+Ex: 'Make a Blur Studio style film in Blender'
+Much more abstract and involves thousands or tens thousands of intermediate steps.
+Involves coordination of multiple perception streams
+Involves *learning* by observation of existing data and practice of relevant skills
+    -Reading
+    -Images
+    -Audio files
+    -Video files
+    -Realtime audiovisual streams
+    -Animation data streams
+Involves subgoals ie 'Create a character 3D model'
+Involves critique and feedback loops
+Involves coordination with other agents/humans
+
+(This is intractably complex and we don't currently have the integrated cognitive tooling to solve it!)
+
+What if we try something simpler first?
+
+Draw a stick figure in Krita.
+This requires a few unspecified parameters and steps, but they're all very straightforward
+Open Krita
+Create new document
+Select appropriate brush size.
+Using two tools: Ellipse and Line
+Perception of the 2D outline primitives 'as rendered'
+Ability to segment the correct regions...
+Proper alignment of lines ie spine below head, legs at bottom of spine... This requires understanding of Waltz style line primitives
+
+So you need correct representation and operational capability to 'synthesize with tools'
+You also need some approach to teach all this through a combination of natural language and demonstration
+
+'Let me show you how to {x}'
+Should induce a program learning mode.

@@ -12,8 +12,21 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # add_definitions(AOTInductor_CUDA)
-add_executable(${PROJECT_NAME} src/main.cpp src/mel_spec_render.cpp src/glad.c src/vision_processor.cpp src/x11_outline.cpp src/dino_embedder.cpp)
+add_executable(${PROJECT_NAME} src/main.cpp src/mel_spec_render.cpp src/glad.c src/vision_processor.cpp src/x11_outline.cpp src/dino_embedder.cpp src/thorn_vfx.cpp src/tradewinds.cpp)
 # deps/tracy-0.13.1/public/TracyClient.cpp
+
+target_include_directories(${PROJECT_NAME} PRIVATE "deps/cppzmq")
+
+include_directories(deps/msgpack-c/include)
+add_subdirectory("deps/msgpack-c")
+
+# build libzmq from source
+set(WITH_DOC OFF CACHE BOOL "" FORCE)
+set(ZMQ_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(BUILD_SHARED ON CACHE BOOL "" FORCE)
+set(BUILD_STATIC OFF CACHE BOOL "" FORCE)
+add_subdirectory("deps/libzmq")
+target_include_directories(${PROJECT_NAME} PRIVATE "deps/libzmq/include")
 
 include_directories("src")
 include_directories("deps/mel_spec/src")
@@ -23,6 +36,7 @@ include_directories("deps/mel_spec/deps/glad/include")
 include_directories("deps/spdlog/include")
 include_directories("deps/mel_spec/deps/fpng/src")
 include_directories("deps/json-3.11.2/single_include")
+include_directories("deps/enet-1.3.18/include")
 
 add_definitions(-DTRACY_ENABLE)
 add_subdirectory("deps/tracy-0.13.1")
@@ -32,7 +46,7 @@ include_directories("deps/flecs-4.1.1/include")
 set(BUILD_SHARED_LIBS ON CACHE BOOL "Build Flecs as a shared library" FORCE)
 add_subdirectory("deps/flecs-4.1.1")
 
-# Flecs custom build configuration - must match defines in main.cpp
+# Flecs custom build configuration
 target_compile_definitions(flecs PUBLIC
     FLECS_CUSTOM_BUILD
     FLECS_ALERTS
@@ -65,6 +79,7 @@ set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 add_subdirectory("deps/glfw")
+add_subdirectory("deps/enet-1.3.18")
 
 include_directories("deps/raylib")
 
@@ -128,7 +143,7 @@ target_link_libraries(query_server flecs spatialindex lmdb pthread)
 set_property(TARGET query_server PROPERTY CXX_STANDARD 20)
 # ----
 
-target_link_libraries(${PROJECT_NAME} flecs glfw glad nanovg fpng X11 Xi Xtst SDL2 SDL2_image ${OpenCV_LIBS} query_server Tracy::TracyClient libssh2::libssh2 dinov2)
+target_link_libraries(${PROJECT_NAME} flecs enet glfw glad nanovg fpng X11 Xi Xtst SDL2 SDL2_image ${OpenCV_LIBS} query_server Tracy::TracyClient libssh2::libssh2 dinov2 msgpack-cxx libzmq)
 
 # Add audio stream client executable
 add_executable(audio_stream_client src/audio_stream_client.c)

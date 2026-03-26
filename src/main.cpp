@@ -31,6 +31,10 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 
+#include <filesystem>
+#include <system_error>
+namespace fs = std::filesystem;
+
 // LibVNC
 #include <rfb/rfbclient.h>
 
@@ -66,9 +70,16 @@
 #include <libssh2.h>
 #include <nlohmann/json.hpp>
 
+#include <enet/enet.h>
+
 using json = nlohmann::json;
 
-struct TextSize { float w, h; };
+#include "components.h"
+#include "thorn_vfx.h"
+
+#include "tradewinds.h"
+
+using namespace tradewinds;
 
 std::vector<std::string> splitLinesPreserve(std::string s) {
     std::vector<std::string> out;
@@ -148,7 +159,7 @@ static struct timeval g_last_screenshot_time;
 // Vision processing job queue
 struct VisionProcessingJob {
     SDL_Surface* surface;
-    int quadrant;
+    int quadrant; // TODO: Remove this since it's an artifact of Shephleetess having 4 VNC Streams...
     std::string paletteFile;
     std::string outputPath;
     int width;
@@ -353,159 +364,6 @@ static PNGSaveQueue g_pngSaveQueue;
 
 #include "vnc_struct.h"
 
-/*
-These luminous phenomena still manifest themselves
-from time to time, as when a new idea opening up possibilities
-strikes me, but they are no longer exciting, being of relatively
-small intensity. When I close my eyes I invariably observe first,
-a background of very dark and uniform blue, not unlike the
-sky on a clear but starless night. In a few seconds this field
-becomes animated with innumerable scintillating flakes of
-green, arranged in several layers and advancing towards me.
-Then there appears, to the right, a beautiful pattern of two
-systems of parallel and closely spaced lines, at right angles to
-one another, in all sorts of colors with yellow-green and gold
-predominating. Immediately thereafter the lines grow brighter and the whole is thickly sprinkled with dots of twinkling
-light. This picture moves slowly across the field of vision and
-in about ten seconds vanishes to the left, leaving behind a
-ground of rather unpleasant and inert grey which quickly
-gives way to a billowy sea of clouds, seemingly trying to mould
-themselves in living shapes. It is curious that I cannot project a
-form into this grey until the second phase is reached. Every
-time, before falling asleep, images of persons or objects flit
-before my view. When I see them I know that I am about to lose
-consciousness. If they are absent and refuse to come it means a
-sleepless night.
-*/
-
-// ECS Components
-
-// struct Position {
-//     float x, y;
-// };
-
-typedef Vector2 Position;
-
-struct Edge
-{
-    Position p0;// LibVNC
-#include <rfb/rfbclient.h>
-    Position p1;
-};
-
-struct Local {};
-struct World {};
-
-struct Velocity {
-    float dx, dy;
-};
-
-struct UIElementSize
-{
-    float width, height;
-};
-
-struct DebugRenderBounds {};
-struct UIElementBounds {
-    float xmin, ymin, xmax, ymax;
-};
-
-enum class ServerStatus
-{
-    Offline,
-    Loading,
-    Ready,
-};
-
-struct ServerScript
-{
-    std::string name;
-    std::string conda_env;
-    std::string launcher_path;
-};
-
-struct RenderStatus {
-    bool visible;
-    // float transparency = 1.0f;
-};
-
-// Unified layout box - used for both horizontal and vertical layouts
-struct LayoutBox
-{
-  enum Direction { Horizontal, Vertical };
-  Direction dir = Horizontal;
-  float padding = 0.0f;
-  float move_dir = 1.0f; // 1 = right/down, -1 = left/up
-};
-
-struct ColumnFitConstraint
-{
-    int count;
-};
-
-struct FitChildren 
-{
-    float scale_factor;
-};
-
-struct FlowLayoutBox
-{
-  float x_progress;
-  float y_progress;
-  float padding = 0.0f;
-  float line_height = 0.0f;
-  float line_spacing = 0.0f;
-};
-
-struct RenderGradient
-{
-    uint32_t start;
-    uint32_t end;
-};
-
-struct RectRenderable {
-    float width, height;
-    bool stroke;
-    uint32_t color;
-};
-
-// Forward declaration
-struct RenderCommand; 
-
-// Example, diamond
-struct CustomRenderable
-{
-    float width, height;
-    bool stroke;
-    uint32_t color;
-    uint32_t gradient_start = 0;
-    uint32_t gradient_end = 0;
-
-    std::function<void(NVGcontext*, const RenderCommand*, const CustomRenderable&)> render_function;
-};
-
-struct RoundedRectRenderable {
-    float width, height, radius;
-    bool stroke;
-    uint32_t color;
-};
-
-struct LineRenderable {
-    float x1, y1;
-    float x2, y2;
-    
-    float thickness;
-    uint32_t color;
-};
-
-struct QuadraticBezierRenderable {
-    float x1, y1;
-    float cx, cy;
-    float x2, y2;
-    
-    float thickness;
-    uint32_t color;
-};
 
 float get_time_of_day_normalized() {
     using namespace std::chrono;
@@ -590,114 +448,6 @@ QuadraticBezierRenderable get_hour_segment(size_t i, float start_angle = 0.0f)
     return {x1, y1, cx, cy, x2, y2, thickness, segColor};
 }
 
-struct DiurnalHour
-{
-    size_t segment;
-};
-
-struct DynamicTextWrap 
-{
-    float pad;
-};
-
-struct DynamicTextWrapContainer {};
-
-struct TextRenderable {
-    std::string text;
-    std::string fontFace;
-    float fontSize;
-    uint32_t color;
-    float scaleY = 1.0f;
-    float wrapWidth = 0.0f;  // 0 = no wrapping, >0 = wrap at this width
-};
-
-struct ImageCreator
-{
-    std::string path;
-    float scaleX = 1.0f;
-    float scaleY = 1.0f;
-    NVGcolor tint = nvgRGBA(255, 255, 255, 255);
-};
-
-struct ImageRenderable
-{
-    int imageHandle;
-    float scaleX, scaleY;
-
-    float width, height;
-    NVGcolor tint = nvgRGBA(255, 255, 255, 255);
-
-    // Texture offset for smooth scrolling (shifts UV sampling, not element position)
-    float texOffsetX = 0.0f;
-    float texOffsetY = 0.0f;
-};
-
-struct ZIndex {
-    int layer;
-};
-
-struct Window {
-    GLFWwindow* handle;
-    int width, height;
-};
-
-struct CursorState
-{
-    double x, y;
-};
-
-struct AddTagOnLeftClick{};
-struct ShowEditorPanels {};
-struct SetPanelEditorType {};
-struct SelectServer {};
-
-struct LeftClickEvent {};
-struct Dragging {};
-struct DynamicPartition {};
-struct DynamicMerge {};
-struct LeftReleaseEvent {};
-struct RightClick {};
-struct RightRelease {};
-
-struct AddTagOnHoverEnter {};
-struct HoverEnterEvent {};
-
-struct AddTagOnHoverExit {};
-struct HoverExitEvent {};
-
-struct ServerHUDOverlay {};
-struct ServerDescription
-{
-    ecs_entity_t selected;
-};
-struct ShowServerHUDOverlay {};
-struct HideServerHUDOverlay {};
-
-struct HighlightBFOInheritanceHierarchy {};
-struct ResetBFOSprites {};
-
-struct CloseEditorSelector {};
-struct SetMenuHighlightColor {};
-struct SetMenuStandardColor {};
-
-struct ChatMessage {
-    std::string author;
-    std::string text;
-};
-
-struct ChatState {
-    std::vector<ChatMessage> messages;
-    std::string draft;
-    bool input_focused;
-};
-
-struct ChatMessageView {
-    int index;
-};
-
-struct FocusChatInput {};
-struct SendChatMessage {};
-
 struct ChatPanel {
     flecs::entity messages_panel;
     flecs::entity input_panel;
@@ -751,12 +501,15 @@ struct SentenceToken {
     }
 };
 
+// TODO: Automatically register from create badge?
 // Cache for entity colors (binding_symbol -> color)
 std::unordered_map<std::string, uint32_t> entity_color_cache = {
     {"w", 0x6df0ffFF},  // Wesley - cyan
-    {"h", 0xff75baFF}   // Heonae - pink
+    {"h", 0xff75baFF},   // Heonae - pink
+    {"g", 0xe66c25ff}
 };
 
+// TODO: Refactor this to Tradewinds...
 // Get color via Unix socket to persistent Python server (fast after first call)
 uint32_t get_entity_color(std::string binding_symbol, const std::string& entity_text) {
     // Check cache first
@@ -841,6 +594,7 @@ uint32_t get_entity_color(std::string binding_symbol, const std::string& entity_
     return color;
 }
 
+// TODO: This should be probably be prechewed into a more imperically digestable form with Python first...
 // Parse sentence template string into tokens
 // Formats:
 //   "Hello {{world, 5}} text" - entity binding
@@ -1005,336 +759,91 @@ std::vector<KnownEntity> known_entities = {
 int next_entity_number = 1;  // Global counter for entity display numbers
 
 // Previous sentences for context (last N sentences)
-std::mutex previous_sentences_mutex;
+std::mutex previous_sentences_mutex; // WTF?
 std::vector<std::string> previous_sentences;
 const int MAX_PREVIOUS_SENTENCES = 10;  // Keep last N sentences for context
 
-// Particle animation for grid triangles - moving with velocity to collide at target
-struct TriangleParticle {
-    float targetX, targetY, targetZ;  // Final grid position (collision point)
-    float localX, localY, localZ;     // Rotated local offset from tetrahedron centroid
-    float vx, vy, vz;  // Velocity
-    float collisionTime;  // When this particle reaches its target
-    float u, v;  // UV coordinates (don't animate)
-    float elapsedTime;  // Current time
-    float hitTime;  // Time when particle first hit/locked (for glow effect)
-    float baryX, baryY, baryZ;  // Barycentric coordinates for edge detection
-    int vertexIndex;  // Which vertex in the buffer
-    bool locked;  // Has reached target
-    bool isCentral;  // Part of central triangle (for impact glow intensity)
-    float pulseScale;  // Random scale variation for pulse (0.6 - 1.4)
-    float pulseRotation;  // Random rotation for pulse asymmetry
-};
 
-// Noise tetrahedron that flies past without joining grid
-struct NoiseTetrahedron {
-    float x, y, z;      // Current position (centroid)
-    float vz;           // Velocity towards camera
-    float scale;        // Size multiplier
-    // Random rotation (axis-angle)
-    float axisX, axisY, axisZ;
-    float rotAngle;
-};
-
-struct TimeEventRowChannel 
-{   
-    int scaleForMinimumCount;
-};
-
-struct CopyChildHeight {};
-
-struct Graphics {
-    NVGcontext* vg;
-
-    // 3D rendering resources
-    GLuint fbo;
-    GLuint fboTexture;
-    GLuint fboDepthRenderBuffer;
-    GLuint planeVAO;
-    GLuint planeVBO;
-    GLuint planeEBO;
-    GLuint gridVAO;
-    GLuint gridVBO;
-    GLuint gridEBO;
-    GLuint shaderProgram;
-    GLuint greyTexture;  // 1x1 grey texture for noise tetrahedrons
-    float tiltAngle;
-    int uiWidth;
-    int uiHeight;
-    bool useGridMode;
-    float gridModeTransitionTimer;  // Timer for delayed transition to plane mode
-    bool allParticlesLocked;        // Track if all particles are locked
-    int gridVertexCount;
-
-    // Particle system data
-    std::vector<TriangleParticle> particles;
-    std::vector<float> gridVertices;  // Store vertices for dynamic updates
-
-    // Noise tetrahedrons (fly past, don't join grid)
-    GLuint noiseVAO;
-    GLuint noiseVBO;
-    std::vector<NoiseTetrahedron> noiseParticles;
-    std::vector<float> noiseVertices;
-    int noiseVertexCount;
-
-    // FTL deceleration state
-    float decelerationTime;      // Time since start of deceleration
-    float decelerationDuration;  // Total deceleration period
-};
-
-enum class EditorType
+class VirtualList
 {
-    Void,
-    PeachCore,
-    ImaginaryInterlocutor,
-    VNCStream,
-    Healthbar,
-    // Respawn,
-    // Genome,
-    Embodiment,
-    Vision,
-    Hearing,
-    Memory,
-    Bookshelf,
-    Episodic,
-    BFO,
-    SceneGraph,
-    DataFusion,
-    // SystemNavigator,
-
-    // Bookshelf,
-    // MelSpectrogram,
-    // VNCStream,
-    // CameraVideoFeed,
-    // RobotActuators,
-    // VirtualHumanoid,
-    // EpisodicMemoryTimeline,
-    // Reification,
-    // ReadingRepresentation,
-    // ProgramSynthesis,
-    // Servers,
-    // Healthbar,
-    // Inventory,
-    // Scheduling,
-    // Chat,
-    // ComputeProvisioning,
-    // Backup
+public:
+    size_t index = 0;
+    // The page count to display should be dynamically calculated based on the list element size
+    // and the parent of the list
+    size_t page_max = 64;
+    std::vector<flecs::entity> entities;
+    virtual void Populate(flecs::world*) = 0;
+    virtual flecs::entity CreateNextElement(flecs::world*) = 0;
+    virtual flecs::entity CreatePrevElement(flecs::world*) = 0;
 };
 
-struct ParentClass {};
-struct BFOSprite {};
+class FileNavVirtualList : public VirtualList {
+public:
+    std::string path_to_scan;
+    std::vector<std::string> file_names;
+    flecs::entity container;
 
-// Node representing the editor area...
-struct EditorNodeArea
-{
-    float width, height;
-};
+    FileNavVirtualList(std::string path, flecs::entity parent) 
+        : path_to_scan(path), container(parent) {}
 
-struct EditorShiftRegion
-{
-    UIElementBounds bounds;
-    int cursor_type; // ex, GLFW_CROSSHAIR_CURSOR
-    flecs::entity split_target;
-};
+    virtual void Populate(flecs::world* world) override {
+        auto UIElement = world->lookup("UIElement");
+        file_names.clear();
+        std::error_code ec;
 
-struct EditorModifyPartitionRegion
-{
-    UIElementBounds bounds;
-    flecs::entity split_target;
-};
-
-struct EditorRoot 
-{
-    std::vector<EditorShiftRegion> shift_regions;
-    std::vector<EditorModifyPartitionRegion> modify_partition_regions;
-};
-
-struct EditorVisual {};
-struct EditorHeader {};
-struct EditorOutline {};
-struct EditorCanvas {};
-struct EditorLeaf {};
-
-struct UpperNode {};
-struct LowerNode {};
-
-struct LeftNode {};
-struct RightNode {};
-
-struct Align
-{
-    float self_horizontal;
-    float self_vertical;
-    float horizontal;
-    float vertical;
-};
-
-// Expand Rect or RoundedRect to UIElement bounds of parent
-// with some padding
-struct Expand
-{
-    bool x_enabled;
-    // TODO: Use a padding primitive rather than placing these on expand...
-    float pad_left, pad_right;
-    float x_percent; // 0.0 to 1.0
-
-    bool y_enabled;
-    float pad_top, pad_bottom;
-    float y_percent;
-
-    // If true (ImageRenderable only), do not upscale beyond native image size
-    // (after applying ImageRenderable.scaleX/scaleY).
-    bool cap_to_intrinsic = false;
-};
-
-// This is a special system tag to reduce UIElementBounds for LayoutBox
-struct ContractBoundsPostLayout {};
-
-struct UIContainer
-{
-    int pad_horizontal;
-    int pad_vertical;
-};
-
-// Post expand layer to 'fit within editor panel bounds'
-struct Constrain
-{
-    bool fit_x; // Scale x to fit within bounds (maintain ratio)
-    bool fit_y; // Scale y to fit within bounds (maintain ratio)
-};
-
-// What the actual fuck is this?
-struct ProportionalConstraint {
-    float max_width;
-    float max_height;
-};
-
-// This needs to be refactored to be a direct enum relationship in flecs once you grow up and become a competent person
-struct EditorLeafData
-{
-    EditorType editor_type;
-};
-
-struct FilmstripChannel{};
-// Relationship tag to link mel spec display to its source renderer entity
-struct MelSpecSource{};
-// Determine how to chunk and choose which frames to display
-
-enum class FilmstripMode {
-    Uniform,     // Frames added at fixed time intervals, adjacent layout
-    Stegosaurus  // Frames added on DINO spikes, time-based positioning with overlaps
-};
-
-// Component to track when a filmstrip frame was captured (for time-based positioning)
-struct FilmstripFrameTime {
-    double capture_time;  // glfwGetTime() when captured
-};
-
-struct FilmstripData
-{
-    // TODO: This should probably be a dynamic value based on container width...
-    int frame_limit;
-    // Should they be stored as entities or paths?
-    std::vector<flecs::entity> frames;
-    // Scroll tracking for realtime left-to-right scroll over 24 seconds
-    float scroll_offset = 0.0f;  // Current scroll progress (0.0 to 1.0 of one frame width)
-    float elapsed_time = 0.0f;   // Time elapsed in current scroll cycle
-    size_t total_frames_added = 0;  // Counter incremented each time a frame is pushed
-    size_t last_seen_frame_count = 0;  // To detect when total_frames_added changes
-    static constexpr float SCROLL_DURATION = 24.0f;  // Seconds for full container to scroll
-
-    // Mode selection
-    FilmstripMode mode = FilmstripMode::Uniform;
-
-    // Stegosaurus mode parameters
-    float spike_threshold = 0.15f;   // Minimum cosDiff to trigger a spike (0.0-1.0)
-    float last_dino_value = 0.0f;    // Last DINO cosDiff value seen
-    float spike_cooldown = 1.0f;     // Minimum seconds between spike captures
-    float time_since_spike = 0.0f;   // Time since last spike capture
-    bool pending_capture = false;    // Flag to signal capture should happen
-    double pending_spike_time = 0.0; // Time when the spike was detected (for accurate frame positioning)
-
-    // Uniform mode: track mel spec scroll position for sync
-    size_t last_capture_scroll_commands = 0;  // totalScrollCommands at last frame capture
-};
-
-// Timestamped data point for line chart
-struct LineChartPoint {
-    float value;
-    double capture_time;  // Wall clock time when this value was captured
-};
-
-// Line chart channel for streaming data visualization (e.g., DINO cosine similarity)
-struct LineChartData
-{
-    std::vector<LineChartPoint> points;  // Circular buffer of timestamped values
-    size_t write_pos = 0;       // Current write position in circular buffer
-    size_t capacity = 0;        // Max number of data points
-    float min_value = 0.0f;     // Min value for normalization
-    float max_value = 1.0f;     // Max value for normalization
-    uint32_t fill_color = 0xFFFFFF40;  // RGBA fill color (semi-transparent white)
-    uint32_t line_color = 0xFFFFFFFF;  // RGBA line color (solid white)
-    float sample_interval = 0.0f;  // Seconds between samples (0 = every frame)
-    float time_since_sample = 0.0f;  // Time accumulator for sampling
-    float processing_lag = 0.0f;  // Additional lag in seconds (e.g., DINO inference time)
-
-    static constexpr float WINDOW_DURATION = 24.0f;  // Total time window in seconds (matches filmstrip)
-
-    void push(float value, double timestamp) {
-        if (capacity == 0) return;
-        LineChartPoint point = {value, timestamp};
-        if (points.size() < capacity) {
-            points.push_back(point);
-        } else {
-            points[write_pos] = point;
+        for (const auto& entry : std::filesystem::directory_iterator(path_to_scan, ec)) {
+            std::string name = entry.path().filename().string();
+            if (entry.is_directory()) name += "/";
+            file_names.push_back(name);
         }
-        write_pos = (write_pos + 1) % capacity;
+
+        float probe_height = 0.0f;
+        for (size_t i = 0; i < file_names.size(); ++i) { // file_names.size()
+            probe_height += 16.0f;
+            page_max = entities.size();
+            // if (probe_height < container.parent().get<RoundedRectRenderable>().height)
+            // {
+            //     auto e = world->entity()
+            //         .is_a(UIElement)
+            //         .child_of(container)
+            //         .set<TextRenderable>({"", "JetBrainsMono", 16.0f, 0xFFFFFFFF})
+            //         .set<ZIndex>({14});
+                    
+            //         entities.push_back(e);
+            // } else{
+            //     break;
+            // }
+        }
+        
+        Refresh(); // Fill the text for the first time
     }
 
-    // Get point at index (0 = oldest, size-1 = newest)
-    LineChartPoint get(size_t index) const {
-        if (points.empty() || index >= points.size()) return {0.0f, 0.0};
-        if (points.size() < capacity) {
-            return points[index];
+    void Refresh() {
+        for (size_t i = 0; i < page_max; ++i) {
+            size_t data_idx = index + i;
+            if (data_idx < file_names.size()) {
+                entities[i].ensure<TextRenderable>().text = file_names[data_idx];
+            } else {
+                entities[i].ensure<TextRenderable>().text = ""; // Clear unused slots
+            }
         }
-        return points[(write_pos + index) % capacity];
     }
 
-    size_t size() const { return points.size(); }
-};
+    virtual flecs::entity CreateNextElement(flecs::world* world) override {
+        if (index + page_max < file_names.size()) {
+            index++;
+            Refresh();
+        }
+        return entities.back();
+    }
 
-// Tag for LineChart channel type
-struct LineChartChannel{};
-
-enum class PanelSplitType
-{
-    Horizontal,
-    Vertical
-};
-
-struct DragContext {
-    bool active;
-    flecs::entity target;
-    PanelSplitType dim;
-    float startPercent;
-};
-
-struct PanelSplit 
-{
-    // use percent instead of pixel count for proportional expansion when
-    // window size changes
-    float percent; // 0 to 100
-    PanelSplitType dim;
-};
-
-enum class RenderType {
-    Rectangle,
-    RoundedRectangle,
-    Text,
-    Image,
-    Line,
-    QuadraticBezier,
-    CustomRenderable,
+    virtual flecs::entity CreatePrevElement(flecs::world* world) override {
+        if (index > 0) {
+            index--;
+            Refresh();
+        }
+        return entities.front();
+    }
 };
 
 flecs::world* world = nullptr;
@@ -1840,267 +1349,6 @@ void vnc_message_thread(VNCClientHandle vnc_handle) {
 
 // End VNC Stream
 
-// ============================================================================
-// SFTP File Transfer
-// ============================================================================
-
-#include "sftp_client.h"
-#include <libssh2.h>
-#include <libssh2_sftp.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <sys/stat.h>
-#include <unistd.h>
-
-// SFTP connection function - establishes SSH and SFTP session
-bool sftp_connect(SFTPClient* sftp) {
-    LOG_INFO(LogCategory::SFTP, "Connecting to {}:{} (ptr: {})", sftp->host, sftp->port, (void*)sftp);
-
-    sftp->conn_state = SFTPClient::CONNECTING;
-
-    // 1. Create socket and connect to host:port
-    LOG_INFO(LogCategory::SFTP, "Creating socket...");
-    sftp->sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sftp->sock < 0) {
-        sftp->conn_state = SFTPClient::ERROR;
-        LOG_ERROR(LogCategory::SFTP, "Failed to create socket");
-        return false;
-    }
-    LOG_INFO(LogCategory::SFTP, "Socket created: {}", sftp->sock);
-
-    struct sockaddr_in sin;
-    sin.sin_family = AF_INET;
-    sin.sin_port = htons(sftp->port);
-    sin.sin_addr.s_addr = inet_addr(sftp->host.c_str());
-
-    LOG_INFO(LogCategory::SFTP, "Connecting socket to {}:{}...", sftp->host, sftp->port);
-    if (connect(sftp->sock, (struct sockaddr*)&sin, sizeof(struct sockaddr_in)) != 0) {
-        sftp->conn_state = SFTPClient::ERROR;
-        LOG_ERROR(LogCategory::SFTP, "Failed to connect to {}:{} - {}", sftp->host, sftp->port, strerror(errno));
-        close(sftp->sock);
-        sftp->sock = -1;
-        return false;
-    }
-    LOG_INFO(LogCategory::SFTP, "Socket connected successfully");
-
-    // 2. Initialize libssh2 session
-    LOG_INFO(LogCategory::SFTP, "Initializing SSH session...");
-    sftp->session = libssh2_session_init();
-    if (!sftp->session) {
-        sftp->conn_state = SFTPClient::ERROR;
-        LOG_ERROR(LogCategory::SFTP, "Failed to initialize SSH session");
-        close(sftp->sock);
-        sftp->sock = -1;
-        return false;
-    }
-    LOG_INFO(LogCategory::SFTP, "SSH session initialized");
-
-    // Set blocking mode
-    LOG_INFO(LogCategory::SFTP, "Setting blocking mode...");
-    libssh2_session_set_blocking(sftp->session, 1);
-
-    // 3. Perform SSH handshake
-    LOG_INFO(LogCategory::SFTP, "Starting SSH handshake...");
-    int rc = libssh2_session_handshake(sftp->session, sftp->sock);
-    if (rc) {
-        sftp->conn_state = SFTPClient::ERROR;
-        LOG_ERROR(LogCategory::SFTP, "SSH handshake failed (error {})", rc);
-        libssh2_session_free(sftp->session);
-        sftp->session = nullptr;
-        close(sftp->sock);
-        sftp->sock = -1;
-        return false;
-    }
-    LOG_INFO(LogCategory::SFTP, "SSH handshake completed");
-
-    const char * fingerprint = libssh2_hostkey_hash(sftp->session, LIBSSH2_HOSTKEY_HASH_SHA1);
-
-    fprintf(stderr, "Fingerprint: ");
-    for(int i = 0; i < 20; i++) 
-    {
-        fprintf(stderr, "%02X ", (unsigned char)fingerprint[i]);
-    }
-    fprintf(stderr, "\n");
-
-    // 4. Authenticate using password
-    LOG_INFO(LogCategory::SFTP, "Authenticating user: {}", sftp->username);
-    rc = libssh2_userauth_password(sftp->session,
-        sftp->username.c_str(),
-        sftp->password.c_str());
-
-    if (rc) {
-        sftp->conn_state = SFTPClient::ERROR;
-        LOG_ERROR(LogCategory::SFTP, "SSH password authentication failed (user: {}, error: {})", sftp->username, rc);
-        libssh2_session_disconnect(sftp->session, "Auth failed");
-        libssh2_session_free(sftp->session);
-        sftp->session = nullptr;
-        close(sftp->sock);
-        sftp->sock = -1;
-        return false;
-    }
-    LOG_INFO(LogCategory::SFTP, "Authentication successful");
-
-    // 5. Initialize SFTP subsystem
-    sftp->sftp_session = libssh2_sftp_init(sftp->session);
-    if (!sftp->sftp_session) {
-        sftp->conn_state = SFTPClient::ERROR;
-        LOG_ERROR(LogCategory::SFTP, "Failed to initialize SFTP session");
-        libssh2_session_disconnect(sftp->session, "SFTP init failed");
-        libssh2_session_free(sftp->session);
-        sftp->session = nullptr;
-        close(sftp->sock);
-        sftp->sock = -1;
-        return false;
-    }
-
-    sftp->conn_state = SFTPClient::CONNECTED;
-    LOG_INFO(LogCategory::SFTP, "SFTP connected successfully to {}@{}", sftp->username, sftp->host);
-
-    return true;
-}
-
-// SFTP worker thread - processes file transfer queue
-void sftp_worker_thread(SFTPClient* sftp) {
-    LOG_INFO(LogCategory::SFTP, "SFTP thread started for {} (ptr: {})", sftp->host, (void*)sftp);
-
-    sftp->thread_running = true;
-
-    while (!sftp->thread_should_stop) {
-        // 1. Wait for transfer request (with timeout)
-        FileTransferRequest request;
-        {
-            std::unique_lock<std::mutex> lock(sftp->queue_mutex);
-            sftp->queue_cv.wait_for(lock, std::chrono::milliseconds(100),
-                [sftp]() { return !sftp->transfer_queue.empty() || sftp->thread_should_stop; });
-
-            if (sftp->transfer_queue.empty()) continue;
-            request = sftp->transfer_queue.front();
-            sftp->transfer_queue.pop_front();
-        }
-
-        // 2. Ensure connection (lazy connect)
-        if (sftp->conn_state != SFTPClient::CONNECTED) {
-            if (!sftp_connect(sftp)) {
-                // Update progress with error
-                std::lock_guard<std::mutex> plock(sftp->progress_mutex);
-                sftp->current_progress.state = FileTransferProgress::FAILED;
-                sftp->current_progress.error_message = "Connection failed (see logs)";
-                continue;
-            }
-        }
-
-        LOG_INFO(LogCategory::SFTP, "Transferring: {} -> {}", request.local_path, request.remote_path);
-
-        // 3. Open local file
-        FILE* local_file = fopen(request.local_path.c_str(), "rb");
-        if (!local_file) {
-            std::string error = "Cannot open local file: " + request.local_path;
-            LOG_ERROR(LogCategory::SFTP, "{}", error);
-            std::lock_guard<std::mutex> lock(sftp->progress_mutex);
-            sftp->current_progress.state = FileTransferProgress::FAILED;
-            sftp->current_progress.error_message = error;
-            continue;
-        }
-
-        // 4. Open remote file via SFTP
-        LIBSSH2_SFTP_HANDLE* sftp_handle = libssh2_sftp_open(
-            sftp->sftp_session, request.remote_path.c_str(),
-            LIBSSH2_FXF_WRITE | LIBSSH2_FXF_CREAT | LIBSSH2_FXF_TRUNC,
-            LIBSSH2_SFTP_S_IRUSR | LIBSSH2_SFTP_S_IWUSR | LIBSSH2_SFTP_S_IRGRP | LIBSSH2_SFTP_S_IROTH);
-
-        if (!sftp_handle) {
-            unsigned long sftp_err = libssh2_sftp_last_error(sftp->sftp_session);
-            std::string error = "Cannot open remote file (SFTP error " + std::to_string(sftp_err) + "): " + request.remote_path;
-            LOG_ERROR(LogCategory::SFTP, "{}", error);
-            fclose(local_file);
-            std::lock_guard<std::mutex> lock(sftp->progress_mutex);
-            sftp->current_progress.state = FileTransferProgress::FAILED;
-            sftp->current_progress.error_message = error;
-            continue;
-        }
-
-        // 5. Transfer file in chunks, updating progress
-        {
-            std::lock_guard<std::mutex> lock(sftp->progress_mutex);
-            sftp->current_progress.state = FileTransferProgress::TRANSFERRING;
-            sftp->current_progress.bytes_transferred = 0;
-        }
-
-        char buffer[32768];
-        size_t total_written = 0;
-        bool transfer_failed = false;
-
-        while (!feof(local_file) && !sftp->thread_should_stop) {
-            size_t nread = fread(buffer, 1, sizeof(buffer), local_file);
-            if (nread <= 0) break;
-
-            // Write to SFTP
-            char* ptr = buffer;
-            size_t remaining = nread;
-            while (remaining > 0) {
-                ssize_t nwritten = libssh2_sftp_write(sftp_handle, ptr, remaining);
-                if (nwritten < 0) {
-                    std::string error = "SFTP write failed (error " + std::to_string(nwritten) + ")";
-                    LOG_ERROR(LogCategory::SFTP, "{}", error);
-                    std::lock_guard<std::mutex> lock(sftp->progress_mutex);
-                    sftp->current_progress.state = FileTransferProgress::FAILED;
-                    sftp->current_progress.error_message = error;
-                    transfer_failed = true;
-                    break;
-                }
-                ptr += nwritten;
-                remaining -= nwritten;
-                total_written += nwritten;
-
-                // Update progress (thread-safe)
-                {
-                    std::lock_guard<std::mutex> lock(sftp->progress_mutex);
-                    sftp->current_progress.bytes_transferred = total_written;
-                    sftp->current_progress.progress_percent =
-                        (float)total_written / request.file_size * 100.0f;
-                }
-            }
-
-            if (transfer_failed) break;
-        }
-
-        // 6. Close handles
-        libssh2_sftp_close(sftp_handle);
-        fclose(local_file);
-
-        // 7. Mark completed or failed
-        if (!transfer_failed && !sftp->thread_should_stop) {
-            std::lock_guard<std::mutex> lock(sftp->progress_mutex);
-            sftp->current_progress.state = FileTransferProgress::COMPLETED;
-            sftp->current_progress.completion_time = std::chrono::steady_clock::now();
-            sftp->current_progress.progress_percent = 100.0f;
-            LOG_INFO(LogCategory::SFTP, "Transfer completed: {} ({} bytes)",
-                request.remote_path, total_written);
-        }
-    }
-
-    // Cleanup connection
-    if (sftp->sftp_session) {
-        libssh2_sftp_shutdown(sftp->sftp_session);
-        sftp->sftp_session = nullptr;
-    }
-    if (sftp->session) {
-        libssh2_session_disconnect(sftp->session, "Shutdown");
-        libssh2_session_free(sftp->session);
-        sftp->session = nullptr;
-    }
-    if (sftp->sock >= 0) {
-        close(sftp->sock);
-        sftp->sock = -1;
-    }
-
-    sftp->thread_running = false;
-    LOG_INFO(LogCategory::SFTP, "SFTP thread stopped for {}", sftp->host);
-}
-
-// End SFTP File Transfer
-
 #include <algorithm>
 
 // Helper to convert hex RGBA (0xRRGGBBAA) to NVGcolor
@@ -2178,7 +1426,7 @@ void draw_double_arrow(NVGcontext* vg, const RenderCommand* cmd, const CustomRen
     float x = cmd->pos.x;
     float y = cmd->pos.y;
 
-    float leftArrowStartX = x + data.height/2.0f;
+    float leftArrowStartX = x - data.height/2.0f;
     float rightArrowStartX = x + data.width-data.height/2.0f;
     float midY = y + data.height / 2.0f;
 
@@ -2220,6 +1468,73 @@ void draw_double_arrow(NVGcontext* vg, const RenderCommand* cmd, const CustomRen
         }
         nvgFill(vg);
     }
+}
+
+flecs::entity create_slot_image(flecs::entity parent_entity, const std::string& symbol, uint32_t tint) {
+    auto UIElement = world->lookup("UIElement");
+    uint32_t tint_color = scale_color(tint, 1.3f);
+    unsigned char r = (tint_color >> 24) & 0xFF;
+    unsigned char g = (tint_color >> 16) & 0xFF;
+    unsigned char b = (tint_color >> 8) & 0xFF;
+    unsigned char a = (tint_color) & 0xFF;
+
+    std::string image_path;
+    if (symbol == "*") {
+        // Wildcard - use wildcard.png
+        image_path = "wildcard.png";
+    }
+    else if (symbol == "checkbox")
+    {
+        // TODO: Bind to boolean state
+        image_path == "checkbox_true.png";
+    } else if (symbol.length() == 1 && std::isdigit(static_cast<unsigned char>(symbol[0]))) {
+        // Standard MNIST digit
+        image_path = "mnist/set_0/" + symbol + ".png";
+    } else {
+        // Non-digit - use uppercase letter_set sprite
+        std::string upper_symbol = symbol;
+        for (auto& c : upper_symbol) c = std::toupper(static_cast<unsigned char>(c));
+        image_path = "letter_sets/set_01/" + upper_symbol + ".png";
+    }
+
+    return world->entity()
+        .is_a(UIElement)
+        .child_of(parent_entity)
+        .set<ImageCreator>({image_path, 0.9f, 0.9f, nvgRGBA(r, g, b, a)})
+        .set<ZIndex>({25});
+};
+
+void create_triple_block(flecs::entity parent, const SentenceToken& token) {
+    auto UIElement = world->lookup("UIElement");
+    
+    // 1. Create the outer bridge (The Double-Arrow container)
+    // We average the colors of the source and target for the outline
+    uint32_t src_color = get_entity_color(token.source_symbol, ""); 
+    uint32_t tgt_color = get_entity_color(token.target_symbol, "");
+    uint32_t bridge_color = (scale_color(src_color, 0.5f) & 0xFFFFFF00) | (scale_color(tgt_color, 0.5f) & 0xFFFFFF00) | 0xFF;
+
+    flecs::entity bridge = world->entity()
+        .is_a(UIElement)
+        .child_of(parent)
+        .set<CustomRenderable>({100.0f, 25.0f, true, bridge_color, 0, 0, draw_double_arrow})
+        .set<UIContainer>({12, 0}) // Space for the arrow tips
+        .set<ZIndex>({20});
+
+    // 2. Create the internal horizontal layout
+    auto content = world->entity()
+        .is_a(UIElement)
+        .child_of(bridge)
+        .set<LayoutBox>({LayoutBox::Horizontal, 2.0f})
+        .add(flecs::OrderedChildren);
+
+    // 3. Add the three parts of the triple
+    create_slot_image(content, token.source_symbol, src_color); // Subject
+    
+    world->entity().is_a(UIElement).child_of(content) // Predicate Text
+        .set<TextRenderable>({token.text, "CharisSIL", 16.0f, 0xFFFFFFFF})
+        .set<ZIndex>({25});
+
+    create_slot_image(content, token.target_symbol, tgt_color); // Object
 }
 
 // Forward declaration for vector-based version
@@ -2328,35 +1643,39 @@ flecs::entity create_badge_impl(flecs::entity parent, flecs::entity UIElement,
             .set<ZIndex>({22});
     }
 
-    // Helper lambda to create MNIST digit with tint
     // Helper lambda to create MNIST digit or wildcard image
-    auto create_slot_image = [&](flecs::entity parent_entity, const std::string& symbol, uint32_t tint) {
-        uint32_t tint_color = scale_color(tint, 1.3f);
-        unsigned char r = (tint_color >> 24) & 0xFF;
-        unsigned char g = (tint_color >> 16) & 0xFF;
-        unsigned char b = (tint_color >> 8) & 0xFF;
-        unsigned char a = (tint_color) & 0xFF;
+    // auto create_slot_image = [&](flecs::entity parent_entity, const std::string& symbol, uint32_t tint) {
+    //     uint32_t tint_color = scale_color(tint, 1.3f);
+    //     unsigned char r = (tint_color >> 24) & 0xFF;
+    //     unsigned char g = (tint_color >> 16) & 0xFF;
+    //     unsigned char b = (tint_color >> 8) & 0xFF;
+    //     unsigned char a = (tint_color) & 0xFF;
 
-        std::string image_path;
-        if (symbol == "*") {
-            // Wildcard - use wildcard.png
-            image_path = "wildcard.png";
-        } else if (symbol.length() == 1 && std::isdigit(static_cast<unsigned char>(symbol[0]))) {
-            // Standard MNIST digit
-            image_path = "mnist/set_0/" + symbol + ".png";
-        } else {
-            // Non-digit - use uppercase letter_set sprite
-            std::string upper_symbol = symbol;
-            for (auto& c : upper_symbol) c = std::toupper(static_cast<unsigned char>(c));
-            image_path = "letter_sets/set_01/" + upper_symbol + ".png";
-        }
+    //     std::string image_path;
+    //     if (symbol == "*") {
+    //         // Wildcard - use wildcard.png
+    //         image_path = "wildcard.png";
+    //     }
+    //     else if (symbol == "checkbox")
+    //     {
+    //         // TODO: Bind to boolean state
+    //         image_path == "checkbox_true.png";
+    //     } else if (symbol.length() == 1 && std::isdigit(static_cast<unsigned char>(symbol[0]))) {
+    //         // Standard MNIST digit
+    //         image_path = "mnist/set_0/" + symbol + ".png";
+    //     } else {
+    //         // Non-digit - use uppercase letter_set sprite
+    //         std::string upper_symbol = symbol;
+    //         for (auto& c : upper_symbol) c = std::toupper(static_cast<unsigned char>(c));
+    //         image_path = "letter_sets/set_01/" + upper_symbol + ".png";
+    //     }
 
-        world->entity()
-            .is_a(UIElement)
-            .child_of(parent_entity)
-            .set<ImageCreator>({image_path, 0.9f, 0.9f, nvgRGBA(r, g, b, a)})
-            .set<ZIndex>({25});
-    };
+    //     world->entity()
+    //         .is_a(UIElement)
+    //         .child_of(parent_entity)
+    //         .set<ImageCreator>({image_path, 0.9f, 0.9f, nvgRGBA(r, g, b, a)})
+    //         .set<ZIndex>({25});
+    // };
 
     // Helper lambda to create text element
     auto create_text_element = [&](flecs::entity parent_entity, const char* txt, uint32_t color_val) {
@@ -2364,7 +1683,7 @@ flecs::entity create_badge_impl(flecs::entity parent, flecs::entity UIElement,
             .is_a(UIElement)
             .child_of(parent_entity)
             .set<Position, Local>({0.0f, 6.0f})
-            .set<TextRenderable>({txt, "Inter", 16.0f, color_val})
+            .set<TextRenderable>({txt, "CharisSIL", 16.0f, color_val})
             .set<ZIndex>({25});
     };
 
@@ -2414,7 +1733,7 @@ flecs::entity create_badge_impl(flecs::entity parent, flecs::entity UIElement,
         .is_a(UIElement)
         .child_of(badge_text_parent)
         .set<Position, Local>({xPad, 6.0f})
-        .set<TextRenderable>({text, "Inter", 16.0f, white, 1.2f})
+        .set<TextRenderable>({text, "CharisSIL", 16.0f, white, 1.2f})
         .set<RenderGradient>({white, light})
         .set<ZIndex>({25});
 
@@ -2570,7 +1889,7 @@ void recreate_annotation_entities(WordAnnotationSelector& selector) {
                 .is_a(UIElement)
                 .child_of(text_parent)
                 .set<Position, Local>({0.0f, !token.reified_symbol.empty() ? 0.0f : 6.0f})
-                .set<TextRenderable>({token.text.c_str(), "Inter", 16.0f, 0xFFFFFFFF, 1.2f})
+                .set<TextRenderable>({token.text.c_str(), "CharisSIL", 16.0f, 0xFFFFFFFF, 1.2f})
                 .set<RenderGradient>({0xFFFFFFFF, light})
                 .set<ZIndex>({25});
 
@@ -2619,7 +1938,7 @@ void recreate_annotation_entities(WordAnnotationSelector& selector) {
             flecs::entity text_ent = world->entity()
                 .is_a(UIElement)
                 .child_of(selector.parent_entity)
-                .set<TextRenderable>({token.text.c_str(), "Inter", 16.0f, 0x777777FF})
+                .set<TextRenderable>({token.text.c_str(), "CharisSIL", 16.0f, 0x777777FF})
                 .set<ZIndex>({17});
             selector.ui_entities.push_back(text_ent);
             selector.selection_entities.push_back(text_ent);
@@ -2665,6 +1984,7 @@ void create_editor(flecs::entity leaf, EditorNodeArea& node_area, flecs::entity 
         .set<ZIndex>({8});
 
     leaf.add<EditorHeader>(editor_header);
+    leaf.add<PanelState>();
 
     // Add 'expand to parent UIElement bounds with padding'
     auto editor_canvas = world->entity()
@@ -2687,6 +2007,7 @@ void create_editor(flecs::entity leaf, EditorNodeArea& node_area, flecs::entity 
         .set<Expand>({true, 0.0f, 0.0f, 1.0f, false, 0, 0, 0})
         .set<ZIndex>({2});
 
+    { // Panel type dropdown
     auto editor_icon_bkg = world->entity()
         .is_a(UIElement)
         .child_of(editor_visual)
@@ -2695,6 +2016,37 @@ void create_editor(flecs::entity leaf, EditorNodeArea& node_area, flecs::entity 
         .add<EditorCanvas>(editor_canvas)
         .add<EditorLeaf>(leaf)
         .add<AddTagOnLeftClick, ShowEditorPanels>()
+        .set<ZIndex>({4});
+
+    auto editor_icon = world->entity()
+        .is_a(UIElement)
+        .child_of(editor_icon_bkg)
+        .set<Position, Local>({2.0f, 0.0f})
+        .set<ImageCreator>({"../assets/panel_type.png", 1.0f, 1.0f})
+        .set<ZIndex>({12});
+
+    auto editor_dropdown = world->entity()
+        .is_a(UIElement)
+        .child_of(editor_icon_bkg)
+        .set<Position, Local>({22.0f, 8.0f})
+        .set<ImageCreator>({"../assets/arrow_down.png", 1.0f, 1.0f})
+        .set<ZIndex>({12});
+        
+    world->entity()
+        .is_a(UIElement)
+        .child_of(editor_icon_bkg)
+        .set<RoundedRectRenderable>({32.0f, 20.0f, 4.0f, true, 0x5f5f5fFF})
+        .set<ZIndex>({6});
+    }
+    { // Panel state dropdown
+    auto editor_icon_bkg = world->entity()
+        .is_a(UIElement)
+        .child_of(editor_visual)
+        .set<Position, Local>({46.0f, 2.0f})
+        .set<RoundedRectRenderable>({32.0f, 20.0f, 4.0f, false, 0x282828FF})
+        .add<EditorCanvas>(editor_canvas)
+        .add<EditorLeaf>(leaf)
+        .add<AddTagOnLeftClick, ShowPanelState>()
         .set<ZIndex>({4});
 
     auto editor_icon = world->entity()
@@ -2716,6 +2068,7 @@ void create_editor(flecs::entity leaf, EditorNodeArea& node_area, flecs::entity 
         .child_of(editor_icon_bkg)
         .set<RoundedRectRenderable>({32.0f, 20.0f, 4.0f, true, 0x5f5f5fFF})
         .set<ZIndex>({6});
+    }
 
     // TODO: Editor type entities...
 
@@ -2731,11 +2084,13 @@ std::vector<std::string> editor_types =
     "Void",
     // "ECS Graph", // Entity component relationship
     "Peach Core",
+    "Condensate",
     "Interlocutor", // Queue or Stream
     "VNC Stream",
     "Healthbar",
     // "Gynoid",
-    "Embodiment",
+    "In-Silico Lab",
+    "Droid",
     "Vision",
     "Hearing",
     "Memory",
@@ -2752,7 +2107,7 @@ struct VNCData
     VNCClientHandle client;  // Stable handle that survives ECS moves
 };
 
-VNCData get_vnc_source(const std::string& host, int port) {
+VNCData get_vnc_source(flecs::entity user_state_leaf, const std::string& host, int port) {
     std::string addr = host + ":" + std::to_string(port);
 
     // 1. Check if we already have this connection
@@ -2771,6 +2126,7 @@ VNCData get_vnc_source(const std::string& host, int port) {
     client_handle->surfaceMutex = std::make_shared<std::mutex>();
     client_handle->dirtyRectQueue = std::make_shared<DirtyRectQueue>();
     client_handle->connectionState = VNCClient::CONNECTING;
+    client_handle->user_state_leaf = user_state_leaf;
 
     // Create OpenGL texture (will be resized when connected)
     glGenTextures(1, &client_handle->vncTexture);
@@ -2798,8 +2154,6 @@ VNCData get_vnc_source(const std::string& host, int port) {
 
     return {created, client_handle};
 }
-
-struct ScissorContainer {};
 // TODO: Make it transitive
 
 void draw_diamond(NVGcontext* vg, const RenderCommand* cmd, const CustomRenderable& data) {
@@ -2955,9 +2309,56 @@ void setup_bfo_hierarchy(flecs::entity bfo_editor, flecs::entity UIElement) {
     std::cout << "BFO Hierarchy initialized with " << entities.size() << " sprites." << std::endl;
 }
 
+void create_process_segment(flecs::entity UIElement, flecs::entity leaf, flecs::entity channel, TimeInterval interval)
+{
+    flecs::entity process_start = world->entity() 
+        .is_a(UIElement)
+        .child_of(channel)
+        .set<Position, Local>({128.0f, 2.0f}); // TODO: This should start at the rightmost pos of the channel and behind everything
+    // TODO: Binding processes to particular timestamps and channels, reflected in the UI
+    world->entity()
+        .is_a(UIElement)
+        .child_of(process_start)
+        .set<RectRenderable>({100.0f, 20.0f, false, 0xf039e044 })
+        .add<ScissorContainer>(leaf.target<EditorCanvas>())
+        .set<ZIndex>({15});
+
+    world->entity()
+        .is_a(UIElement)
+        .child_of(process_start)
+        .set<TimeInterval>(interval)
+        .add<TimeIntervalToSpaceSegment>()
+        .set<RectRenderable>({100.0f, 20.0f, true, 0xf039e0ff })
+        .add<ScissorContainer>(leaf.target<EditorCanvas>())
+        .set<ZIndex>({18});
+
+    world->entity()
+        .is_a(UIElement)
+        .child_of(process_start)
+        // .set<ImageCreator>({("../assets/checkbox_.png").c_str(), 1.0f, 1.0f})
+        .set<ImageCreator>({"../assets/process_overlay.png", 1.0f, 1.0f})
+        .add<ScissorContainer>(leaf.target<EditorCanvas>())
+        .set<ZIndex>({20});
+}
+
+void clicked_minilm(flecs::entity e)
+{
+    std::cout << "clicked_minilm" << std::endl;
+    world->entity()
+    .is_a(e.world().lookup("UIElement"))
+    .child_of(e)
+    .set<ImageCreator>({"../assets/server_dot.png", 1.0f, 1.0f})
+    .set<Align>({-0.5f, -0.5f, 0.5f, 0.9f})
+    .set<ZIndex>({16})
+    .set<Expand>({false, 0.0f, 0.0f, 1.0f, false, 0.0f, 0.0f, 1.0f, true});
+}
+
 // Factory function to populate editor content, whether the panel is initialized or changed
+// TODO: Refactor editor creation to unique files 
 void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::entity UIElement)
 {
+    PanelState& state = leaf.ensure<PanelState>();
+    state.options.clear();
     std::cout << "Change panel type to " << editor_types[(int)editor_type] << std::endl;
     if (editor_type == EditorType::PeachCore)
     {
@@ -2978,7 +2379,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         .add<ServerDescription>()
         .child_of(leaf.target<EditorCanvas>());
 
-        std::vector<std::string> server_icons = {"aeri_memory", "claude", "flecs", "x11", "parakeet", "chatterbox", "doctr", "huggingface", "dino2", "alpaca", "modal"}; // , "autodistill", "yolo", 
+        std::vector<std::string> server_icons = {"aeri_memory", "zmq", "flecs", "x11", "parakeet", "chatterbox", "doctr", "opencv", "minilm", "dino2", "alpaca", "modal"}; // , "autodistill", "yolo", 
         // std::vector<std::string> server_icons = {"peach_core"};
 
         for (const auto& icon : server_icons)
@@ -2989,6 +2390,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
             flecs::entity server_icon = world->entity()
             .is_a(UIElement)
             .add<ServerHUDOverlay>(panel_overlay)
+            // TODO: Replace these events with callback functions?
             .add<AddTagOnHoverEnter, ShowServerHUDOverlay>()
             .add<AddTagOnHoverExit, HideServerHUDOverlay>()
             .child_of(server_hud)
@@ -2996,16 +2398,50 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
             .set<Expand>({false, 4.0f, 4.0f, 1.0f, true, 0.0f, 0.0f, 1.0f, true})
             .set<ImageCreator>({"../assets/server_hud/" + icon + ".png", 1.0f, 1.0f})
             .set<ZIndex>({10});
-            // TODO: Server dot should only exist if the server is active...
-            world->entity()
-            .is_a(UIElement)
-            .child_of(server_icon)
-            .set<ImageCreator>({"../assets/server_dot.png", 1.0f, 1.0f})
-            .set<Align>({-0.5f, -0.5f, 0.5f, 0.9f})
-            .set<ZIndex>({12})
-            .set<Expand>({false, 0.0f, 0.0f, 1.0f, false, 0.0f, 0.0f, 1.0f, true});
+
+            if (icon == "minilm")
+            {
+                server_icon.set<CallbackOnLeftClick>({clicked_minilm});
+                // TODO: OnClick
+            } else
+            {
+                world->entity()
+                .is_a(UIElement)
+                .child_of(server_icon)
+                .set<ImageCreator>({"../assets/server_dot.png", 1.0f, 1.0f})
+                .set<Align>({-0.5f, -0.5f, 0.5f, 0.9f})
+                .set<ZIndex>({12})
+                .set<Expand>({false, 0.0f, 0.0f, 1.0f, false, 0.0f, 0.0f, 1.0f, true});
+            }
         }
         
+    } else if (editor_type == EditorType::Condensate)
+    {
+        // TODO: Generate list of files/directories
+        auto dir_list = world->entity()
+            .is_a(UIElement)
+            .child_of(leaf.target<EditorCanvas>())
+            .set<LayoutBox>({LayoutBox::Vertical, 0.0f})
+            .add<ScissorContainer>(leaf.target<EditorCanvas>())
+            .add(flecs::OrderedChildren);
+
+        auto file_nav = FileNavVirtualList("/home/wesxdz/Downloads/", dir_list);
+        file_nav.Populate(world);
+
+        auto scrollbar_right = world->entity()
+            .is_a(UIElement)
+            .child_of(leaf.target<EditorCanvas>())
+            .set<RectRenderable>({8.0f, 100.0f, false, 0x555555ff})
+            .set<Align>({-1.0f, 0.0f, 1.0f, 0.0f})
+            .set<Expand>({0, 0, 0, 0, 1, 0, 0, 1.0f})
+            .set<ZIndex>({20});
+
+        auto scrollbar_slider = world->entity()
+            .is_a(UIElement)
+            .child_of(scrollbar_right)
+            .set<RectRenderable>({8.0f, 10.0f, false, 0x888888ff})
+            .set<Expand>({1, 0, 0, 1, 1, 0, 0, 0.5f})
+            .set<ZIndex>({20});
     }
     else if (editor_type == EditorType::Memory)
     {
@@ -3058,12 +2494,12 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         auto badges = world->entity()
         .is_a(UIElement)
         .set<LayoutBox>({LayoutBox::Horizontal, 2.0f})
-        .set<Position, Local>({48.0f, 0.0f})
+        .set<Position, Local>({84.0f, 0.0f})
         .child_of(leaf.target<EditorHeader>());
         
         create_badge(badges, UIElement, "Healthbar", 0x61c300ff);
     }
-    else if (editor_type == EditorType::Embodiment)
+    else if (editor_type == EditorType::InSilicoLab)
     {
         auto grey_bkg = world->entity()
         .is_a(UIElement)
@@ -3081,17 +2517,10 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         .set<Constrain>({true, true})
         .set<ZIndex>({10});
 
-        world->entity()
-        .is_a(UIElement)
-        .set<ImageCreator>({"../assets/mnist_version.png", 1.0f, 1.0f})
-        // .set<Align>({-0.5f, -0.5f, 1.0f, 0.0f})
-        .set<ZIndex>({15})
-        .child_of(grey_bkg);
-
         auto badges = world->entity()
         .is_a(UIElement)
         .set<LayoutBox>({LayoutBox::Horizontal, 2.0f})
-        .set<Position, Local>({48.0f, 0.0f})
+        .set<Position, Local>({84.0f, 0.0f})
         .child_of(leaf.target<EditorHeader>());
         
         
@@ -3102,8 +2531,50 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         // create_badge(badges, UIElement, "Physical", 0x619393ff);
         
     }
+    else if (editor_type == EditorType::Droid)
+    {
+        auto grey_bkg = world->entity()
+        .is_a(UIElement)
+        .set<ZIndex>({9})
+        .set<Expand>({true, 0.0f, 0.0f, 1.0f, true, 0.0f, 0.0f, 1.0f})
+        .set<RectRenderable>({0.0f, 0.0f, false, 0x3b3b3bff})
+        .child_of(leaf.target<EditorCanvas>());
+
+        auto profile = world->entity()
+        .is_a(UIElement)
+        .child_of(leaf.target<EditorCanvas>())
+        .set<ImageCreator>({"../assets/robot.png", 1.0f, 1.0f})
+        .set<Expand>({true, 0.0f, 0.0f, 1.0f, false, 0.0f, 0.0f, 1.0f})
+        .set<Align>({-0.5f, -1.0f, 0.5f, 1.0f})
+        .set<Constrain>({true, true})
+        .set<ZIndex>({10});
+
+        world->entity()
+        .is_a(UIElement)
+        .set<ImageCreator>({"../assets/mnist_version.png", 1.0f, 1.0f})
+        // .set<Align>({-0.5f, -0.5f, 1.0f, 0.0f})
+        .set<ZIndex>({15})
+        .child_of(grey_bkg);
+
+        auto badges = world->entity()
+        .is_a(UIElement)
+        .set<LayoutBox>({LayoutBox::Horizontal, 2.0f})
+        .set<Position, Local>({84.0f, 0.0f})
+        .child_of(leaf.target<EditorHeader>());
+
+
+        // create_badge(badges, UIElement, "Heonae", 0xff75baff, false, false, {}, {0}, {"H"}, {0xff75baff});
+        create_badge(badges, UIElement, "Aeri Peach", 0xe66c25ff, false, false, {}, {0}, {"A"}, {0xe66c25ff});
+        create_badge(badges, UIElement, "Physical", 0x619393ff);
+        
+    }
     else if (editor_type == EditorType::ImaginaryInterlocutor)
     {
+        // TODO: Message text size...
+        state.options.push_back({"Show Messages", true, "Show messages as generically dependent continuants"});
+        state.options.push_back({"Show Interpretations", true, "Show in-situ entity/relationship badges"});
+        state.options.push_back({"Show BFO", true, "Show basic formal ontology annotation sprites"});
+        
         auto canvas = leaf.target<EditorCanvas>();
 
         auto chat_root = world->entity()
@@ -3146,7 +2617,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
             // .add<DebugRenderBounds>()
             .child_of(input_panel)
             .set<Position, Local>({8.0f, 8.0f})
-            .set<TextRenderable>({"", "Inter", 16.0f, 0xFFFFFFFF})
+            .set<TextRenderable>({"", "JetBrainsMono", 16.0f, 0xFFFFFFFF})
             .set<ZIndex>({12});
 
         auto message_list = world->entity()
@@ -3154,6 +2625,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
             .child_of(messages_panel)
             .add(flecs::OrderedChildren)
             .set<Position, Local>({12.0f, 16.0f})
+            .add<DebugRenderBounds>()
             .set<LayoutBox>({LayoutBox::Vertical, 4.0f, 1.0f})
             .set<Expand>({true, 0.0f, 0.0f, 1.0f, false, 0.0f, 0.0f, 0.0f});
 
@@ -3167,6 +2639,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         .set<LayoutBox>({LayoutBox::Horizontal, 2.0f})
         .add(flecs::OrderedChildren)
         // .add<DebugRenderBounds>()
+        .set<Align>({-1.0f, 0.0f, 0.98, 0.0f})
         .child_of(message_list);
 
         auto black_bkg = world->entity()
@@ -3177,8 +2650,8 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         .child_of(leaf.target<EditorCanvas>());
         
         create_badge(meta_input, UIElement, "Wesley", 0x6df0ffff, false, false, {}, {0}, {"W"}, {0x6df0ffff});
-
         create_badge(meta_input, UIElement, "advises", 0xa34d1aff, false, true);
+        create_badge(meta_input, UIElement, "Heonae", 0xff75baff, false, false, {}, {0}, {"H"}, {0xff75baff});
 
 
 
@@ -3232,7 +2705,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         auto badges = world->entity()
         .is_a(UIElement)
         .set<LayoutBox>({LayoutBox::Horizontal, 2.0f})
-        .set<Position, Local>({48.0f, 0.0f})
+        .set<Position, Local>({84.0f, 0.0f})
         .child_of(leaf.target<EditorHeader>());
 
         create_badge(badges, UIElement, "System", 0x1361b0ff, false);
@@ -3301,10 +2774,13 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
     }
     else if (editor_type == EditorType::VNCStream)
     {
+        state.options.push_back({"Passthrough Keyboard", true, "Keys pressed in Thornfield are sent to the VNC Stream"});
+        state.options.push_back({"Passthrough Mouse", true, "Mouse events in Thornfield are sent to the VNC Stream"});
+
         auto badges = world->entity()
         .is_a(UIElement)
         .set<LayoutBox>({LayoutBox::Horizontal, 2.0f})
-        .set<Position, Local>({48.0f, 0.0f})
+        .set<Position, Local>({84.0f, 0.0f})
         .child_of(leaf.target<EditorHeader>());
 
         create_badge(badges, UIElement, "Docker", 0x1d60e6ff);
@@ -3313,6 +2789,8 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         create_badge(badges, UIElement, "5901", 0xf64242ff, true);
         create_badge(badges, UIElement, "Kubuntu", 0xe2521fff);
         create_badge(badges, UIElement, "22.04", 0xe2521fff, true);
+        // flecs::entity capture = create_badge(badges, UIElement, "Capture", 0x888888ff, false, {}, {}, {"checkbox"});
+        
 
         const char* vnc_host = getenv("VNC_SERVER_HOST");
         if (!vnc_host) {
@@ -3324,7 +2802,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         int port = 5901;
         std::string host_string = std::string(vnc_host) + ":" + std::to_string(port);
 
-        VNCData data = get_vnc_source(vnc_host, port);
+        VNCData data = get_vnc_source(leaf, vnc_host, port);
         // const VNCClient* vncClient = vncStreamSource.try_get<VNCClient>();
 
         flecs::entity vnc_active_outline_indicator = world->entity()
@@ -3355,7 +2833,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         auto badges = world->entity()
         .is_a(UIElement)
         .set<LayoutBox>({LayoutBox::Horizontal, 2.0f})
-        .set<Position, Local>({48.0f, 0.0f})
+        .set<Position, Local>({84.0f, 0.0f})
         .child_of(leaf.target<EditorHeader>());
 
         auto messageBfoSprite = world->entity()
@@ -3484,7 +2962,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         for (size_t i = 0; i < 12; i++)
         {
             // TODO: Interface/method to convert an ordinary event channel to a frame/melspec stream...
-            world->entity()
+            flecs::entity channel = world->entity()
                 .is_a(UIElement)
                 .child_of(channels)
                 .set<RectRenderable>({10.0f, 24.0f, false, i % 2 == 0 ? 0x222327FF : 0x121212FF })
@@ -3492,6 +2970,11 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
                 .add<ScissorContainer>(leaf.target<EditorCanvas>())
                 .add<TimeEventRowChannel>()
                 .set<ZIndex>({12});
+
+            if (i == 0)
+            {
+                create_process_segment(UIElement, leaf, channel, {0, 0});
+            }
         }
             
         // for (size_t i = 0; i < 4; i++)
@@ -3751,16 +3234,7 @@ void drop_callback(GLFWwindow* window, int count, const char** paths)
 {
     // 1. Get cursor state
     flecs::entity glfw_state = world->lookup("GLFWState");
-    if (!glfw_state.is_valid()) {
-        LOG_WARN(LogCategory::SFTP, "File drop ignored - no GLFWState entity");
-        return;
-    }
-
     const CursorState* cursorState = glfw_state.try_get<CursorState>();
-    if (!cursorState) {
-        LOG_WARN(LogCategory::SFTP, "File drop ignored - no cursor state");
-        return;
-    }
 
     // 2. Find VNC panel under mouse
     flecs::entity target_vnc_entity = flecs::entity::null();
@@ -3779,75 +3253,13 @@ void drop_callback(GLFWwindow* window, int count, const char** paths)
         }
     });
 
-    if (!target_vnc_entity.is_valid()) {
-        LOG_INFO(LogCategory::SFTP, "File drop ignored - no VNC panel under mouse");
-        return;
-    }
-
-    // 3. Get/create SFTPClient component
-    SFTPClient& sftp = target_vnc_entity.ensure<SFTPClient>();
-
-    // 4. Initialize worker thread if first time
-    if (!sftp.thread_running) {
-        const VNCClientHandle* handle = target_vnc_entity.try_get<VNCClientHandle>();
-        if (!handle || !*handle) {
-            LOG_ERROR(LogCategory::SFTP, "VNC entity has no VNCClientHandle component");
-            return;
-        }
-        const VNCClient* vnc = handle->get();
-
-        sftp.host = vnc->host;
-        sftp.port = 23;
-        sftp.username = "grok";
-        sftp.password = "GrokValentine42!";
-        sftp.thread_should_stop = false;
-
-        LOG_INFO(LogCategory::SFTP, "Starting SFTP worker thread for {} (SFTPClient at {})", sftp.host, (void*)&sftp);
-        sftp.worker_thread = std::thread(sftp_worker_thread, &sftp);
-
-        LOG_INFO(LogCategory::SFTP, "Started SFTP worker thread for {}", sftp.host);
-    }
-
     // 5. Queue file transfers
     for (int i = 0; i < count; i++) {
         std::string local_path = paths[i];
         std::string filename = local_path.substr(local_path.find_last_of("/\\") + 1);
         std::string remote_path = "/home/grok/Downloads/" + filename;
-
-        // Get file size
-        struct stat st;
-        if (stat(local_path.c_str(), &st) != 0) {
-            LOG_ERROR(LogCategory::SFTP, "Cannot stat file: {}", local_path);
-            continue;
-        }
-
-        FileTransferRequest request;
-        request.local_path = local_path;
-        request.remote_path = remote_path;
-        request.file_size = st.st_size;
-
-        {
-            std::lock_guard<std::mutex> lock(sftp.queue_mutex);
-            sftp.transfer_queue.push_back(request);
-
-            // Initialize progress for first file
-            if (sftp.transfer_queue.size() == 1) {
-                std::lock_guard<std::mutex> plock(sftp.progress_mutex);
-                sftp.current_progress.filename = filename;
-                sftp.current_progress.total_bytes = st.st_size;
-                sftp.current_progress.bytes_transferred = 0;
-                sftp.current_progress.progress_percent = 0.0f;
-                sftp.current_progress.state = FileTransferProgress::IDLE;
-            }
-        }
-        sftp.queue_cv.notify_one();
-
-        LOG_INFO(LogCategory::SFTP, "Queued file transfer: {} -> {} ({} bytes)",
-                 local_path, remote_path, st.st_size);
     }
 
-    // 6. Add tag for rendering system
-    target_vnc_entity.add<HasSFTPTransfer>();
 }
 
 // Track mouse button state for VNC
@@ -3874,10 +3286,22 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
                     .emit();
                 } 
             });
+
+            flecs::query callback_elements = world->query_builder<CallbackOnLeftClick, UIElementBounds>()
+            .build();
+            callback_elements.each([&](flecs::entity ui_element, CallbackOnLeftClick& callback, UIElementBounds& bounds) {
+                if (point_in_bounds(cursor_state->x, cursor_state->y, bounds))
+                {
+                    callback.onClicked(ui_element);
+                } 
+            });
+
             world->event<LeftClickEvent>()
             .id<CursorState>()
             .entity(glfw_state)
             .emit();
+
+
         } else if (action == GLFW_RELEASE)
         {
             world->event<LeftReleaseEvent>()
@@ -4138,8 +3562,6 @@ std::unique_ptr<EditorConfigNode> read_editor_config(std::ifstream& in) {
     return node;
 }
 
-void apply_editor_config(const EditorConfigNode& config, flecs::entity node, flecs::entity UIElement);
-
 void apply_editor_config(const EditorConfigNode& config, flecs::entity node, flecs::entity UIElement) {
     if (config.is_leaf) {
         EditorNodeArea& area = node.ensure<EditorNodeArea>();
@@ -4197,6 +3619,125 @@ bool load_editor_layout(flecs::entity editor_root, flecs::entity UIElement) {
     return true;
 }
 
+flecs::entity create_message(flecs::entity& UIElement, ChatPanel& chat_panel, flecs::entity speaker, std::string message)
+{
+    auto messageBox = world->entity()
+    .is_a(UIElement)
+    .child_of(chat_panel.message_list)
+    // .add<DebugRenderBounds>()
+    .set<LayoutBox>({LayoutBox::Horizontal});
+    
+    // Create the background bubble
+    auto example_message_bkg = world->entity()
+        .is_a(UIElement)
+        .child_of(messageBox) // Attached to the ChatPanel found via query
+        .set<RoundedRectRenderable>({100.0f, 16.0f, 2.0f, false, 0x121212FF})
+    // .set<Expand>({true, 4.0f, 4.0f, 1.0f, false, 0, 0, 0})
+        .set<UIContainer>({8, 6})
+        // .add<DebugRenderBounds>()
+        .set<ZIndex>({15});
+
+        auto message_content = world->entity()
+        .is_a(UIElement)
+        .set<Position, Local>({8, 8})
+        // .child_of(example_message_bkg)
+        .child_of(example_message_bkg)
+        // .add<DebugRenderBounds>()
+        .set<LayoutBox>({LayoutBox::Vertical});
+
+    // Create the text content using the actual draft
+    auto example_message_text = world->entity()
+        .is_a(UIElement)
+        .child_of(message_content)
+        .set<TextRenderable>({message, "JetBrainsMono", 16.0f, 0xFFFFFFFF})
+        .add<DynamicTextWrapContainer>(chat_panel.messages_panel)
+        .set<DynamicTextWrap>({48.0f})
+        .set<ZIndex>({17});
+        
+    if (speaker.name() == "Wesley") // TODO: Obviously...
+    {
+        messageBox.set<Align>({-1.1f, 0.0f, 1.0, 0.0f});
+        // TODO: Set a wraparound width...
+        
+        // I put it outside the message since it is a meta annotation
+        // This might only need to be visible during certain 'entity binding' interface modes...
+        auto messageBfoSprite = world->entity()
+        .is_a(UIElement)
+        .child_of(messageBox)
+        .set<ZIndex>({20})
+        .set<ImageCreator>({"../assets/bfo/generically_dependent_continuant.png", 1.0f, 1.0f});
+        
+    } else if (speaker.name() == "Heonae")
+    {
+        example_message_bkg.set<RoundedRectRenderable>({100.0f, 16.0f, 2.0f, false, 0x12121200});
+    }
+
+    return messageBox;
+}
+
+void interlocutor_response(std::map<std::string, msgpack::object>& res_map)
+{
+    std::string reply = res_map["reply"].as<std::string>();
+    std::cout << reply << std::endl;
+    // TOOD: Include 'context' entity in the function signature of Tradewinds
+    // to get the right panel and interlocutor
+    world->query<ChatPanel>()
+        .each([&](flecs::entity leaf, ChatPanel& chat_panel) {
+            auto UIElement = world->lookup("UIElement");
+            auto messageBox = create_message(UIElement, chat_panel, world->lookup("Heonae"), reply.c_str());
+        });
+}
+
+void sync_representation_grounding(WordAnnotationSelector& selector, flecs::entity container, const std::string& template_str) 
+{
+    container.children([](flecs::entity child) { child.destruct(); });
+
+    selector.selection_entities.clear(); 
+
+    auto tokens = parse_sentence_template(template_str);
+    auto UIElement = world->lookup("UIElement");
+
+    for (const auto& token : tokens)
+    {
+        if (token.type == TokenType::Relationship)
+        {
+            // Triple Blocks have 3 selectable slots: Source, Badge, Target
+            // We need to capture the entities created inside create_triple_block
+            create_triple_block(container, token);
+            
+            // Get the children we just created to fill the selection map
+            // Note: Order matters here! Should match: [Source, Bridge, Target]
+            container.children([&](flecs::entity child) {
+                // The last child added was the 'bridge'
+                // We need to reach into the bridge's 'content' layout to find the 3 parts
+                child.children([&](flecs::entity layout) {
+                    layout.children([&](flecs::entity slot) {
+                        selector.selection_entities.push_back(slot);
+                    });
+                });
+            });
+        }
+        else if (token.type == TokenType::Entity) {
+            uint32_t color = get_entity_color(token.binding_symbol, token.text);
+            flecs::entity badge = create_badge(container, UIElement, token.text.c_str(), color, 
+                         false, false, token.binding_symbol, "", 0, color);
+            
+            selector.selection_entities.push_back(badge);
+        } else {
+            // Plain text
+            flecs::entity text_ent = world->entity().is_a(UIElement).child_of(container)
+                .set<TextRenderable>({token.text.c_str(), "CharisSIL", 16.0f, 0x777777FF})
+                .set<ZIndex>({17});
+                
+            selector.selection_entities.push_back(text_ent);
+        }
+    }
+    
+    selector.token_count = selector.selection_entities.size();
+    selector.dirty = true; // Force bounds recalculation
+}
+
+// TODO: The key callback needs to be refactored to callback functions or observers with semantic description
 static void key_callback(GLFWwindow* window, int key, int scancode, int action, int mods)
 {
     if (action == GLFW_PRESS)
@@ -4559,7 +4100,11 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
         {
             bool handled = false;
             annotation_query.each([&](flecs::entity e, WordAnnotationSelector& selector) {
+                    std::cout << "Selector active " << selector.active << std::endl;
+                    std::cout << selector.sentence_template << selector.active << std::endl;
+
                 if (selector.active && !selector.sentence_template.empty()) {
+                    std::cout << "Token parser" << std::endl;
                     auto tokens = parse_sentence_template(selector.sentence_template);
                     if (tokens.empty()) return;
 
@@ -4881,141 +4426,52 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                 .each([&](flecs::entity leaf, ChatPanel& chat_panel) {
 
                     auto UIElement = world->lookup("UIElement");
+                    auto messageBox = create_message(UIElement, chat_panel, world->lookup("Wesley"), chat->draft.c_str());
+                    
+                    // The interlocutor client might have some submodel dependencies...
+                    // which might be logical to run on another server because other parts of Thornfield depend on it
 
-                    auto messageBox = world->entity()
-                    .is_a(UIElement)
-                    .child_of(chat_panel.message_list)
-                    .set<LayoutBox>({LayoutBox::Horizontal});
+                    auto i_client = world->lookup("InterlocutorClient");
+                    i_client.set<SendMapRequest>({ { {"type", "message"}, {"content", chat->draft} } });
+                    i_client.set<AwaitResponse>({interlocutor_response});
+                    
+                    // TODO: Create thinking indicators...
 
-                    // Create the background bubble
-                    auto example_message_bkg = world->entity()
+                    auto representation_ux = world->entity()
                         .is_a(UIElement)
-                        .child_of(messageBox) // Attached to the ChatPanel found via query
-                        .set<RoundedRectRenderable>({100.0f, 16.0f, 2.0f, false, 0x121212FF})
-                        // .set<Expand>({true, 4.0f, 4.0f, 1.0f, false, 0, 0, 0})
-                        .set<UIContainer>({8, 6})
-                        // .add<DebugRenderBounds>()
-                        .set<ZIndex>({15});
+                        .add<DebugRenderBounds>()
+                        .set<FlowLayoutBox>({0.0f, 0.0f, 2.0f, 0.0f, 2.0f})
+                        .set<Expand>({true, 0, 0, 1, false, 0, 0, 0})
+                        .add(flecs::OrderedChildren)
+                        .child_of(chat_panel.message_list);
 
-                        auto message_content = world->entity()
-                        .is_a(UIElement)
-                        .set<Position, Local>({8, 8})
-                        // .child_of(example_message_bkg)
-                        .child_of(example_message_bkg)
-                        // .add<DebugRenderBounds>()
-                        .set<LayoutBox>({LayoutBox::Vertical});
-
-                    // Create the text content using the actual draft
-                    auto example_message_text = world->entity()
-                        .is_a(UIElement)
-                        .child_of(message_content)
-                        .set<TextRenderable>({chat->draft.c_str(), "Inter", 16.0f, 0xFFFFFFFF})
-                        .add<DynamicTextWrapContainer>(chat_panel.messages_panel)
-                        .set<DynamicTextWrap>({48.0f})
-                        .set<ZIndex>({17});
-                    // TODO: Set a wraparound width...
-
-                    // I put it outside the message since it is a meta annotation
-                    // This might only need to be visible during certain 'entity binding' interface modes...
-                    auto messageBfoSprite = world->entity()
-                    .is_a(UIElement)
-                    .child_of(messageBox)
-                    .set<ZIndex>({20})
-                    .set<ImageCreator>({"../assets/bfo/generically_dependent_continuant.png", 1.0f, 1.0f});
-
-                    // Run interpretation async - badges will be created when it completes
-                    auto pending = std::make_shared<PendingInterpretation>();
-                    pending->draft = chat->draft;
-                    pending->message_list = chat_panel.message_list;
-
-                    {
-                        std::lock_guard<std::mutex> lock(pending_interpretations_mutex);
-                        pending_interpretations.push_back(pending);
-                    }
-
-                    // Capture known entities for context
-                    std::string context_json;
-                    {
-                        std::lock_guard<std::mutex> lock(known_entities_mutex);
-                        json entities_array = json::array();
-                        // TODO: Consider a simplified in-place representation
-                        for (const auto& entity : known_entities) {
-                            entities_array.push_back({
-                                {"id", entity.id},
-                                {"label", entity.label},
-                                {"color", entity.color},
-                                {"display_symbol", entity.display_symbol}
-                            });
-                        }
-                        context_json = entities_array.dump();
-                    }
-
-                    // Capture previous sentences for context
-                    std::string sentences_json;
-                    {
-                        std::lock_guard<std::mutex> lock(previous_sentences_mutex);
-                        json sentences_array = json::array();
-                        for (const auto& sentence : previous_sentences) {
-                            sentences_array.push_back(sentence);
-                        }
-                        sentences_json = sentences_array.dump();
-                    }
-
-                    // Add current sentence to previous sentences
-                    {
-                        std::lock_guard<std::mutex> lock(previous_sentences_mutex);
-                        previous_sentences.push_back(pending->draft);
-                        // Keep only the last N sentences
-                        while (previous_sentences.size() > MAX_PREVIOUS_SENTENCES) {
-                            previous_sentences.erase(previous_sentences.begin());
-                        }
-                    }
-
-                    std::thread([pending, context_json, sentences_json]() {
-                        // Escape the draft for shell
-                        std::string escaped_draft;
-                        for (char c : pending->draft) {
-                            if (c == '\'' || c == '\\' || c == '"' || c == '$' || c == '`') {
-                                escaped_draft += '\\';
-                            }
-                            escaped_draft += c;
-                        }
-
-                        // Escape the context JSON for shell
-                        std::string escaped_context;
-                        for (char c : context_json) {
-                            if (c == '\'' || c == '\\' || c == '"' || c == '$' || c == '`') {
-                                escaped_context += '\\';
-                            }
-                            escaped_context += c;
-                        }
-
-                        // Escape the sentences JSON for shell
-                        std::string escaped_sentences;
-                        for (char c : sentences_json) {
-                            if (c == '\'' || c == '\\' || c == '"' || c == '$' || c == '`') {
-                                escaped_sentences += '\\';
-                            }
-                            escaped_sentences += c;
-                        }
+                        // Register message in global list
                         
-                        bool interpret_with_llm = false;
-                        if (interpret_with_llm)
-                        {
-                            std::string cmd = "python3 ../scripts/interpretation.py \"" + escaped_draft + "\" \"" + escaped_context + "\" \"" + escaped_sentences + "\" 2>&1";
-                            FILE* pipe = popen(cmd.c_str(), "r");
-                            if (pipe) {
-                                char buffer[4096];
-                                std::string result;
-                                while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-                                    result += buffer;
-                                }
-                                pclose(pipe);
-                                pending->result = result;
-                            }
-                        }
-                        pending->completed.store(true);
-                    }).detach();
+                        g_annotatable_messages.push_back({chat->draft, representation_ux});
+                        int msg_idx = (int)g_annotatable_messages.size() - 1;
+
+                        flecs::entity interlocutorAnnotator = world->lookup("InterlocutorAnnotator");
+
+                        // TODO: Only set sentence_template?
+                        interlocutorAnnotator.set<WordAnnotationSelector>({
+                            chat->draft,           // sentence_template
+                            {},                       // ui_entities
+                            {},                       // selection_entities
+                            representation_ux,       // parent_entity
+                            0, 0,                     // start_index, end_index
+                            0,                        // token_count
+                            true,                    // active
+                            true,                     // dirty
+                            0x4488FFAA                // highlight_color
+                        })
+                        .set<Position, World>({0, 0})
+                        .set<RectRenderable>({0, 0, false, 0x4488FFAA})
+                        .set<RenderStatus>({true})
+                        .set<ZIndex>({15});
+                        
+                        sync_representation_grounding(interlocutorAnnotator.ensure<WordAnnotationSelector>(), representation_ux, chat->draft);
+
+                    return;
                 });
 
             chat->draft.clear();
@@ -5028,6 +4484,8 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
     static auto vnc_query = world->query<VNCClientHandle>();
     vnc_query.each([&](flecs::entity e, VNCClientHandle& handle) {
         VNCClient& vnc = *handle;
+        PanelState& state = vnc.user_state_leaf.ensure<PanelState>();
+        // TODO: Keyboard passthrough on Leaf State...
         if (vnc.connected && vnc.client && vnc.eventPassthroughEnabled) {
             rfbKeySym keysym = glfw_key_to_rfb_keysym(key, mods);
 
@@ -5086,1261 +4544,6 @@ void trace_pop(const char *file, size_t line, const char *name) {
     }
 }
 
-// Shader sources for 3D plane rendering
-const char* vertexShaderSource = R"(
-#version 330 core
-layout (location = 0) in vec3 aPos;
-layout (location = 1) in vec2 aTexCoord;
-layout (location = 2) in vec3 aBary;
-layout (location = 3) in float aGlow;
-layout (location = 4) in vec2 aCentroidOffset;
-
-out vec2 TexCoord;
-out vec3 Bary;
-out float Glow;
-
-uniform mat4 model;
-uniform mat4 view;
-uniform mat4 projection;
-uniform int glowPass;  // 0 = normal, 1 = outer glow pass
-uniform float glowExpand;  // How much to expand for glow (e.g., 0.015)
-
-void main()
-{
-    vec3 pos = aPos;
-
-    // In glow pass, expand vertices outward from centroid
-    // Glow encoding: 0-2 = normal glow, 10+ = central pulse (10 = start, 12 = fully expanded)
-    if (glowPass == 1 && aGlow > 0.0) {
-        vec2 expandDir = normalize(aCentroidOffset);
-        float expandAmount;
-
-        if (aGlow >= 10.0) {
-            // Central pulse: decode scale and progress
-            // Format: glow = 10.0 + (scale-0.6)*5.0 + progress*0.5
-            float encoded = aGlow - 10.0;
-            float scaleEnc = floor(encoded / 0.5) * 0.5;  // Quantized scale portion
-            float pulseProgress = clamp((encoded - scaleEnc) / 0.5, 0.0, 1.0);
-            float pulseScale = scaleEnc / 5.0 + 0.6;  // Recover 0.6-1.4 range
-
-            // Ease out for smooth deceleration as it expands
-            float easedProgress = 1.0 - (1.0 - pulseProgress) * (1.0 - pulseProgress);
-
-            // Add rotational asymmetry using centroid offset angle
-            float angle = atan(aCentroidOffset.y, aCentroidOffset.x);
-            float wobble = 1.0 + 0.3 * sin(angle * 3.0 + pulseScale * 10.0);  // Asymmetric shape
-
-            expandAmount = glowExpand * pulseScale * 2.0 * easedProgress * 20.0 * wobble;
-        } else {
-            expandAmount = glowExpand * aGlow;
-        }
-        pos.xy += expandDir * expandAmount;
-    }
-
-    gl_Position = projection * view * model * vec4(pos, 1.0);
-    TexCoord = aTexCoord;
-    Bary = aBary;
-    Glow = aGlow;
-}
-)";
-
-const char* fragmentShaderSource = R"(
-#version 330 core
-out vec4 FragColor;
-
-in vec2 TexCoord;
-in vec3 Bary;
-in float Glow;
-
-uniform sampler2D uiTexture;
-uniform int glowPass;  // 0 = normal, 1 = outer glow pass
-uniform float chromaStrength;  // Chromatic aberration intensity
-
-void main()
-{
-    if (glowPass == 1) {
-        // Outer glow pass: soft diffuse glow
-        if (Glow <= 0.0) discard;
-
-        // Distance from center using barycentric (0.33 at center, 0 at edges)
-        float minBary = min(min(Bary.x, Bary.y), Bary.z);
-
-        // Check if this is a central pulse (glow >= 10.0)
-        if (Glow >= 10.0) {
-            // Central pulse with rounded corners - decode scale and progress
-            float encoded = Glow - 10.0;
-            float scaleEnc = floor(encoded / 0.5) * 0.5;
-            float pulseProgress = clamp((encoded - scaleEnc) / 0.5, 0.0, 1.0);
-            float pulseScale = scaleEnc / 5.0 + 0.6;
-
-            // Create rounded corners by using a smooth distance from edges
-            // Transform barycentric to a rounded shape - vary by scale
-            float cornerRadius = 0.1 + pulseScale * 0.1;  // Bigger pulses = rounder corners
-            float smoothEdge = smoothstep(0.0, cornerRadius, minBary);
-
-            // Radial falloff from center for soft edge blur
-            float centerDist = 1.0 - minBary * 3.0;  // 0 at center, 1 at edges
-            float edgeSoftness = 0.3;
-            float radialFalloff = 1.0 - smoothstep(1.0 - edgeSoftness, 1.0, centerDist);
-
-            // Combine rounded corners with radial falloff
-            float shapeMask = smoothEdge * radialFalloff;
-
-            // Intensity fades as pulse expands outward - vary by scale
-            float fadeIntensity = 1.0 - pulseProgress * (0.5 + pulseScale * 0.3);
-            // Add a bright leading edge that travels outward - vary ring width by scale
-            float ringWidth = 0.15 + pulseScale * 0.15;
-            float ringPos = pulseProgress;
-            float normalizedDist = centerDist;
-            float ringIntensity = exp(-pow((normalizedDist - ringPos) / ringWidth, 2.0) * 2.0);
-
-            float glowIntensity = (fadeIntensity * 0.15 + ringIntensity * 0.3) * shapeMask;
-            glowIntensity *= 0.5;  // Subtle enough to see character beneath
-
-            // Warm shield pulse color (slightly cyan-shifted for energy feel)
-            vec3 glowColor = mix(vec3(1.0, 0.95, 0.7), vec3(0.7, 0.95, 1.0), pulseProgress * 0.3);
-
-            FragColor = vec4(glowColor * glowIntensity, glowIntensity * 0.4);
-        } else {
-            // Normal glow for outer triangles
-            // Soft radial falloff - bright at outer edge, fading inward
-            float edgeness = 1.0 - minBary * 3.0;  // 1 at edges, 0 at center
-
-            // Very gentle cubic falloff for soft blur
-            float t = clamp(edgeness, 0.0, 1.0);
-            float glowIntensity = t * t * (3.0 - 2.0 * t);  // Smooth hermite
-            glowIntensity *= Glow * 0.35;  // Subtle intensity
-
-            // Soft warm yellow glow
-            vec3 glowColor = vec3(1.0, 0.92, 0.6);
-
-            FragColor = vec4(glowColor * glowIntensity, glowIntensity * 0.6);
-        }
-    } else {
-        // Normal pass: render textured triangle
-        // Use transparency for UVs outside the 0-1 range (edge triangles)
-        if (TexCoord.x < 0.0 || TexCoord.x > 1.0 || TexCoord.y < 0.0 || TexCoord.y > 1.0) {
-            FragColor = vec4(0.0, 0.0, 0.0, 0.0);
-        } else {
-            // Chromatic aberration: offset RGB channels radially from center
-            vec2 center = vec2(0.5, 0.5);
-            vec2 dir = TexCoord - center;
-            float dist = length(dir);
-            vec2 offset = dir * chromaStrength * dist;  // Stronger at edges
-
-            // Sample each channel at slightly different positions
-            float r = texture(uiTexture, TexCoord + offset).r;
-            float g = texture(uiTexture, TexCoord).g;
-            float b = texture(uiTexture, TexCoord - offset).b;
-            float a = texture(uiTexture, TexCoord).a;
-
-            FragColor = vec4(r, g, b, a);
-        }
-    }
-}
-)";
-
-// Compile shader helper
-GLuint compileShader(GLenum type, const char* source) {
-    GLuint shader = glCreateShader(type);
-    glShaderSource(shader, 1, &source, NULL);
-    glCompileShader(shader);
-
-    GLint success;
-    glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
-    if (!success) {
-        char infoLog[512];
-        glGetShaderInfoLog(shader, 512, NULL, infoLog);
-        std::cerr << "Shader compilation failed: " << infoLog << std::endl;
-    }
-
-    return shader;
-}
-
-// Helper function to check if a point is inside a triangle using barycentric coordinates
-bool pointInTriangle(float px, float py,
-                     float ax, float ay, float bx, float by, float cx, float cy) {
-    float v0x = cx - ax, v0y = cy - ay;
-    float v1x = bx - ax, v1y = by - ay;
-    float v2x = px - ax, v2y = py - ay;
-
-    float dot00 = v0x * v0x + v0y * v0y;
-    float dot01 = v0x * v1x + v0y * v1y;
-    float dot02 = v0x * v2x + v0y * v2y;
-    float dot11 = v1x * v1x + v1y * v1y;
-    float dot12 = v1x * v2x + v1y * v2y;
-
-    float invDenom = 1.0f / (dot00 * dot11 - dot01 * dot01);
-    float u = (dot11 * dot02 - dot01 * dot12) * invDenom;
-    float v = (dot00 * dot12 - dot01 * dot02) * invDenom;
-
-    return (u >= 0) && (v >= 0) && (u + v <= 1);
-}
-
-// Generate flat triangle grid pattern (alternating up/down triangles)
-// Each triangle has 3 vertices and 1 face
-void generateTriangularGrid(std::vector<float>& vertices, std::vector<unsigned int>& indices,
-                           float width, float height, int subdivisionsX, int subdivisionsY) {
-    vertices.clear();
-    indices.clear();
-
-    int vertexIndex = 0;
-
-    // Calculate triangle dimensions for triangular tiling
-    float triWidth = width / subdivisionsX;
-    float triHeight = triWidth * 0.866025f; // sqrt(3)/2 for equilateral triangles
-
-    // Giant triangle boundary (upward pointing - flat bottom edge, point at top)
-    float triSize = std::min(width, height) * 0.4f;
-    // Snap bottom Y to nearest row boundary for clean flat edge alignment
-    float giantBottomY = -triSize * 0.4f;
-    giantBottomY = floor(giantBottomY / triHeight) * triHeight;  // Snap to grid row
-    float giantTopY = giantBottomY + triSize * 0.866025f;  // Point at top
-    float halfBase = (giantTopY - giantBottomY) / 0.866025f * 0.5f;  // Half base width
-
-    float giantTriAx = -halfBase, giantTriAy = giantBottomY;   // Bottom left (flat edge)
-    float giantTriBx =  halfBase, giantTriBy = giantBottomY;   // Bottom right (flat edge)
-    float giantTriCx =  0.0f,     giantTriCy = giantTopY;      // Top center (point)
-
-    // Adjust number of rows based on height
-    int numRows = (int)(height / triHeight) + 1;
-
-    // Generate triangle tiling pattern
-    for (int row = 0; row < numRows; row++) {
-        // Calculate Y position for this row
-        float rowY = (row * triHeight) - height * 0.5f;
-
-        // Determine if this is an even or odd row (for offset)
-        bool isEvenRow = (row % 2 == 0);
-
-        // Number of triangles in this row (add extra for edge coverage)
-        int numTrisInRow = subdivisionsX * 2 + 2;
-
-        for (int col = -1; col < numTrisInRow; col++) {
-            // Determine if this is an upward or downward pointing triangle
-            bool isUpward = (col % 2 == 0);
-
-            // Calculate base X position (start one column earlier to fill left gap)
-            float baseX = (col * triWidth * 0.5f) - width * 0.5f;
-            if (!isEvenRow) {
-                baseX -= triWidth * 0.25f; // Offset odd rows left to fill gap
-            }
-
-            float x0, x1, x2, y0, y1, y2;
-
-            if (isUpward) {
-                // Upward pointing triangle (△)
-                x0 = baseX;                    // left
-                x1 = baseX + triWidth;         // right
-                x2 = baseX + triWidth * 0.5f;  // top (center)
-
-                y0 = rowY;
-                y1 = rowY;
-                y2 = rowY + triHeight;
-            } else {
-                // Downward pointing triangle (▽)
-                x0 = baseX;                    // left
-                x1 = baseX + triWidth;         // right
-                x2 = baseX + triWidth * 0.5f;  // bottom (center)
-
-                y0 = rowY + triHeight;
-                y1 = rowY + triHeight;
-                y2 = rowY;
-            }
-
-            // Calculate UV coordinates
-            float u0 = (x0 + width * 0.5f) / width;
-            float u1 = (x1 + width * 0.5f) / width;
-            float u2 = (x2 + width * 0.5f) / width;
-
-            float v0 = (y0 + height * 0.5f) / height;
-            float v1 = (y1 + height * 0.5f) / height;
-            float v2 = (y2 + height * 0.5f) / height;
-
-            // Calculate centroid for offset computation
-            float centX = (x0 + x1 + x2) / 3.0f;
-            float centY = (y0 + y1 + y2) / 3.0f;
-
-            // Vertex 0 (barycentric: 1,0,0)
-            vertices.push_back(x0);
-            vertices.push_back(y0);
-            vertices.push_back(0.0f);  // Flat on Z=0
-            vertices.push_back(u0);
-            vertices.push_back(v0);
-            vertices.push_back(1.0f);  // baryX
-            vertices.push_back(0.0f);  // baryY
-            vertices.push_back(0.0f);  // baryZ
-            vertices.push_back(0.0f);  // glow
-            vertices.push_back(x0 - centX);  // offsetX (direction from centroid)
-            vertices.push_back(y0 - centY);  // offsetY
-
-            // Vertex 1 (barycentric: 0,1,0)
-            vertices.push_back(x1);
-            vertices.push_back(y1);
-            vertices.push_back(0.0f);
-            vertices.push_back(u1);
-            vertices.push_back(v1);
-            vertices.push_back(0.0f);  // baryX
-            vertices.push_back(1.0f);  // baryY
-            vertices.push_back(0.0f);  // baryZ
-            vertices.push_back(0.0f);  // glow
-            vertices.push_back(x1 - centX);  // offsetX
-            vertices.push_back(y1 - centY);  // offsetY
-
-            // Vertex 2 (barycentric: 0,0,1)
-            vertices.push_back(x2);
-            vertices.push_back(y2);
-            vertices.push_back(0.0f);
-            vertices.push_back(u2);
-            vertices.push_back(v2);
-            vertices.push_back(0.0f);  // baryX
-            vertices.push_back(0.0f);  // baryY
-            vertices.push_back(1.0f);  // baryZ
-            vertices.push_back(0.0f);  // glow
-            vertices.push_back(x2 - centX);  // offsetX
-            vertices.push_back(y2 - centY);  // offsetY
-
-            // Single triangle face
-            indices.push_back(vertexIndex);
-            indices.push_back(vertexIndex + 1);
-            indices.push_back(vertexIndex + 2);
-
-            vertexIndex += 3; // 3 vertices per triangle
-        }
-    }
-}
-
-// Apply rotation to a point around origin (Rodrigues' rotation formula simplified for unit axis)
-void rotatePoint(float& x, float& y, float& z, float axisX, float axisY, float axisZ, float angle) {
-    float c = cos(angle);
-    float s = sin(angle);
-    float dot = x * axisX + y * axisY + z * axisZ;
-    float crossX = axisY * z - axisZ * y;
-    float crossY = axisZ * x - axisX * z;
-    float crossZ = axisX * y - axisY * x;
-
-    float newX = x * c + crossX * s + axisX * dot * (1 - c);
-    float newY = y * c + crossY * s + axisY * dot * (1 - c);
-    float newZ = z * c + crossZ * s + axisZ * dot * (1 - c);
-
-    x = newX;
-    y = newY;
-    z = newZ;
-}
-
-// Initialize particle animation - FTL deceleration into Thornfield
-// Screen tetrahedrons move with velocities, calculated to collide at their target positions
-void initializeParticles(Graphics& graphics, const std::vector<float>& targetVertices,
-                         float width, float height, float duration = 3.0f) {
-    // Re-seed each time for different pattern on every spawn
-    auto seed = std::chrono::high_resolution_clock::now().time_since_epoch().count();
-    static std::mt19937 gen(seed);
-    gen.seed(seed);
-
-    // Velocity distribution - coming from far away (negative Z) towards camera/grid (positive Z)
-    std::uniform_real_distribution<float> vxDist(-0.3f, 0.3f);   // Small lateral drift
-    std::uniform_real_distribution<float> vyDist(-0.3f, 0.3f);   // Small vertical drift
-    std::uniform_real_distribution<float> vzDist(1.5f, 4.0f);    // Moving towards camera (+Z direction)
-    std::uniform_real_distribution<float> rotAngleDist(0.0f, 2.0f * M_PI);
-    std::uniform_real_distribution<float> axisDist(-1.0f, 1.0f);
-    std::uniform_real_distribution<float> collisionTimeDist(0.2f, 1.0f);  // Central triangle timing (fast)
-    std::uniform_real_distribution<float> outerCollisionTimeDist(1.2f, 2.5f);  // Outer grid delayed
-
-    // Calculate giant triangle bounds (same as in generateTriangularGrid)
-    // Upward pointing - flat bottom edge, point at top
-    float triWidth = width / 160;  // Match subdivisions (80x2)
-    float triHeight = triWidth * 0.866025f;
-    float triSize = std::min(width, height) * 0.4f;
-    float bottomY = -triSize * 0.4f;
-    bottomY = floor(bottomY / triHeight) * triHeight;
-    float topY = bottomY + triSize * 0.866025f;
-    float halfBase = (topY - bottomY) / 0.866025f * 0.5f;
-    float giantTriAx = -halfBase, giantTriAy = bottomY;   // Bottom left (flat edge)
-    float giantTriBx =  halfBase, giantTriBy = bottomY;   // Bottom right (flat edge)
-    float giantTriCx =  0.0f,     giantTriCy = topY;      // Top center (point)
-
-    graphics.particles.clear();
-    graphics.gridVertices = targetVertices;
-
-    // Each vertex has 11 floats: x, y, z, u, v, baryX, baryY, baryZ, glow, offsetX, offsetY
-    int numVertices = targetVertices.size() / 11;
-    // 3 vertices per triangle
-    int numTriangles = numVertices / 3;
-
-    for (int t = 0; t < numTriangles; t++) {
-        // Calculate triangle's centroid and find min Y vertex
-        float centroidX = 0, centroidY = 0, centroidZ = 0;
-        float minVertY = 1e10f;
-        for (int v = 0; v < 3; v++) {
-            int i = t * 3 + v;
-            float vy = targetVertices[i * 11 + 1];
-            centroidX += targetVertices[i * 11 + 0];
-            centroidY += vy;
-            centroidZ += targetVertices[i * 11 + 2];
-            minVertY = std::min(minVertY, vy);
-        }
-        centroidX /= 3.0f;
-        centroidY /= 3.0f;
-        centroidZ /= 3.0f;
-
-        // Check if this triangle is inside the central giant triangle
-        bool isInCentralTriangle = pointInTriangle(centroidX, centroidY,
-                                                    giantTriAx, giantTriAy,
-                                                    giantTriBx, giantTriBy,
-                                                    giantTriCx, giantTriCy);
-
-        // Exclude downward-pointing triangles at the bottom edge (they have points, not flat edges)
-        // Downward triangles have centroid above their minimum Y vertex
-        bool isDownwardPointing = (centroidY > minVertY + triHeight * 0.2f);
-        bool isAtBottomEdge = (minVertY < bottomY + triHeight * 0.5f);
-        if (isInCentralTriangle && isDownwardPointing && isAtBottomEdge) {
-            isInCentralTriangle = false;  // Exclude from central triangle
-        }
-
-        // Calculate collision time based on position
-        float collisionTime;
-        float vx, vy, vz;
-
-        if (isInCentralTriangle) {
-            // Central triangle loads first with random timing
-            collisionTime = collisionTimeDist(gen);
-            // Random velocity for central triangles
-            vx = vxDist(gen);
-            vy = vyDist(gen);
-            vz = vzDist(gen);
-        } else {
-            // Outer triangles (torus/thorns) stay stable until central triangle forms
-            // Then "wither away" - triangles near center extract first like decay/fire
-
-            float distFromCenter = sqrt(centroidX * centroidX + centroidY * centroidY);
-            float maxDist = sqrt(width * width + height * height) * 0.5f;  // Half diagonal
-            float normalizedDist = std::min(distFromCenter / maxDist, 1.0f);
-
-            // Withering timing: wait for central triangle to form (1.5s), then decay
-            // Closer to center = extract sooner (inverse of before)
-            // Narrow time window (0.8s) for gradual peeling effect
-            float witherStart = 1.5f;  // Start after central triangle is mostly formed
-            float witherDuration = 0.8f;  // Narrow window for decay effect
-
-            // Invert: closer triangles (low normalizedDist) wither first
-            float witherOrder = 1.0f - normalizedDist;
-
-            std::uniform_real_distribution<float> jitterDist(-0.05f, 0.05f);
-            float baseTime = witherStart + witherOrder * witherDuration;
-            collisionTime = baseTime + jitterDist(gen);
-
-            // Calculate spawn position on thorny stem torus around central triangle
-            // Triangles cluster at discrete thorn positions to form visible spikes
-
-            // Torus parameters
-            float majorRadius = width * 0.7f;   // Main ring radius
-            float minorRadius = height * 0.1f;  // Stem tube thickness
-
-            // Number of thorns around the torus
-            int numThorns = 16;
-
-            // Decide if this triangle is part of stem or a thorn
-            std::uniform_real_distribution<float> partDist(0.0f, 1.0f);
-            bool isStem = partDist(gen) < 0.25f;  // 25% form the stem, 75% form thorns
-
-            float torusX, torusY, torusZ;
-
-            if (isStem) {
-                // Stem triangles - distributed along the torus surface
-                std::uniform_real_distribution<float> uDist(0.0f, 2.0f * M_PI);
-                std::uniform_real_distribution<float> vDist(0.0f, 2.0f * M_PI);
-                float u = uDist(gen);
-                float v = vDist(gen);
-
-                torusX = (majorRadius + minorRadius * cos(v)) * cos(u);
-                torusY = (majorRadius + minorRadius * cos(v)) * sin(u);
-                torusZ = minorRadius * sin(v);
-            } else {
-                // Thorn triangles - cluster at discrete thorn positions
-                std::uniform_real_distribution<float> thornIndexDist(0.0f, (float)numThorns);
-                int thornIndex = (int)thornIndexDist(gen);
-
-                // Various thorn sizes - some small, some large
-                std::uniform_real_distribution<float> thornSizeDist(0.1f, 0.35f);
-                float thornLength = thornSizeDist(gen) * height;
-
-                // Thorn profile: 0 = spikey isosceles, 1 = fat equilateral
-                std::uniform_real_distribution<float> profileDist(0.0f, 1.0f);
-                float thornProfile = profileDist(gen);
-
-                // Position around main ring for this thorn
-                float u = (thornIndex / (float)numThorns) * 2.0f * M_PI;
-
-                // Each thorn has a fixed outward direction (v angle)
-                std::uniform_real_distribution<float> vVariation(-0.2f, 0.2f);
-                float v = (thornIndex % 6) * (M_PI / 3.0f) + vVariation(gen);  // 6 directions
-
-                // Base position on torus surface
-                float baseX = (majorRadius + minorRadius * cos(v)) * cos(u);
-                float baseY = (majorRadius + minorRadius * cos(v)) * sin(u);
-                float baseZ = minorRadius * sin(v);
-
-                // Thorn direction (outward from tube surface)
-                float thornDirX = cos(v) * cos(u);
-                float thornDirY = cos(v) * sin(u);
-                float thornDirZ = sin(v);
-
-                // Position along the thorn (0 = base, 1 = tip)
-                std::uniform_real_distribution<float> alongThorn(0.0f, 1.0f);
-                float tPos = alongThorn(gen);
-
-                // Thorn profile affects spread vs length ratio
-                // Spikey (profile=0): narrow spread, elongated
-                // Equilateral (profile=1): wide spread, shorter effective length
-                float baseSpread = 0.03f + thornProfile * 0.12f;  // 0.03 to 0.15
-                float lengthScale = 1.0f - thornProfile * 0.4f;   // 1.0 to 0.6
-                thornLength *= lengthScale;
-
-                // Thorn tapers - spread decreases toward tip (more dramatic for spikey)
-                float taperPower = 1.0f + (1.0f - thornProfile) * 1.5f;  // 1.0 to 2.5
-                float spread = pow(1.0f - tPos, taperPower) * baseSpread * height;
-                std::uniform_real_distribution<float> spreadDist(-1.0f, 1.0f);
-
-                // Calculate perpendicular directions for spread
-                float perpX1 = -sin(u);
-                float perpY1 = cos(u);
-                float perpZ1 = 0.0f;
-                float perpX2 = thornDirY * perpZ1 - thornDirZ * perpY1;
-                float perpY2 = thornDirZ * perpX1 - thornDirX * perpZ1;
-                float perpZ2 = thornDirX * perpY1 - thornDirY * perpX1;
-
-                float spreadOffset1 = spreadDist(gen) * spread;
-                float spreadOffset2 = spreadDist(gen) * spread;
-
-                torusX = baseX + thornDirX * tPos * thornLength + perpX1 * spreadOffset1 + perpX2 * spreadOffset2;
-                torusY = baseY + thornDirY * tPos * thornLength + perpY1 * spreadOffset1 + perpY2 * spreadOffset2;
-                torusZ = baseZ + thornDirZ * tPos * thornLength + perpZ1 * spreadOffset1 + perpZ2 * spreadOffset2;
-            }
-
-            // Tilt the torus around the X-axis (planetary ring angle)
-            float tiltAngle = -0.45f;  // About 25 degrees
-            float cosT = cos(tiltAngle);
-            float sinT = sin(tiltAngle);
-            float arcX = torusX;
-            float arcY = torusY * cosT - torusZ * sinT;
-            float arcZ = torusY * sinT + torusZ * cosT;
-
-            // Offset to position the ring
-            arcY += height * 0.15f;
-
-            // Z position - push spawn further back
-            float spawnZ = arcZ - 4.0f;
-
-            // Calculate velocity to travel from arc spawn to target in collision time
-            vx = (centroidX - arcX) / collisionTime;
-            vy = (centroidY - arcY) / collisionTime;
-            vz = (0.0f - spawnZ) / collisionTime;  // Target Z is 0
-        }
-
-        // Random rotation axis (normalized) for initial orientation
-        float axisX = axisDist(gen);
-        float axisY = axisDist(gen);
-        float axisZ = axisDist(gen);
-        float axisLen = sqrt(axisX*axisX + axisY*axisY + axisZ*axisZ);
-        if (axisLen > 0.001f) {
-            axisX /= axisLen;
-            axisY /= axisLen;
-            axisZ /= axisLen;
-        } else {
-            axisX = 0; axisY = 0; axisZ = 1;
-        }
-        float rotAngle = rotAngleDist(gen);
-
-        // Apply to all 3 vertices of this triangle
-        for (int v = 0; v < 3; v++) {
-            int i = t * 3 + v;
-            TriangleParticle p;
-
-            // Target position from grid (where it will collide)
-            p.targetX = targetVertices[i * 11 + 0];
-            p.targetY = targetVertices[i * 11 + 1];
-            p.targetZ = targetVertices[i * 11 + 2];
-
-            // Local offset from centroid (maintains triangle shape)
-            float localX = p.targetX - centroidX;
-            float localY = p.targetY - centroidY;
-            float localZ = p.targetZ - centroidZ;
-
-            // Apply random rotation to local offset (tumbling debris orientation)
-            rotatePoint(localX, localY, localZ, axisX, axisY, axisZ, rotAngle);
-
-            // Store rotated local offset (for maintaining shape during flight)
-            p.localX = localX;
-            p.localY = localY;
-            p.localZ = localZ;
-
-            // Velocity (same for all vertices of this triangle)
-            p.vx = vx;
-            p.vy = vy;
-            p.vz = vz;
-
-            // Collision time
-            p.collisionTime = collisionTime;
-
-            // UVs don't animate
-            p.u = targetVertices[i * 11 + 3];
-            p.v = targetVertices[i * 11 + 4];
-
-            // Barycentric coordinates (from grid generation)
-            p.baryX = targetVertices[i * 11 + 5];
-            p.baryY = targetVertices[i * 11 + 6];
-            p.baryZ = targetVertices[i * 11 + 7];
-
-            p.elapsedTime = 0.0f;
-            p.hitTime = -1.0f;  // Not hit yet
-            p.vertexIndex = i;
-            p.locked = false;
-            p.isCentral = isInCentralTriangle;
-
-            // Pulse variation based on debris velocity magnitude and rotation
-            float velocityMag = sqrt(vx*vx + vy*vy + vz*vz);
-            p.pulseScale = 0.6f + (velocityMag / 4.0f) * 0.8f;  // Faster debris = bigger pulse
-            p.pulseScale = std::min(p.pulseScale, 1.4f);
-            p.pulseRotation = rotAngle;  // Use debris rotation for pulse asymmetry
-
-            graphics.particles.push_back(p);
-        }
-    }
-}
-
-// Update particle positions based on velocity trajectories toward collision points
-void updateParticles(Graphics& graphics, float deltaTime) {
-    for (auto& p : graphics.particles) {
-        p.elapsedTime += deltaTime;
-
-        float x, y, z;
-        float glow = 0.0f;
-
-        if (p.locked || p.elapsedTime >= p.collisionTime) {
-            // Track first hit time for glow effect
-            if (!p.locked) {
-                p.hitTime = p.elapsedTime;
-            }
-            p.locked = true;
-
-            // Time since impact
-            float timeSinceHit = p.elapsedTime - p.hitTime;
-
-            // Impact overshoot effect - deflects backward then bounces back
-            // Central triangles have stronger overshoot (debris impact on shield)
-            float overshootAmount = p.isCentral ? 0.425f : 0.112f;
-            float overshootDuration = p.isCentral ? 1.0f : 0.48f;
-            float overshootZ = 0.0f;
-
-            if (timeSinceHit < overshootDuration) {
-                // Damped spring oscillation for bounce-back effect
-                // z(t) = A * sin(ωt) * e^(-bt) where ω gives ~1.5 oscillations
-                float t = timeSinceHit / overshootDuration;
-                float omega = 4.5f * M_PI;  // ~1.5 oscillations
-                float damping = 4.0f;
-                overshootZ = overshootAmount * sin(omega * t) * exp(-damping * t);
-            }
-
-            // Position with overshoot (negative Z = pushed back toward viewer)
-            x = p.targetX;
-            y = p.targetY;
-            z = p.targetZ - overshootZ;
-
-            // Compute glow based on triangle type
-            if (p.isCentral) {
-                // Central pulse: encode scale and progress in glow value
-                // Format: glow = 10.0 + (scale-0.6)*5.0 + progress*0.5
-                // Scale range 0.6-1.4 -> 0-4, progress 0-1 -> 0-0.5
-                // Total range: 10.0 to 14.5
-                float pulseDuration = 0.8f;
-                if (timeSinceHit < pulseDuration) {
-                    float pulseProgress = timeSinceHit / pulseDuration;
-                    float scaleEnc = (p.pulseScale - 0.6f) * 5.0f;  // 0-4
-                    glow = 10.0f + scaleEnc + pulseProgress * 0.5f;
-                } else {
-                    glow = 0.0f;  // Pulse complete
-                }
-            } else {
-                // Normal glow for outer triangles
-                // float glowDuration = 0.8f;
-                // if (timeSinceHit < glowDuration) {
-                //     glow = exp(-3.0f * timeSinceHit / glowDuration);
-                // }
-                glow = 0.0f;
-                // float pulseDuration = 0.1f;
-                // if (timeSinceHit < pulseDuration) {
-                //     float pulseProgress = timeSinceHit / pulseDuration;
-                //     float scaleEnc = (p.pulseScale - 0.6f) * 1.0f;  // 0-4
-                //     glow = 30.0f + scaleEnc + pulseProgress * 0.5f;
-                // } else {
-                //     glow = 0.0f;  // Pulse complete
-                // }
-                float glowDuration = 0.5f;
-                glow = exp(-5.0f * timeSinceHit / glowDuration);
-
-            }
-        } else {
-            // Flying towards collision point along velocity trajectory
-            float timeToCollision = p.collisionTime - p.elapsedTime;
-            float t = p.elapsedTime / p.collisionTime;  // 0 at start, 1 at collision
-
-            // Centroid follows trajectory: starts far, arrives at target centroid
-            float centroidX = p.targetX - p.vx * timeToCollision;
-            float centroidY = p.targetY - p.vy * timeToCollision;
-            float centroidZ = p.targetZ - p.vz * timeToCollision;
-
-            // Rotated local offset blends out as we approach collision (tumbling -> aligned)
-            float localBlend = 1.0f - t;
-            x = centroidX + p.localX * localBlend;
-            y = centroidY + p.localY * localBlend;
-            z = centroidZ + p.localZ * localBlend;
-        }
-
-        // Update in grid vertices buffer (11 floats per vertex: x,y,z, u,v, baryX,baryY,baryZ, glow, offsetX,offsetY)
-        int offset = p.vertexIndex * 11;
-        graphics.gridVertices[offset + 0] = x;
-        graphics.gridVertices[offset + 1] = y;
-        graphics.gridVertices[offset + 2] = z;
-        // UV (3,4) and barycentric (5,6,7) stay the same
-        graphics.gridVertices[offset + 8] = glow;
-    }
-}
-
-// Upload updated vertices to GPU
-void uploadParticleVertices(Graphics& graphics) {
-    glBindBuffer(GL_ARRAY_BUFFER, graphics.gridVBO);
-    glBufferSubData(GL_ARRAY_BUFFER, 0, graphics.gridVertices.size() * sizeof(float), graphics.gridVertices.data());
-    glBindBuffer(GL_ARRAY_BUFFER, 0);
-}
-
-// Initialize noise tetrahedrons - grey debris all around (we've just hit the debris field)
-void initializeNoiseTetrahedrons(Graphics& graphics, int count = 300) {
-    static std::random_device rd;
-    static std::mt19937 gen(rd());
-    // Spread debris all around in 3D space
-    std::uniform_real_distribution<float> xDist(-8.0f, 8.0f);
-    std::uniform_real_distribution<float> yDist(-6.0f, 6.0f);
-    std::uniform_real_distribution<float> zDistFar(-15.0f, -3.0f);   // Far debris field
-    std::uniform_real_distribution<float> zDistNear(-3.0f, 2.0f);    // Near-camera debris (passes through early)
-    std::uniform_real_distribution<float> velocityDist(4.0f, 10.0f);  // FTL speeds
-    std::uniform_real_distribution<float> scaleDist(0.015f, 0.06f);
-    std::uniform_real_distribution<float> axisDist(-1.0f, 1.0f);
-    std::uniform_real_distribution<float> angleDist(0.0f, 2.0f * M_PI);
-
-    // Initialize FTL deceleration state
-    graphics.decelerationTime = 0.0f;
-    graphics.decelerationDuration = 5.0f;  // 5 seconds to decelerate
-
-    graphics.noiseParticles.clear();
-    graphics.noiseParticles.reserve(count);
-
-    // Spawn 40% of particles near the camera so they pass through early
-    int nearCount = count * 4 / 10;
-
-    for (int i = 0; i < count; i++) {
-        NoiseTetrahedron n;
-        // Distribute throughout 3D space around the viewer
-        n.x = xDist(gen);
-        n.y = yDist(gen);
-        // Near particles pass through camera area early, before screen forms
-        n.z = (i < nearCount) ? zDistNear(gen) : zDistFar(gen);
-        n.vz = velocityDist(gen);
-        n.scale = scaleDist(gen);
-
-        // Random rotation axis (normalized)
-        n.axisX = axisDist(gen);
-        n.axisY = axisDist(gen);
-        n.axisZ = axisDist(gen);
-        float axisLen = sqrt(n.axisX*n.axisX + n.axisY*n.axisY + n.axisZ*n.axisZ);
-        if (axisLen > 0.001f) {
-            n.axisX /= axisLen;
-            n.axisY /= axisLen;
-            n.axisZ /= axisLen;
-        } else {
-            n.axisX = 0; n.axisY = 0; n.axisZ = 1;
-        }
-        n.rotAngle = angleDist(gen);
-
-        graphics.noiseParticles.push_back(n);
-    }
-
-    // Pre-allocate vertex buffer (4 verts * 5 floats per tetrahedron)
-    graphics.noiseVertices.resize(count * 4 * 5);
-    graphics.noiseVertexCount = count * 12; // 4 faces * 3 indices
-}
-
-// Respawn a noise tetrahedron at far distance
-void respawnNoiseTetrahedron(NoiseTetrahedron& n) {
-    static std::random_device rd;
-    static std::mt19937 gen(rd());
-    std::uniform_real_distribution<float> xDist(-8.0f, 8.0f);
-    std::uniform_real_distribution<float> yDist(-6.0f, 6.0f);
-    std::uniform_real_distribution<float> velocityDist(4.0f, 10.0f);
-    std::uniform_real_distribution<float> scaleDist(0.015f, 0.06f);
-    std::uniform_real_distribution<float> axisDist(-1.0f, 1.0f);
-    std::uniform_real_distribution<float> angleDist(0.0f, 2.0f * M_PI);
-
-    n.x = xDist(gen);
-    n.y = yDist(gen);
-    n.z = -20.0f;  // Respawn far away
-    n.vz = velocityDist(gen);
-    n.scale = scaleDist(gen);
-
-    // New random rotation
-    n.axisX = axisDist(gen);
-    n.axisY = axisDist(gen);
-    n.axisZ = axisDist(gen);
-    float axisLen = sqrt(n.axisX*n.axisX + n.axisY*n.axisY + n.axisZ*n.axisZ);
-    if (axisLen > 0.001f) {
-        n.axisX /= axisLen;
-        n.axisY /= axisLen;
-        n.axisZ /= axisLen;
-    } else {
-        n.axisX = 0; n.axisY = 0; n.axisZ = 1;
-    }
-    n.rotAngle = angleDist(gen);
-}
-
-// Update noise tetrahedrons - move towards camera with FTL deceleration
-void updateNoiseTetrahedrons(Graphics& graphics, float deltaTime) {
-    // Update deceleration time
-    graphics.decelerationTime += deltaTime;
-
-    // Calculate deceleration factor: starts at 1.0 (full speed), decays towards 0.1 (crawl)
-    float t = std::min(graphics.decelerationTime / graphics.decelerationDuration, 1.0f);
-    // Exponential decay for deceleration feel
-    float speedMultiplier = 0.1f + 0.9f * exp(-3.0f * t);
-
-    for (auto& n : graphics.noiseParticles) {
-        // Apply decelerated velocity
-        n.z += n.vz * speedMultiplier * deltaTime;
-
-        // Respawn if past camera (but only if still decelerating fast enough)
-        if (n.z > 5.0f) {
-            if (speedMultiplier > 0.15f) {
-                respawnNoiseTetrahedron(n);
-            } else {
-                // At near-stop, just keep them drifting slowly past
-                n.z = 5.1f; // Park them just past camera
-            }
-        }
-    }
-}
-
-// Generate vertices for noise tetrahedrons
-void generateNoiseVertices(Graphics& graphics) {
-    int idx = 0;
-    for (const auto& n : graphics.noiseParticles) {
-        float s = n.scale;
-        float h = s * 0.8f;  // Apex height
-
-        // Base triangle vertices (local, centered at origin)
-        float lx0 = -s,    ly0 = -s * 0.577f, lz0 = 0;
-        float lx1 = s,     ly1 = -s * 0.577f, lz1 = 0;
-        float lx2 = 0,     ly2 = s * 1.155f,  lz2 = 0;
-        float lx3 = 0,     ly3 = 0,           lz3 = h;  // Apex
-
-        // Apply rotation to each local vertex
-        rotatePoint(lx0, ly0, lz0, n.axisX, n.axisY, n.axisZ, n.rotAngle);
-        rotatePoint(lx1, ly1, lz1, n.axisX, n.axisY, n.axisZ, n.rotAngle);
-        rotatePoint(lx2, ly2, lz2, n.axisX, n.axisY, n.axisZ, n.rotAngle);
-        rotatePoint(lx3, ly3, lz3, n.axisX, n.axisY, n.axisZ, n.rotAngle);
-
-        // Translate to world position
-        float x0 = n.x + lx0, y0 = n.y + ly0, z0 = n.z + lz0;
-        float x1 = n.x + lx1, y1 = n.y + ly1, z1 = n.z + lz1;
-        float x2 = n.x + lx2, y2 = n.y + ly2, z2 = n.z + lz2;
-        float x3 = n.x + lx3, y3 = n.y + ly3, z3 = n.z + lz3;
-
-        // Grey UV
-        float u = 0.5f, v = 0.5f;
-
-        // Vertex 0
-        graphics.noiseVertices[idx++] = x0;
-        graphics.noiseVertices[idx++] = y0;
-        graphics.noiseVertices[idx++] = z0;
-        graphics.noiseVertices[idx++] = u;
-        graphics.noiseVertices[idx++] = v;
-        // Vertex 1
-        graphics.noiseVertices[idx++] = x1;
-        graphics.noiseVertices[idx++] = y1;
-        graphics.noiseVertices[idx++] = z1;
-        graphics.noiseVertices[idx++] = u;
-        graphics.noiseVertices[idx++] = v;
-        // Vertex 2
-        graphics.noiseVertices[idx++] = x2;
-        graphics.noiseVertices[idx++] = y2;
-        graphics.noiseVertices[idx++] = z2;
-        graphics.noiseVertices[idx++] = u;
-        graphics.noiseVertices[idx++] = v;
-        // Vertex 3 (apex)
-        graphics.noiseVertices[idx++] = x3;
-        graphics.noiseVertices[idx++] = y3;
-        graphics.noiseVertices[idx++] = z3;
-        graphics.noiseVertices[idx++] = u;
-        graphics.noiseVertices[idx++] = v;
-    }
-}
-
-// Upload noise vertices to GPU
-void uploadNoiseVertices(Graphics& graphics) {
-    glBindBuffer(GL_ARRAY_BUFFER, graphics.noiseVBO);
-    glBufferSubData(GL_ARRAY_BUFFER, 0, graphics.noiseVertices.size() * sizeof(float), graphics.noiseVertices.data());
-    glBindBuffer(GL_ARRAY_BUFFER, 0);
-}
-
-// Initialize 3D rendering resources
-void initialize3DRendering(Graphics& graphics, int width, int height) {
-    graphics.uiWidth = width;
-    graphics.uiHeight = height;
-    graphics.tiltAngle = 0.0f;
-
-    // Create framebuffer for UI rendering
-    glGenFramebuffers(1, &graphics.fbo);
-    glBindFramebuffer(GL_FRAMEBUFFER, graphics.fbo);
-
-    // Create texture to render UI to
-    glGenTextures(1, &graphics.fboTexture);
-    glBindTexture(GL_TEXTURE_2D, graphics.fboTexture);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, graphics.fboTexture, 0);
-
-    // Create depth and stencil renderbuffer
-    glGenRenderbuffers(1, &graphics.fboDepthRenderBuffer);
-    glBindRenderbuffer(GL_RENDERBUFFER, graphics.fboDepthRenderBuffer);
-    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, width, height);
-    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, graphics.fboDepthRenderBuffer);
-
-    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
-        std::cerr << "Framebuffer is not complete!" << std::endl;
-    }
-
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-
-    // Create shader program
-    GLuint vertexShader = compileShader(GL_VERTEX_SHADER, vertexShaderSource);
-    GLuint fragmentShader = compileShader(GL_FRAGMENT_SHADER, fragmentShaderSource);
-
-    graphics.shaderProgram = glCreateProgram();
-    glAttachShader(graphics.shaderProgram, vertexShader);
-    glAttachShader(graphics.shaderProgram, fragmentShader);
-    glLinkProgram(graphics.shaderProgram);
-
-    GLint success;
-    glGetProgramiv(graphics.shaderProgram, GL_LINK_STATUS, &success);
-    if (!success) {
-        char infoLog[512];
-        glGetProgramInfoLog(graphics.shaderProgram, 512, NULL, infoLog);
-        std::cerr << "Shader program linking failed: " << infoLog << std::endl;
-    }
-
-    glDeleteShader(vertexShader);
-    glDeleteShader(fragmentShader);
-
-    // Create plane geometry
-    float aspectRatio = (float)width / (float)height;
-    float planeWidth = 2.0f * aspectRatio;
-    float planeHeight = 2.0f;
-
-    float vertices[] = {
-        // positions                              // tex     // bary (unused)   // glow  // centroid offset
-        -planeWidth/2, -planeHeight/2, 0.0f,   0.0f, 0.0f,   0.33f, 0.33f, 0.34f, 0.0f,  0.0f, 0.0f,  // bottom left
-         planeWidth/2, -planeHeight/2, 0.0f,   1.0f, 0.0f,   0.33f, 0.33f, 0.34f, 0.0f,  0.0f, 0.0f,  // bottom right
-         planeWidth/2,  planeHeight/2, 0.0f,   1.0f, 1.0f,   0.33f, 0.33f, 0.34f, 0.0f,  0.0f, 0.0f,  // top right
-        -planeWidth/2,  planeHeight/2, 0.0f,   0.0f, 1.0f,   0.33f, 0.33f, 0.34f, 0.0f,  0.0f, 0.0f   // top left
-    };
-
-    unsigned int indices[] = {
-        0, 1, 2,
-        0, 2, 3
-    };
-
-    glGenVertexArrays(1, &graphics.planeVAO);
-    glGenBuffers(1, &graphics.planeVBO);
-    glGenBuffers(1, &graphics.planeEBO);
-
-    glBindVertexArray(graphics.planeVAO);
-
-    glBindBuffer(GL_ARRAY_BUFFER, graphics.planeVBO);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
-
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, graphics.planeEBO);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(indices), indices, GL_STATIC_DRAW);
-
-    // Position attribute (location 0)
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 11 * sizeof(float), (void*)0);
-    glEnableVertexAttribArray(0);
-
-    // Texture coord attribute (location 1)
-    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 11 * sizeof(float), (void*)(3 * sizeof(float)));
-    glEnableVertexAttribArray(1);
-
-    // Barycentric coords attribute (location 2)
-    glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, 11 * sizeof(float), (void*)(5 * sizeof(float)));
-    glEnableVertexAttribArray(2);
-
-    // Glow factor attribute (location 3)
-    glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, 11 * sizeof(float), (void*)(8 * sizeof(float)));
-    glEnableVertexAttribArray(3);
-
-    // Centroid offset attribute (location 4)
-    glVertexAttribPointer(4, 2, GL_FLOAT, GL_FALSE, 11 * sizeof(float), (void*)(9 * sizeof(float)));
-    glEnableVertexAttribArray(4);
-
-    glBindVertexArray(0);
-
-    // Create triangular grid geometry (20x20 subdivisions for smooth tessellation)
-    std::vector<float> gridVertices;
-    std::vector<unsigned int> gridIndices;
-    generateTriangularGrid(gridVertices, gridIndices, planeWidth, planeHeight, 80, 80);
-
-    graphics.gridVertexCount = gridIndices.size();
-    graphics.useGridMode = true; // Start with grid mode to show particle animation
-    graphics.gridModeTransitionTimer = 0.0f;
-    graphics.allParticlesLocked = false;
-
-    glGenVertexArrays(1, &graphics.gridVAO);
-    glGenBuffers(1, &graphics.gridVBO);
-    glGenBuffers(1, &graphics.gridEBO);
-
-    glBindVertexArray(graphics.gridVAO);
-
-    // Initialize particles with random positions that will animate to grid
-    initializeParticles(graphics, gridVertices, planeWidth, planeHeight, 3.0f);
-
-    glBindBuffer(GL_ARRAY_BUFFER, graphics.gridVBO);
-    // Use DYNAMIC_DRAW since we'll update vertices each frame during animation
-    glBufferData(GL_ARRAY_BUFFER, graphics.gridVertices.size() * sizeof(float), graphics.gridVertices.data(), GL_DYNAMIC_DRAW);
-
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, graphics.gridEBO);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER, gridIndices.size() * sizeof(unsigned int), gridIndices.data(), GL_STATIC_DRAW);
-
-    // Position attribute (location 0)
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 11 * sizeof(float), (void*)0);
-    glEnableVertexAttribArray(0);
-
-    // Texture coord attribute (location 1)
-    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 11 * sizeof(float), (void*)(3 * sizeof(float)));
-    glEnableVertexAttribArray(1);
-
-    // Barycentric coords attribute (location 2)
-    glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, 11 * sizeof(float), (void*)(5 * sizeof(float)));
-    glEnableVertexAttribArray(2);
-
-    // Glow factor attribute (location 3)
-    glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, 11 * sizeof(float), (void*)(8 * sizeof(float)));
-    glEnableVertexAttribArray(3);
-
-    // Centroid offset attribute (location 4)
-    glVertexAttribPointer(4, 2, GL_FLOAT, GL_FALSE, 11 * sizeof(float), (void*)(9 * sizeof(float)));
-    glEnableVertexAttribArray(4);
-
-    glBindVertexArray(0);
-
-    // Create grey texture for noise tetrahedrons
-    unsigned char greyPixel[4] = {100, 100, 100, 255};  // Dark grey RGBA
-    glGenTextures(1, &graphics.greyTexture);
-    glBindTexture(GL_TEXTURE_2D, graphics.greyTexture);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, greyPixel);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-
-    // Initialize noise tetrahedrons
-    initializeNoiseTetrahedrons(graphics, 300);
-
-    // Generate indices for noise tetrahedrons (4 faces * 3 verts each)
-    std::vector<unsigned int> noiseIndices;
-    for (int t = 0; t < (int)graphics.noiseParticles.size(); t++) {
-        unsigned int base = t * 4;
-        // Face 0: base (v0, v1, v2)
-        noiseIndices.push_back(base + 0);
-        noiseIndices.push_back(base + 1);
-        noiseIndices.push_back(base + 2);
-        // Face 1: side (v0, v1, apex)
-        noiseIndices.push_back(base + 0);
-        noiseIndices.push_back(base + 1);
-        noiseIndices.push_back(base + 3);
-        // Face 2: side (v1, v2, apex)
-        noiseIndices.push_back(base + 1);
-        noiseIndices.push_back(base + 2);
-        noiseIndices.push_back(base + 3);
-        // Face 3: side (v2, v0, apex)
-        noiseIndices.push_back(base + 2);
-        noiseIndices.push_back(base + 0);
-        noiseIndices.push_back(base + 3);
-    }
-    graphics.noiseVertexCount = noiseIndices.size();
-
-    glGenVertexArrays(1, &graphics.noiseVAO);
-    glGenBuffers(1, &graphics.noiseVBO);
-    GLuint noiseEBO;
-    glGenBuffers(1, &noiseEBO);
-
-    glBindVertexArray(graphics.noiseVAO);
-
-    // Generate initial vertices
-    generateNoiseVertices(graphics);
-
-    glBindBuffer(GL_ARRAY_BUFFER, graphics.noiseVBO);
-    glBufferData(GL_ARRAY_BUFFER, graphics.noiseVertices.size() * sizeof(float), graphics.noiseVertices.data(), GL_DYNAMIC_DRAW);
-
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, noiseEBO);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER, noiseIndices.size() * sizeof(unsigned int), noiseIndices.data(), GL_STATIC_DRAW);
-
-    // Position attribute
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)0);
-    glEnableVertexAttribArray(0);
-
-    // Texture coord attribute
-    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)(3 * sizeof(float)));
-    glEnableVertexAttribArray(1);
-
-    glBindVertexArray(0);
-}
-
-// Helper function to create a 4x4 identity matrix
-void mat4Identity(float* mat) {
-    for (int i = 0; i < 16; i++) mat[i] = 0.0f;
-    mat[0] = mat[5] = mat[10] = mat[15] = 1.0f;
-}
-
-// Helper function to create a perspective projection matrix
-void mat4Perspective(float* mat, float fov, float aspect, float near, float far) {
-    float tanHalfFov = tan(fov / 2.0f);
-    mat4Identity(mat);
-    mat[0] = 1.0f / (aspect * tanHalfFov);
-    mat[5] = 1.0f / tanHalfFov;
-    mat[10] = -(far + near) / (far - near);
-    mat[11] = -1.0f;
-    mat[14] = -(2.0f * far * near) / (far - near);
-    mat[15] = 0.0f;
-}
-
-// Helper function to create an orthographic projection matrix
-void mat4Ortho(float* mat, float left, float right, float bottom, float top, float near, float far) {
-    mat4Identity(mat);
-    mat[0] = 2.0f / (right - left);
-    mat[5] = 2.0f / (top - bottom);
-    mat[10] = -2.0f / (far - near);
-    mat[12] = -(right + left) / (right - left);
-    mat[13] = -(top + bottom) / (top - bottom);
-    mat[14] = -(far + near) / (far - near);
-}
-
-// Helper function to create a look-at view matrix
-void mat4LookAt(float* mat, float eyeX, float eyeY, float eyeZ,
-                float centerX, float centerY, float centerZ,
-                float upX, float upY, float upZ) {
-    // Calculate forward vector
-    float fx = centerX - eyeX;
-    float fy = centerY - eyeY;
-    float fz = centerZ - eyeZ;
-    float fLen = sqrt(fx*fx + fy*fy + fz*fz);
-    fx /= fLen; fy /= fLen; fz /= fLen;
-
-    // Calculate right vector
-    float rx = fy * upZ - fz * upY;
-    float ry = fz * upX - fx * upZ;
-    float rz = fx * upY - fy * upX;
-    float rLen = sqrt(rx*rx + ry*ry + rz*rz);
-    rx /= rLen; ry /= rLen; rz /= rLen;
-
-    // Calculate up vector
-    float ux = ry * fz - rz * fy;
-    float uy = rz * fx - rx * fz;
-    float uz = rx * fy - ry * fx;
-
-    mat4Identity(mat);
-    mat[0] = rx; mat[4] = ry; mat[8] = rz;
-    mat[1] = ux; mat[5] = uy; mat[9] = uz;
-    mat[2] = -fx; mat[6] = -fy; mat[10] = -fz;
-    mat[12] = -(rx * eyeX + ry * eyeY + rz * eyeZ);
-    mat[13] = -(ux * eyeX + uy * eyeY + uz * eyeZ);
-    mat[14] = (fx * eyeX + fy * eyeY + fz * eyeZ);
-}
-
-// Helper function to create a rotation matrix around Y axis
-void mat4RotateY(float* mat, float angle) {
-    mat4Identity(mat);
-    float c = cos(angle);
-    float s = sin(angle);
-    mat[0] = c;
-    mat[2] = s;
-    mat[8] = -s;
-    mat[10] = c;
-}
-
-// Resize framebuffer and plane when window size changes
-void resize3DRendering(Graphics& graphics, int width, int height) {
-    if (width == graphics.uiWidth && height == graphics.uiHeight) {
-        return; // No change, skip resize
-    }
-
-    graphics.uiWidth = width;
-    graphics.uiHeight = height;
-
-    // Resize framebuffer texture
-    glBindTexture(GL_TEXTURE_2D, graphics.fboTexture);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-    glBindTexture(GL_TEXTURE_2D, 0);
-
-    // Resize depth/stencil renderbuffer
-    glBindRenderbuffer(GL_RENDERBUFFER, graphics.fboDepthRenderBuffer);
-    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, width, height);
-    glBindRenderbuffer(GL_RENDERBUFFER, 0);
-
-    // Update plane geometry to match aspect ratio
-    float aspectRatio = (float)width / (float)height;
-    float planeWidth = 2.0f * aspectRatio;
-    float planeHeight = 2.0f;
-
-    float vertices[] = {
-        // positions                              // tex     // bary (unused)   // glow  // centroid offset
-        -planeWidth/2, -planeHeight/2, 0.0f,   0.0f, 0.0f,   0.33f, 0.33f, 0.34f, 0.0f,  0.0f, 0.0f,  // bottom left
-         planeWidth/2, -planeHeight/2, 0.0f,   1.0f, 0.0f,   0.33f, 0.33f, 0.34f, 0.0f,  0.0f, 0.0f,  // bottom right
-         planeWidth/2,  planeHeight/2, 0.0f,   1.0f, 1.0f,   0.33f, 0.33f, 0.34f, 0.0f,  0.0f, 0.0f,  // top right
-        -planeWidth/2,  planeHeight/2, 0.0f,   0.0f, 1.0f,   0.33f, 0.33f, 0.34f, 0.0f,  0.0f, 0.0f   // top left
-    };
-
-    glBindBuffer(GL_ARRAY_BUFFER, graphics.planeVBO);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
-    glBindBuffer(GL_ARRAY_BUFFER, 0);
-
-    // Update grid geometry to match aspect ratio
-    std::vector<float> gridVertices;
-    std::vector<unsigned int> gridIndices;
-    generateTriangularGrid(gridVertices, gridIndices, planeWidth, planeHeight, 80, 80);
-
-    graphics.gridVertexCount = gridIndices.size();
-
-    // Reinitialize particles for new grid dimensions
-    initializeParticles(graphics, gridVertices, planeWidth, planeHeight, 4.0f);
-
-    glBindBuffer(GL_ARRAY_BUFFER, graphics.gridVBO);
-    glBufferData(GL_ARRAY_BUFFER, graphics.gridVertices.size() * sizeof(float), graphics.gridVertices.data(), GL_DYNAMIC_DRAW);
-
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, graphics.gridEBO);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER, gridIndices.size() * sizeof(unsigned int), gridIndices.data(), GL_STATIC_DRAW);
-
-    glBindBuffer(GL_ARRAY_BUFFER, 0);
-}
-
-// Cleanup 3D resources
-void cleanup3DRendering(Graphics& graphics) {
-    glDeleteFramebuffers(1, &graphics.fbo);
-    glDeleteTextures(1, &graphics.fboTexture);
-    glDeleteRenderbuffers(1, &graphics.fboDepthRenderBuffer);
-    glDeleteVertexArrays(1, &graphics.planeVAO);
-    glDeleteBuffers(1, &graphics.planeVBO);
-    glDeleteBuffers(1, &graphics.planeEBO);
-    glDeleteVertexArrays(1, &graphics.gridVAO);
-    glDeleteBuffers(1, &graphics.gridVBO);
-    glDeleteBuffers(1, &graphics.gridEBO);
-    glDeleteProgram(graphics.shaderProgram);
-}
-
 int main(int, char *[]) {
 
     ecs_os_set_api_defaults();
@@ -6351,6 +4554,19 @@ int main(int, char *[]) {
 
     flecs::world world_instance;
     world = &world_instance;
+
+    world->entity("Wesley");
+    world->entity("Heonae");
+
+    world->import<tradewinds::module>();
+
+    world->set<ZMQContext>({ std::make_shared<zmq::context_t>(2) });
+
+    // TODO: Multiple chats
+    flecs::entity interlocutor_server = world->entity("InterlocutorServer")
+    .set<SpawnRequest>({"python3", {"../scripts/interlocutor.py"}});
+    flecs::entity interlocutor_client = world->entity("InterlocutorClient")
+        .set<ZMQClient>({ "ipc:///tmp/thornfield_interlocutor_socket", zmq::socket_type::req });
 
     // Initialize spatial index manager
     spatial::SpatialIndexManager spatial_manager(world);
@@ -6368,13 +4584,14 @@ int main(int, char *[]) {
 
     // TODO: Register spatial data
 
+    // TODO: Refactor to ZeroMQ
     query_server::initialize(world, &spatial_manager);
 
     // TODO: query_server::register_spatial_handler
     // Can this be moved elsewhere?
 
     // Start socket server
-    int port = 8000;
+    int port = 8005;
     query_server::start_server(port);
 
     glfwSetErrorCallback(error_callback);
@@ -6415,7 +4632,7 @@ int main(int, char *[]) {
     // Start in fullscreen mode
     GLFWmonitor* monitor = glfwGetPrimaryMonitor();
     const GLFWvidmode* mode = glfwGetVideoMode(monitor);
-    GLFWwindow* window = glfwCreateWindow(mode->width, mode->height, "Thornfield", monitor, NULL);
+    GLFWwindow* window = glfwCreateWindow(mode->width, mode->height, "Thornfield", NULL, NULL);
     if (window == NULL) {
         std::cerr << "Failed to create GLFW window" << std::endl;
         glfwTerminate();
@@ -6453,7 +4670,7 @@ int main(int, char *[]) {
         return -1;
     }
     std::cout << "[SDL] SDL initialized successfully" << std::endl;
-
+    
     world->component<Position>()
     .member<float>("x")
     .member<float>("y");
@@ -6467,6 +4684,11 @@ int main(int, char *[]) {
     world->component<LineChartChannel>();
     world->component<ZIndex>()
     .member<int>("layer");
+
+    world->component<TimeInterval>();
+    world->component<TimeIntervalToSpaceSegment>();
+
+    world->component<PanelState>();
 
     world->component<RenderGradient>();
 
@@ -6508,11 +4730,7 @@ int main(int, char *[]) {
     world->component<SendChatMessage>();
     world->set<ChatState>({std::vector<ChatMessage>{}, "", false});
 
-    // SFTP components
-    world->component<SFTPClient>();
-    world->component<FileTransferProgress>();
-    world->component<FileTransferRequest>();
-    world->component<HasSFTPTransfer>();
+    world->component<PanelState>();
 
     world->component<DragContext>().add(flecs::Singleton);
     world->set<DragContext>({false, flecs::entity::null(), PanelSplitType::Horizontal, 0.0f});
@@ -6572,6 +4790,9 @@ int main(int, char *[]) {
         .set<UIElementSize>({0.0f, 0.0f})
         .set<RenderStatus>({true})
         .set<ZIndex>({0});
+
+
+
 
     // TODO: Text search field
     // auto FieldEntry = world->prefab("FieldEntry")
@@ -6694,6 +4915,21 @@ int main(int, char *[]) {
     });
 
     world->observer<UIElementBounds, AddTagOnLeftClick>()
+    .term_at(1).second<ToggleBooleanOption>()
+    .event<LeftClickEvent>()
+    .each([&](flecs::entity e, UIElementBounds& bounds, AddTagOnLeftClick)
+    {
+        // Toggle PanelState variable, switch checkbox to the opposite!
+        PanelState& state = e.target<EditorLeaf>().ensure<PanelState>();
+        PanelOption& option = state.options[e.ensure<PanelOptionData>().index];
+        option.active = !option.active;
+        std::string active = option.active ? "true" : "false";
+        // std::string active = option.active ? "true" : "false";
+        e.target<CheckBox>().set<ImageCreator>({("../assets/checkbox_" + active + ".png").c_str(), 1.0f, 1.0f});
+        // TODO: 
+    });
+
+    world->observer<UIElementBounds, AddTagOnLeftClick>()
     .term_at(1).second<FocusChatInput>()
     .event<LeftClickEvent>()
     .each([&](flecs::entity e, UIElementBounds&, AddTagOnLeftClick)
@@ -6726,6 +4962,104 @@ int main(int, char *[]) {
 
         }
         std::cout << "Start chatter server here" << std::endl;
+    });
+
+    world->observer<UIElementBounds, AddTagOnLeftClick>()
+    .term_at(1).second<ShowPanelState>()
+    .event<LeftClickEvent>()
+    .each([&](flecs::entity e, UIElementBounds& bounds, AddTagOnLeftClick)
+    {
+        std::cout << "Left mouse click event on " << e.id() << std::endl;
+        // Popup a menu to selector editor type (or close it)
+        bool has_close_child = false;
+        e.children([&](flecs::entity child) 
+        {
+            if (child.has<AddTagOnHoverExit, CloseEditorSelector>())
+            {
+                child.destruct();
+                has_close_child = true;
+            }
+        });
+        if (has_close_child) return;
+
+        auto editor_hover_region = world->entity()
+        .is_a(UIElement)
+        .child_of(e)
+        // .add<DebugRenderBounds>()
+        .add<AddTagOnHoverExit, CloseEditorSelector>(); // TODO Invisible padding....
+        // .add<AddTagOnLeftClick, CloseEditorSelector>();
+
+        auto editor_icon_bkg_square = world->entity()
+        .is_a(UIElement)
+        .child_of(editor_hover_region)
+        .set<Position, Local>({-1.0f, 10.0f})
+        .set<RectRenderable>({32.0f, 12.0f, false, 0x282828FF})
+        .set<ZIndex>({7});
+
+        auto editor_type_selector = world->entity()
+        .is_a(UIElement)
+        .child_of(editor_hover_region)
+        // .add<DebugRenderBounds>()
+        .set<Position, Local>({-1.0f, 19.0f});
+
+        auto editor_type_selector_square_corner = world->entity()
+        .is_a(UIElement)
+        .child_of(editor_type_selector)
+        .set<RectRenderable>({16.0f, 16.0f, false, 0x282828FF})
+        .set<ZIndex>({30});
+
+        auto editor_type_selector_bkg = world->entity()
+        .is_a(UIElement)
+        .child_of(editor_type_selector)
+        .set<RoundedRectRenderable>({196.0f, 256.0f, 4.0f, false, 0x282828FF})
+        .set<Expand>({false, 0, 0, 1.0f, true, 0.0f, 0.0f, 1.0f})
+        .set<ZIndex>({30});
+
+        auto editor_type_list = world->entity()
+        .is_a(UIElement)
+        .child_of(editor_type_selector)
+        .set<LayoutBox>({LayoutBox::Vertical, 2.0f})
+        // .add<DebugRenderBounds>()
+        .set<Position, Local>({4.0f, 4.0f});
+
+        flecs::entity leaf = e.parent().parent();
+        PanelState& state = leaf.ensure<PanelState>();
+        size_t i = 0;
+        for (PanelOption& option : state.options)
+        {
+            auto editor_option_btn = world->entity()
+            .is_a(UIElement)
+            .child_of(editor_type_list)
+            .set<RoundedRectRenderable>({196.0f-12.0f, 28.0f, 2.0f, false, 0x383838FF})
+            .set<Position, Local>({2.0f, 0.0f})
+            .add<AddTagOnHoverEnter, SetMenuHighlightColor>()
+            .add<AddTagOnHoverExit, SetMenuStandardColor>()
+            .add<AddTagOnLeftClick, ToggleBooleanOption>()
+            .add<EditorLeaf>(leaf)
+            .set<ZIndex>({38});
+
+            world->entity()
+            .is_a(UIElement)
+            .child_of(editor_option_btn)
+            .set<TextRenderable>({option.name, "JetBrainsMono", 12.0f, 0xFFFFFFFF})
+            .set<Position, Local>({4.0f, 8.0f})
+            .set<ZIndex>({40});
+            
+            std::string active = option.active ? "true" : "false";
+
+            flecs::entity checkbox = world->entity()
+            .is_a(UIElement)
+            .child_of(editor_option_btn)
+            .set<ImageCreator>({("../assets/checkbox_" + active + ".png").c_str(), 1.0f, 1.0f})
+            .set<Align>({-0.5f, -0.5f, 0.9f, 0.5f})
+            .set<ZIndex>({42});
+
+            editor_option_btn.add<CheckBox>(checkbox);
+            editor_option_btn.set<PanelOptionData>({i});
+            i++;
+
+        }
+
     });
 
     world->observer<UIElementBounds, AddTagOnLeftClick>()
@@ -6810,21 +5144,14 @@ int main(int, char *[]) {
             world->entity()
             .is_a(UIElement)
             .child_of(edtior_type_btn)
-            .set<TextRenderable>({editor_type_name.c_str(), "ATARISTOCRAT", 16.0f, 0xFFFFFFFF})
-            .set<Position, Local>({4.0f, 2.0f})
+            .set<TextRenderable>({editor_type_name.c_str(), "JetBrainsMono", 12.0f, 0xFFFFFFFF})
+            .set<Position, Local>({4.0f, 5.0f})
             .set<ZIndex>({40});
             
             editor_type_index++;
         }
 
     });
-
-    // Create text entities with different z-indices
-    // auto text1 = world->entity("Text1")
-    //     .is_a(UIElement)
-    //     .set<Position, Local>({400.0f, 100.0f})
-    //     .set<TextRenderable>({"Behind boxes", "ATARISTOCRAT", 24.0f, 0xFFFFFFFF, NVG_ALIGN_CENTER})
-    //     .set<ZIndex>({0});
 
     auto movementSystem = world->system<Position, Velocity>()
     .term_at(0).second<Local>()
@@ -6891,9 +5218,30 @@ int main(int, char *[]) {
         .add(flecs::OrderedChildren);
 
     auto editor_header = world->entity()
+        .set<Position, Local>({0.0f, -28.0f})
+        .set<EditorNodeArea>({800.0f, 28.0f})
+        .is_a(UIElement)
+        .child_of(editor_root);
+
+    auto editor_header_elements = world->entity()
+        .is_a(UIElement)
+        .set<LayoutBox>({LayoutBox::Horizontal, 16.0f})
+        .add(flecs::OrderedChildren)
+        .child_of(editor_header);
+
+    auto cogarc_module_logo = world->entity()
         .is_a(UIElement)
         .set<ImageCreator>({"../assets/ecs_header.png", 1.0f, 1.0f})
-        .set<ZIndex>({5});
+        .set<ZIndex>({5})
+        .child_of(editor_header_elements);
+
+    auto editor_version = world->entity()
+        .is_a(UIElement)
+        .set<Position, Local>({0.0f, 8.0f})
+        .set<TextRenderable>({"The heaven is high and the emperor is far away. The monologic is dead. Long live the swarm.", "JetBrainsMono", 12.0f, 0x888888FF})
+        // .set<TextRenderable>({"Pearl Magi, Whalefall Abyss", "JetBrainsMono", 12.0f, 0x888888FF})
+        .set<ZIndex>({5})
+        .child_of(editor_header_elements);
 
     // Load saved editor config if it exists, otherwise use default layout
     if (!load_editor_layout(editor_root, UIElement)) {
@@ -7623,13 +5971,8 @@ int main(int, char *[]) {
         }
     });
 
-    // world->system<ImageRenderable, ProportionalConstraint, Graphics>()
-    // {
-
-    // }
-
     // What the fuck is this stupid fucking system?
-world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
+    world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
     .term_at(0).parent()
     .term_at(3).optional()
     .kind(flecs::PreUpdate)
@@ -7820,7 +6163,6 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
     {
         UIElementSize& uiElementSize = e.target<DynamicTextWrapContainer>().ensure<UIElementSize>();
         text.wrapWidth = uiElementSize.width - data.pad;
-        std::cout << "Set text wrap to " << text.wrapWidth;
     });
 
     auto textQueueSystem = world->system<Position, TextRenderable, ZIndex, RenderGradient*>()
@@ -7923,20 +6265,6 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
             return;
         }
         glfwSetInputMode(window->handle, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
-
-        // DEBUG BOUNDS
-        // for (EditorShiftRegion& shift_region : editor_root->shift_regions)
-        // {
-        //     RenderQueue& queue = world->ensure<RenderQueue>();
-        //     RectRenderable debug_rect;
-        //     debug_rect.width = shift_region.bounds.xmax - shift_region.bounds.xmin;
-        //     debug_rect.height = shift_region.bounds.ymax - shift_region.bounds.ymin;
-        //     debug_rect.color = 0xFF00FFFF;
-        //     debug_rect.stroke = true;
-        //     queue.addRectCommand({shift_region.bounds.xmin, shift_region.bounds.ymin}, debug_rect, 100);
-        // }
-
-        // std::cout << cursor_state->x << ", " << cursor_state->y << std::endl;
 
         glfwSetCursor(window->handle, NULL);
 
@@ -8388,106 +6716,6 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
             VNCClient& vnc = **handle;
             if (!vnc.connected || !vnc.client) return;
             e.target<ActiveIndicator>().ensure<RenderStatus>().visible = vnc.eventPassthroughEnabled;
-        });
-
-    // SFTP progress indicator rendering system
-    auto sftpProgressRenderSystem = world->system<Position, ImageRenderable>()
-        .with<IsStreamingFrom>(flecs::Wildcard)
-        .term_at(0).second<World>()
-        .kind(flecs::PostUpdate)
-        .each([&](flecs::entity e, Position& pos, ImageRenderable& img) {
-            flecs::entity vnc_entity = e.target<IsStreamingFrom>();
-
-            // Check if this VNC has an active SFTP transfer
-            if (!vnc_entity.has<HasSFTPTransfer>()) return;
-
-            const SFTPClient* sftp = vnc_entity.try_get<SFTPClient>();
-            if (!sftp) return;
-
-            // Read progress (thread-safe)
-            FileTransferProgress progress;
-            {
-                std::lock_guard<std::mutex> lock(sftp->progress_mutex);
-                progress = sftp->current_progress;
-            }
-
-            // Skip if idle or hide after 2 seconds of completion
-            if (progress.state == FileTransferProgress::IDLE) return;
-
-            if (progress.state == FileTransferProgress::COMPLETED) {
-                auto elapsed = std::chrono::steady_clock::now() - progress.completion_time;
-                if (elapsed > std::chrono::seconds(2)) {
-                    vnc_entity.remove<HasSFTPTransfer>();
-                    return;
-                }
-            }
-
-            // Calculate position (bottom-right of VNC panel)
-            float indicator_width = 300.0f;
-            float indicator_height = 60.0f;
-            float indicator_x = pos.x + img.width - indicator_width - 20.0f;
-            float indicator_y = pos.y + img.height - indicator_height - 20.0f;
-
-            // Add to render queue
-            RenderQueue& queue = world->ensure<RenderQueue>();
-
-            // Background
-            queue.addRoundedRectCommand(
-                {indicator_x, indicator_y},
-                {indicator_width, indicator_height, 8.0f, false, 0x000000AA},
-                1500  // High Z-index
-            );
-
-            // Progress bar background
-            float bar_x = indicator_x + 10.0f;
-            float bar_y = indicator_y + 35.0f;
-            float bar_width = indicator_width - 20.0f;
-            float bar_height = 15.0f;
-
-            queue.addRoundedRectCommand(
-                {bar_x, bar_y},
-                {bar_width, bar_height, 4.0f, false, 0x333333FF},
-                1501
-            );
-
-            // Progress bar fill
-            if (progress.progress_percent > 0) {
-                float fill_width = bar_width * (progress.progress_percent / 100.0f);
-                uint32_t fill_color = progress.state == FileTransferProgress::FAILED ?
-                    0xFF0000FF : 0x00AA00FF;  // Red for error, green for success
-
-                queue.addRoundedRectCommand(
-                    {bar_x, bar_y},
-                    {fill_width, bar_height, 4.0f, false, fill_color},
-                    1502
-                );
-            }
-
-            // Filename text
-            queue.addTextCommand(
-                {indicator_x + 10.0f, indicator_y + 15.0f},
-                {progress.filename, "sans-bold", 14.0f, 0xFFFFFFFF, 1.0f},
-                1503
-            );
-
-            // Progress percentage text
-            char percent_str[32];
-            snprintf(percent_str, sizeof(percent_str), "%.1f%%", progress.progress_percent);
-
-            queue.addTextCommand(
-                {bar_x + bar_width - 50.0f, bar_y + 12.0f},
-                {std::string(percent_str), "sans", 12.0f, 0xFFFFFFFF, 1.0f},
-                1503
-            );
-
-            // Error message if failed
-            if (progress.state == FileTransferProgress::FAILED && !progress.error_message.empty()) {
-                queue.addTextCommand(
-                    {indicator_x + 10.0f, indicator_y + 45.0f},
-                    {progress.error_message, "sans", 11.0f, 0xFF0000FF, 1.0f},
-                    1503
-                );
-            }
         });
 
     auto spaceframeSelector = world->system<FilmstripData>()
@@ -9302,7 +7530,8 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
         });
 
     int fontHandle = nvgCreateFont(vg, "ATARISTOCRAT", "../assets/ATARISTOCRAT.ttf");
-    int interFontHandle = nvgCreateFont(vg, "Inter", "../assets/CharisSIL-Regular.ttf");
+    int charisSILFontHandle = nvgCreateFont(vg, "CharisSIL", "../assets/CharisSIL-Regular.ttf");
+    int jetBriansMonoFontHandle = nvgCreateFont(vg, "JetBrainsMono", "../assets/JetBrainsMono-Regular.ttf");
 
     while (!glfwWindowShouldClose(window)) {
         processInput(window);
@@ -9335,6 +7564,7 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
         world->progress();
 
         // Process completed interpretations and create badges
+        // TODO: REFACTOR THIS TO USE TRADEWINDS INSTEAD OF A BESPOKE MUTEX OUT OF LOOP LOL
         {
             std::lock_guard<std::mutex> lock(pending_interpretations_mutex);
             auto it = pending_interpretations.begin();
@@ -9630,84 +7860,6 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
                             }
                         }
 
-                        // Create flow layout for interleaved text and badges
-                        auto meta_response_data = world->entity()
-                            .is_a(UIElement)
-                            .set<FlowLayoutBox>({0.0f, 0.0f, 2.0f, 0.0f, 2.0f})
-                            .set<Expand>({true, 0, 0, 1, false, 0, 0, 0})
-                            .add(flecs::OrderedChildren)
-                            .child_of(pending->message_list);
-                        
-                        // We're currently disabling the model to test annotation
-                        for (size_t i = 0; i < words.size(); i++) 
-                        {
-                            flecs::entity text_annotator = world->entity()
-                                .is_a(UIElement)
-                                .set<UIContainer>({4, 4})
-                                .set<RoundedRectRenderable>({0.0f, 0.0f, 2.0f, true, 0xFFFFFFFF})
-                                .set<ZIndex>({20})
-                                .child_of(meta_response_data);
-                                
-                            flecs::entity text_seq = world->entity()
-                                .is_a(UIElement)
-                                // .child_of(meta_response_data)
-                                .child_of(text_annotator)
-                                .set<TextRenderable>({words[i].c_str(), "Inter", 16.0f, 0x777777FF})
-                                .set<ZIndex>({17});
-                        }
-
-                        // Interleave text with badges - badges replace their word spans
-                        // std::string current_text;
-                        // for (size_t i = 0; i < words.size(); ) {
-                        //     // Check if an annotation starts at this position
-                        //     if (start_annotations.count(i)) {
-                        //         // Flush any accumulated text
-                        //         if (!current_text.empty()) {
-
-                        //             flecs::entity text_annotator = world->entity()
-                        //                 .is_a(UIElement)
-                        //                 .set<UIContainer>({4, 4})
-                        //                 .set<RoundedRectRenderable>({0.0f, 0.0f, 2.0f, true, 0xFFFFFFFF})
-                        //                 .set<ZIndex>({20})
-                        //                 .child_of(meta_response_data);
-                                        
-                        //             flecs::entity text_seq = world->entity()
-                        //                 .is_a(UIElement)
-                        //                 // .child_of(meta_response_data)
-                        //                 .child_of(text_annotator)
-                        //                 .set<TextRenderable>({current_text.c_str(), "Inter", 16.0f, 0x777777FF})
-                        //                 .set<ZIndex>({17});
-                                    
-                                        
-                                    
-                        //             current_text.clear();
-                        //         }
-
-                        //         auto& ann = start_annotations[i];
-                        //         create_badge(meta_response_data, UIElement, ann.label.c_str(),
-                        //                    ann.color, false, ann.is_relationship,
-                        //                    ann.prefix_ids, ann.prefix_tints,
-                        //                    ann.postfix_ids, ann.postfix_tints);
-
-                        //         // Skip all words covered by this annotation (start_idx to end_idx inclusive)
-                        //         i = ann.end_idx + 1;
-                        //     } else {
-                        //         // Add the word to accumulated text
-                        //         if (!current_text.empty()) current_text += " ";
-                        //         current_text += words[i];
-                        //         i++;
-                        //     }
-                        // }
-
-                        // Flush remaining text
-                        // if (!current_text.empty()) {
-                        //     world->entity()
-                        //         .is_a(UIElement)
-                        //         .child_of(meta_response_data)
-                        //         .set<TextRenderable>({current_text.c_str(), "Inter", 16.0f, 0xFFFFFFFF})
-                        //         .set<ZIndex>({17});
-                        // }
-
                     } catch (const json::exception& e) {
                         std::cerr << "[Interpretation] JSON parse error: " << e.what() << std::endl;
                         std::cerr << "[Interpretation] Raw result: " << pending->result << std::endl;
@@ -9841,18 +7993,6 @@ world->system<UIElementBounds*, ImageRenderable, Expand, Constrain*, Graphics>()
     cleanup3DRendering(graphics);
 
     nvgDeleteGL2(vg);
-
-    // Cleanup SFTP threads before shutdown
-    auto sftp_cleanup = world->query<SFTPClient>();
-    sftp_cleanup.each([](flecs::entity e, SFTPClient& sftp) {
-        if (sftp.thread_running) {
-            sftp.thread_should_stop = true;
-            sftp.queue_cv.notify_all();
-            if (sftp.worker_thread.joinable()) {
-                sftp.worker_thread.join();
-            }
-        }
-    });
 
     libssh2_exit();
 
