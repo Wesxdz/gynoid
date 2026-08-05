@@ -1,0 +1,157 @@
+[
+    {
+        "subject": "continuant",
+        "predicate": "subClassOf",
+        "object": "entity"
+    },
+    {
+        "subject": "occurrent",
+        "predicate": "subClassOf",
+        "object": "entity"
+    },
+    {
+        "subject": "independent_continuant",
+        "predicate": "subClassOf",
+        "object": "continuant"
+    },
+    {
+        "subject": "specifically_dependent_continuant",
+        "predicate": "subClassOf",
+        "object": "continuant"
+    },
+    {
+        "subject": "generically_dependent_continuant",
+        "predicate": "subClassOf",
+        "object": "continuant"
+    },
+    {
+        "subject": "material_entity",
+        "predicate": "subClassOf",
+        "object": "independent_continuant"
+    },
+    {
+        "subject": "immaterial_entity",
+        "predicate": "subClassOf",
+        "object": "independent_continuant"
+    },
+    {
+        "subject": "object",
+        "predicate": "subClassOf",
+        "object": "material_entity"
+    },
+    {
+        "subject": "fiat_object_part",
+        "predicate": "subClassOf",
+        "object": "material_entity"
+    },
+    {
+        "subject": "object_aggregate",
+        "predicate": "subClassOf",
+        "object": "material_entity"
+    },
+    {
+        "subject": "site",
+        "predicate": "subClassOf",
+        "object": "immaterial_entity"
+    },
+    {
+        "subject": "spatial_region",
+        "predicate": "subClassOf",
+        "object": "immaterial_entity"
+    },
+    {
+        "subject": "continuant_fiat_boundary",
+        "predicate": "subClassOf",
+        "object": "immaterial_entity"
+    },
+    {
+        "subject": "quality",
+        "predicate": "subClassOf",
+        "object": "specifically_dependent_continuant"
+    },
+    {
+        "subject": "realizable_entity",
+        "predicate": "subClassOf",
+        "object": "specifically_dependent_continuant"
+    },
+    {
+        "subject": "disposition",
+        "predicate": "subClassOf",
+        "object": "realizable_entity"
+    },
+    {
+        "subject": "role",
+        "predicate": "subClassOf",
+        "object": "realizable_entity"
+    },
+    {
+        "subject": "function",
+        "predicate": "subClassOf",
+        "object": "disposition"
+    },
+    {
+        "subject": "process",
+        "predicate": "subClassOf",
+        "object": "occurrent"
+    },
+    {
+        "subject": "process_boundary",
+        "predicate": "subClassOf",
+        "object": "occurrent"
+    },
+    {
+        "subject": "spatiotemporal_region",
+        "predicate": "subClassOf",
+        "object": "occurrent"
+    },
+    {
+        "subject": "temporal_interval",
+        "predicate": "subClassOf",
+        "object": "occurrent"
+    },
+    {
+        "subject": "spatiotemporal_region_unicolor",
+        "predicate": "subClassOf",
+        "object": "spatiotemporal_region"
+    },
+    {
+        "subject": "material_entity",
+        "predicate": "bearer_of",
+        "object": "quality"
+    },
+    {
+        "subject": "material_entity",
+        "predicate": "has_role",
+        "object": "role"
+    },
+    {
+        "subject": "material_entity",
+        "predicate": "has_disposition",
+        "object": "disposition"
+    },
+    {
+        "subject": "material_entity",
+        "predicate": "has_function",
+        "object": "function"
+    },
+    {
+        "subject": "process",
+        "predicate": "has_participant",
+        "object": "material_entity"
+    },
+    {
+        "subject": "process",
+        "predicate": "occurs_in",
+        "object": "spatial_region"
+    },
+    {
+        "subject": "spatiotemporal_region",
+        "predicate": "projects_onto",
+        "object": "spatial_region"
+    },
+    {
+        "subject": "spatiotemporal_region",
+        "predicate": "projects_onto",
+        "object": "temporal_interval"
+    }
+]

@@ -401,12 +401,12 @@ float get_time_of_day_normalized() {
 
 QuadraticBezierRenderable get_hour_segment(size_t i, float start_angle = 0.0f)
 {
-    float radius = 80.0f;
+    float radius = 1080/2;
 
-    float centerX = 100.0f;
-    float centerY = 100.0f;
+    float centerX = radius+16;
+    float centerY = radius+16;
     int segments = 24;
-    float thickness = 2.0f;
+    float thickness = 16.0f;
 
     uint32_t dayA   = 0x5f9c00FF; // Green
     uint32_t dayB   = 0xfc9800FF; // Orange
@@ -482,6 +482,13 @@ enum class TokenType {
     PlainText,       // Regular word
     Entity,          // {{text, n}} - entity binding
     Relationship     // {{text, R:src:tgt}} - relationship with source/target digits
+};
+
+// Binding type for relationship slots
+enum class SlotBindingType {
+    Standard,  // Single bound entity
+    Set,       // Multiple bound entities (could also work for standard entity badges?)
+    Wildcard   // Unbound/intensional slot
 };
 
 // Token in annotated sentence
@@ -1743,218 +1750,6 @@ flecs::entity create_badge_impl(flecs::entity parent, flecs::entity UIElement,
     return badge;
 }
 
-// Recreate UI entities from the template string for a WordAnnotationSelector
-// Call this from key handlers instead of creating entities in a per-frame system
-void recreate_annotation_entities(WordAnnotationSelector& selector) {
-    if (!selector.parent_entity.is_valid()) return;
-
-    // Store old entities to delete after creating new ones (prevents flicker)
-    std::vector<flecs::entity> old_entities = std::move(selector.ui_entities);
-    selector.ui_entities.clear();
-    selector.selection_entities.clear();
-
-    // Parse template and create new entities
-    auto tokens = parse_sentence_template(selector.sentence_template);
-    auto UIElement = world->lookup("UIElement");
-
-    // Calculate token_count as sum of selection widths
-    selector.token_count = 0;
-    for (const auto& token : tokens) {
-        selector.token_count += token.selection_width();
-    }
-
-    for (size_t ti = 0; ti < tokens.size(); ti++) {
-        const auto& token = tokens[ti];
-
-        if (token.type == TokenType::Relationship) {
-            // Create relationship badge with source/target images as children
-            // Note: ImageCreator observer prepends "../assets/" so paths are relative to that
-
-            // Look up source and target entity colors first for outline averaging
-            uint32_t src_color = 0xc72783FF; // default pink
-            uint32_t tgt_color = 0xc72783FF;
-            if (!token.source_symbol.empty()) {
-                auto it = entity_color_cache.find(token.source_symbol);
-                if (it != entity_color_cache.end()) {
-                    src_color = it->second;
-                }
-            }
-            if (!token.target_symbol.empty()) {
-                auto it = entity_color_cache.find(token.target_symbol);
-                if (it != entity_color_cache.end()) {
-                    tgt_color = it->second;
-                }
-            }
-
-            // Average the RGB components for outline color
-            uint8_t avg_r = (((src_color >> 24) & 0xFF) + ((tgt_color >> 24) & 0xFF)) / 2;
-            uint8_t avg_g = (((src_color >> 16) & 0xFF) + ((tgt_color >> 16) & 0xFF)) / 2;
-            uint8_t avg_b = (((src_color >> 8) & 0xFF) + ((tgt_color >> 8) & 0xFF)) / 2;
-            uint32_t avg_color = (avg_r << 24) | (avg_g << 16) | (avg_b << 8) | 0xFF;
-
-            // 1. Create the double arrow badge container
-            uint32_t base_color = avg_color;
-            uint32_t dark = base_color;
-            uint32_t very_dark = scale_color(base_color, 0.2f);
-            uint32_t light = scale_color(base_color, 1.3f);
-            uint32_t outline_color = (light & 0xFFFFFF00) | 0x80;
-            float xPad = 6.0f + 25.0f/2;
-
-            flecs::entity badge = world->entity()
-                .is_a(UIElement)
-                .child_of(selector.parent_entity)
-                .set<CustomRenderable>({100.0f, 25.0f, true, outline_color, 0, 0, draw_double_arrow})
-                .set<RenderGradient>({dark, very_dark})
-                .set<UIContainer>({xPad, 0})
-                .set<ZIndex>({20});
-
-            // 2. Create content container with horizontal layout
-            flecs::entity badge_content = world->entity()
-                .is_a(UIElement)
-                .set<LayoutBox>({LayoutBox::Horizontal, 0.0f})
-                .set<Position, Local>({xPad, 0.0f})
-                .add(flecs::OrderedChildren)
-                .child_of(badge);
-
-            // 3. Source MNIST/wildcard image (child of badge_content)
-            std::string src_path;
-            if (token.source_symbol.empty()) {
-                src_path = "wildcard.png";
-            } else if (token.source_symbol.length() == 1 && std::isdigit(static_cast<unsigned char>(token.source_symbol[0]))) {
-                src_path = "mnist/set_0/" + token.source_symbol + ".png";
-            } else {
-                std::string upper_src = token.source_symbol;
-                for (auto& c : upper_src) c = std::toupper(static_cast<unsigned char>(c));
-                src_path = "letter_sets/set_01/" + upper_src + ".png";
-            }
-            // Tint with entity color if bound (reuse src_color from earlier lookup)
-            NVGcolor src_tint = nvgRGBA((src_color >> 24) & 0xFF, (src_color >> 16) & 0xFF, (src_color >> 8) & 0xFF, 255);
-            flecs::entity source_ent = world->entity()
-                .is_a(UIElement)
-                .child_of(badge_content)
-                .set<ImageCreator>({src_path, 1.0f, 1.0f, src_tint})
-                .set<ZIndex>({25});
-
-            // 4. Relationship text (with optional reified indicator above)
-            flecs::entity text_parent = badge_content;
-            if (!token.reified_symbol.empty()) {
-                // Create vertical container for reified indicator + text
-                flecs::entity text_column = world->entity()
-                    .is_a(UIElement)
-                    .set<LayoutBox>({LayoutBox::Vertical, 0.0f})
-                    .add(flecs::OrderedChildren)
-                    .child_of(badge_content);
-
-                // Reified indicator (3d_node + digit) above text
-                flecs::entity reified_row = world->entity()
-                    .is_a(UIElement)
-                    .set<LayoutBox>({LayoutBox::Horizontal, 0.0f})
-                    .add(flecs::OrderedChildren)
-                    .child_of(text_column);
-
-                // Tint reified with entity color if it exists
-                NVGcolor reified_tint = nvgRGBA(255, 255, 255, 255);
-                if (!token.reified_symbol.empty()) {
-                    auto it = entity_color_cache.find(token.reified_symbol);
-                    if (it != entity_color_cache.end()) {
-                        uint32_t c = it->second;
-                        reified_tint = nvgRGBA((c >> 24) & 0xFF, (c >> 16) & 0xFF, (c >> 8) & 0xFF, 255);
-                    }
-                }
-
-                world->entity()
-                    .is_a(UIElement)
-                    .child_of(reified_row)
-                    .set<ImageCreator>({"3d_node.png", 0.6f, 0.6f, reified_tint})
-                    .set<ZIndex>({25});
-
-                std::string reified_path;
-                if (token.reified_symbol.length() == 1 && std::isdigit(static_cast<unsigned char>(token.reified_symbol[0]))) {
-                    reified_path = "mnist/set_0/" + token.reified_symbol + ".png";
-                } else {
-                    std::string upper_reified = token.reified_symbol;
-                    for (auto& c : upper_reified) c = std::toupper(static_cast<unsigned char>(c));
-                    reified_path = "letter_sets/set_01/" + upper_reified + ".png";
-                }
-                world->entity()
-                    .is_a(UIElement)
-                    .child_of(reified_row)
-                    .set<ImageCreator>({reified_path, 0.6f, 0.6f, reified_tint})
-                    .set<ZIndex>({25});
-
-                text_parent = text_column;
-            }
-
-            flecs::entity text_ent = world->entity()
-                .is_a(UIElement)
-                .child_of(text_parent)
-                .set<Position, Local>({0.0f, !token.reified_symbol.empty() ? 0.0f : 6.0f})
-                .set<TextRenderable>({token.text.c_str(), "CharisSIL", 16.0f, 0xFFFFFFFF, 1.2f})
-                .set<RenderGradient>({0xFFFFFFFF, light})
-                .set<ZIndex>({25});
-
-            // 5. Target MNIST/wildcard image (child of badge_content)
-            std::string tgt_path;
-            if (token.target_symbol.empty()) {
-                tgt_path = "wildcard.png";
-            } else if (token.target_symbol.length() == 1 && std::isdigit(static_cast<unsigned char>(token.target_symbol[0]))) {
-                tgt_path = "mnist/set_0/" + token.target_symbol + ".png";
-            } else {
-                std::string upper_tgt = token.target_symbol;
-                for (auto& c : upper_tgt) c = std::toupper(static_cast<unsigned char>(c));
-                tgt_path = "letter_sets/set_01/" + upper_tgt + ".png";
-            }
-            // Tint with entity color if bound (reuse tgt_color from earlier lookup)
-            NVGcolor tgt_tint = nvgRGBA((tgt_color >> 24) & 0xFF, (tgt_color >> 16) & 0xFF, (tgt_color >> 8) & 0xFF, 255);
-            flecs::entity target_ent = world->entity()
-                .is_a(UIElement)
-                .child_of(badge_content)
-                .set<ImageCreator>({tgt_path, 1.0f, 1.0f, tgt_tint})
-                .set<ZIndex>({25});
-
-            // Only badge needs to be in ui_entities (children deleted with parent)
-            selector.ui_entities.push_back(badge);
-            // Selection entities track 3 parts: source, badge, target
-            // Reified indicator is inside badge but not separately selectable
-            selector.selection_entities.push_back(source_ent);
-            selector.selection_entities.push_back(badge);
-            selector.selection_entities.push_back(target_ent);
-
-        } else if (token.type == TokenType::Entity) {
-            // Entity binding: normal badge with semantic color
-            std::string digit_str = !token.binding_symbol.empty() ? token.binding_symbol : "";
-            uint32_t entity_color = !token.binding_symbol.empty()
-                ? get_entity_color(token.binding_symbol, token.text)
-                : 0x4488FFFF;
-            flecs::entity badge = create_badge(selector.parent_entity, UIElement,
-                token.text.c_str(), entity_color,
-                false, false,
-                digit_str, "",
-                0, entity_color);
-            selector.ui_entities.push_back(badge);
-            selector.selection_entities.push_back(badge);
-        } else {
-            // Plain text entity
-            flecs::entity text_ent = world->entity()
-                .is_a(UIElement)
-                .child_of(selector.parent_entity)
-                .set<TextRenderable>({token.text.c_str(), "CharisSIL", 16.0f, 0x777777FF})
-                .set<ZIndex>({17});
-            selector.ui_entities.push_back(text_ent);
-            selector.selection_entities.push_back(text_ent);
-        }
-    }
-
-    // Delete old entities after new ones are created (prevents flicker)
-    for (auto& ent : old_entities) {
-        if (ent.is_valid()) {
-            ent.destruct();
-        }
-    }
-
-    selector.dirty = false;
-}
-
 void create_editor(flecs::entity leaf, EditorNodeArea& node_area, flecs::entity UIElement)
 {
     leaf.set<EditorLeafData>({EditorType::Void});
@@ -2379,7 +2174,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         .add<ServerDescription>()
         .child_of(leaf.target<EditorCanvas>());
 
-        std::vector<std::string> server_icons = {"aeri_memory", "zmq", "flecs", "x11", "parakeet", "chatterbox", "doctr", "opencv", "minilm", "dino2", "alpaca", "modal"}; // , "autodistill", "yolo", 
+        std::vector<std::string> server_icons = {"aeri_memory", "zmq", "flecs", "x11", "parakeet", "chatterbox", "doctr", "opencv", "minilm", "dino2", "alpaca", "modal", "borg"}; // , "autodistill", "yolo", 
         // std::vector<std::string> server_icons = {"peach_core"};
 
         for (const auto& icon : server_icons)
@@ -2577,6 +2372,8 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         
         auto canvas = leaf.target<EditorCanvas>();
 
+        auto annotator = world->entity("InterlocutorAnnotator");
+
         auto chat_root = world->entity()
             .is_a(UIElement)
             .child_of(canvas)
@@ -2625,7 +2422,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
             .child_of(messages_panel)
             .add(flecs::OrderedChildren)
             .set<Position, Local>({12.0f, 16.0f})
-            .add<DebugRenderBounds>()
+            // .add<DebugRenderBounds>()
             .set<LayoutBox>({LayoutBox::Vertical, 4.0f, 1.0f})
             .set<Expand>({true, 0.0f, 0.0f, 1.0f, false, 0.0f, 0.0f, 0.0f});
 
@@ -2649,9 +2446,9 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         .set<RectRenderable>({0.0f, 0.0f, false, 0x000000FF})
         .child_of(leaf.target<EditorCanvas>());
         
-        create_badge(meta_input, UIElement, "Wesley", 0x6df0ffff, false, false, {}, {0}, {"W"}, {0x6df0ffff});
+        create_badge(meta_input, UIElement, "Wesley", 0x6df0ffff, true, false, {}, {0}, {"W"}, {0x6df0ffff});
         create_badge(meta_input, UIElement, "advises", 0xa34d1aff, false, true);
-        create_badge(meta_input, UIElement, "Heonae", 0xff75baff, false, false, {}, {0}, {"H"}, {0xff75baff});
+        create_badge(meta_input, UIElement, "Heonae", 0xff75baff, true, false, {}, {0}, {"H"}, {0xff75baff});
 
 
 
@@ -3688,8 +3485,9 @@ void interlocutor_response(std::map<std::string, msgpack::object>& res_map)
         });
 }
 
-void sync_representation_grounding(WordAnnotationSelector& selector, flecs::entity container, const std::string& template_str) 
+void sync_representation_grounding(WordAnnotationSelector& selector, const std::string& template_str) 
 {
+    flecs::entity container = selector.parent_entity;
     container.children([](flecs::entity child) { child.destruct(); });
 
     selector.selection_entities.clear(); 
@@ -3764,7 +3562,9 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                     msg.selection_entities = selector.selection_entities;
                     msg.token_count = selector.token_count;
                 }
+
                 selector.active = !selector.active;
+                world->ensure<ChatState>().input_focused = !selector.active;
                 if (selector.active && !selector.sentence_template.empty()) {
                     selector.start_index = 0;  // Reset to first word when activating
                     selector.end_index = 0;
@@ -3859,7 +3659,7 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                     // If no UI entities yet for this message, create them
                     if (selector.ui_entities.empty() && !selector.sentence_template.empty()) {
                         selector.dirty = true;
-                        recreate_annotation_entities(selector);
+                        // recreate_annotation_entities(selector);
                         // Save newly created entities back
                         new_msg.ui_entities = selector.ui_entities;
                         new_msg.selection_entities = selector.selection_entities;
@@ -3934,7 +3734,7 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                         selector.dirty = true;
                         selector.start_index = new_sel_start;
                         selector.end_index = new_sel_start;
-                        recreate_annotation_entities(selector);
+                        // recreate_annotation_entities(selector);
                     } else if (tokens[token_idx].type == TokenType::Relationship) {
                         // Assign digit to relationship part
                         // 0=source, 1=badge, 2=target
@@ -3946,13 +3746,13 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                         // badge part (1) doesn't accept digit assignment
                         selector.sentence_template = tokens_to_template(tokens);
                         selector.dirty = true;
-                        recreate_annotation_entities(selector);
+                        // recreate_annotation_entities(selector);
                     } else if (tokens[token_idx].type == TokenType::Entity) {
                         // Update entity binding symbol
                         tokens[token_idx].binding_symbol = std::to_string(digit);
                         selector.sentence_template = tokens_to_template(tokens);
                         selector.dirty = true;
-                        recreate_annotation_entities(selector);
+                        // recreate_annotation_entities(selector);
                     }
 
                     handled = true;
@@ -4026,7 +3826,8 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                         selector.dirty = true;
                         selector.start_index = new_sel_start;
                         selector.end_index = new_sel_start;
-                        recreate_annotation_entities(selector);
+                        sync_representation_grounding(selector, selector.sentence_template);
+                        // recreate_annotation_entities(selector);
                     } else if (tokens[token_idx].type == TokenType::Relationship) {
                         // Assign symbol to relationship part
                         // 0=source, 1=badge, 2=target
@@ -4038,13 +3839,14 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                         // badge part (1) doesn't accept symbol assignment
                         selector.sentence_template = tokens_to_template(tokens);
                         selector.dirty = true;
-                        recreate_annotation_entities(selector);
+                        // recreate_annotation_entities(selector);
                     } else if (tokens[token_idx].type == TokenType::Entity) {
                         // Update entity binding symbol
                         tokens[token_idx].binding_symbol = symbol;
                         selector.sentence_template = tokens_to_template(tokens);
                         selector.dirty = true;
-                        recreate_annotation_entities(selector);
+                        sync_representation_grounding(selector, selector.sentence_template);
+                        // recreate_annotation_entities(selector);
                     }
 
                     handled = true;
@@ -4087,7 +3889,7 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                         }
                         selector.sentence_template = tokens_to_template(tokens);
                         selector.dirty = true;
-                        recreate_annotation_entities(selector);
+                        // recreate_annotation_entities(selector);
                         handled = true;
                     }
                 }
@@ -4127,7 +3929,7 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                         tokens[token_idx].binding_symbol = "";
                         selector.sentence_template = tokens_to_template(tokens);
                         selector.dirty = true;
-                        recreate_annotation_entities(selector);
+                        // recreate_annotation_entities(selector);
                         handled = true;
                         return;
                     }
@@ -4157,7 +3959,7 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                         tokens[token_idx].target_symbol = target_symbol;
                         selector.sentence_template = tokens_to_template(tokens);
                         selector.dirty = true;
-                        recreate_annotation_entities(selector);
+                        // recreate_annotation_entities(selector);
                         handled = true;
                         return;
                     }
@@ -4219,7 +4021,10 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                     selector.dirty = true;
                     selector.start_index = new_sel_start;
                     selector.end_index = new_sel_start;
-                    recreate_annotation_entities(selector);
+
+                    flecs::entity interlocutorAnnotator = world->lookup("InterlocutorAnnotator");
+                    sync_representation_grounding(selector, selector.sentence_template);
+                    // recreate_annotation_entities(selector);
                     handled = true;
                 }
             });
@@ -4256,7 +4061,9 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                         tokens[token_idx].target_symbol = "";
                         selector.sentence_template = tokens_to_template(tokens);
                         selector.dirty = true;
-                        recreate_annotation_entities(selector);
+
+                        sync_representation_grounding(selector, selector.sentence_template);
+                        // recreate_annotation_entities(selector);
                         handled = true;
                     }
                 }
@@ -4329,13 +4136,16 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                         new_tokens.push_back(tokens[i]);
                     }
 
+                    world->defer_suspend();
                     // Update template and recreate UI entities
                     selector.sentence_template = tokens_to_template(new_tokens);
                     selector.dirty = true;
                     // Select source + relationship (first 2 of 3 parts)
                     selector.start_index = new_sel_start;
                     selector.end_index = new_sel_start + 1;
-                    recreate_annotation_entities(selector);
+                    // recreate_annotation_entities(selector);
+                    sync_representation_grounding(selector, selector.sentence_template);
+                    world->defer_resume();
 
                     handled = true;
                 }
@@ -4393,7 +4203,7 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                         }
                         selector.sentence_template = tokens_to_template(tokens);
                         selector.dirty = true;
-                        recreate_annotation_entities(selector);
+                        // recreate_annotation_entities(selector);
                         handled = true;
                     }
                 }
@@ -4437,9 +4247,10 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                     
                     // TODO: Create thinking indicators...
 
+                    world->defer_suspend();
                     auto representation_ux = world->entity()
                         .is_a(UIElement)
-                        .add<DebugRenderBounds>()
+                        // .add<DebugRenderBounds>()
                         .set<FlowLayoutBox>({0.0f, 0.0f, 2.0f, 0.0f, 2.0f})
                         .set<Expand>({true, 0, 0, 1, false, 0, 0, 0})
                         .add(flecs::OrderedChildren)
@@ -4468,10 +4279,9 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                         .set<RectRenderable>({0, 0, false, 0x4488FFAA})
                         .set<RenderStatus>({true})
                         .set<ZIndex>({15});
+                        world->defer_resume();
                         
-                        sync_representation_grounding(interlocutorAnnotator.ensure<WordAnnotationSelector>(), representation_ux, chat->draft);
-
-                    return;
+                        sync_representation_grounding(interlocutorAnnotator.ensure<WordAnnotationSelector>(), chat->draft);
                 });
 
             chat->draft.clear();
@@ -6039,13 +5849,13 @@ int main(int, char *[]) {
         sprite.height = desired_h;
     });
 
-    auto debugRenderBounds = world->system<RenderQueue, UIElementBounds, DebugRenderBounds>()
-    .term_at(0).src(renderQueueEntity)
-    .each([](flecs::entity e, RenderQueue& render_queue, UIElementBounds& bounds, DebugRenderBounds)
-    {
-        RectRenderable debug_bound {bounds.xmax - bounds.xmin, bounds.ymax - bounds.ymin, true, 0xFFFF00FF};
-        render_queue.addRectCommand({bounds.xmin, bounds.ymin}, debug_bound, 100);
-    });
+    // auto debugRenderBounds = world->system<RenderQueue, UIElementBounds, DebugRenderBounds>()
+    // .term_at(0).src(renderQueueEntity)
+    // .each([](flecs::entity e, RenderQueue& render_queue, UIElementBounds& bounds, DebugRenderBounds)
+    // {
+    //     RectRenderable debug_bound {bounds.xmax - bounds.xmin, bounds.ymax - bounds.ymin, true, 0xFFFF00FF};
+    //     render_queue.addRectCommand({bounds.xmin, bounds.ymin}, debug_bound, 100);
+    // });
 
     // Word annotation selector - updates bounds for selection highlight (entity creation happens in key handlers)
     auto wordAnnotationBoundsSystem = world->system<WordAnnotationSelector, Position, RectRenderable>()
@@ -7562,316 +7372,6 @@ int main(int, char *[]) {
         glfwPollEvents();
         world->defer_end();
         world->progress();
-
-        // Process completed interpretations and create badges
-        // TODO: REFACTOR THIS TO USE TRADEWINDS INSTEAD OF A BESPOKE MUTEX OUT OF LOOP LOL
-        {
-            std::lock_guard<std::mutex> lock(pending_interpretations_mutex);
-            auto it = pending_interpretations.begin();
-            while (it != pending_interpretations.end()) {
-                if ((*it)->completed.load()) {
-                    auto& pending = *it;
-                    auto UIElement = world->lookup("UIElement");
-
-                    // Create "Heonae understands" header
-                    auto meta_response = world->entity()
-                        .is_a(UIElement)
-                        .set<LayoutBox>({LayoutBox::Horizontal, 2.0f})
-                        .add(flecs::OrderedChildren)
-                        .child_of(pending->message_list);
-
-                    // TODO: Reification underline or sphere indicator
-                    // create_badge(meta_response, UIElement, "Heonae", 0xc72783ff, false, false, "1");
-                    // create_badge(meta_response, UIElement, "understands", 0xc72783ff, false, true);
-
-                    // Split draft into words for interleaving
-                    std::vector<std::string> words;
-                    std::istringstream iss(pending->draft);
-                    std::string word;
-                    while (iss >> word) {
-                        words.push_back(word);
-                    }
-
-                    // If no LLM interpretation, just create text entities without badges
-                    if (pending->result.empty()) {
-                        auto meta_response_data = world->entity()
-                            .is_a(UIElement)
-                            // .set<FlowLayoutBox>({0.0f, 0.0f, 2.0f, 0.0f, 2.0f})
-                            // .set<LayoutBox>({LayoutBox::Horizontal, 0.0f})
-                            .set<FlowLayoutBox>({0.0f, 0.0f, 2.0f, 0.0f, 2.0f})
-                            // .set<Expand>({true, 0, 0, 1, false, 0, 0, 0})
-                            .add(flecs::OrderedChildren)
-                            .child_of(pending->message_list);
-
-                        // Register message in global list
-                        g_annotatable_messages.push_back({pending->draft, meta_response_data});
-                        int msg_idx = (int)g_annotatable_messages.size() - 1;
-
-                        // Create or update the single global annotation selector
-                        static flecs::entity g_annotation_entity = flecs::entity::null();
-                        if (!g_annotation_entity.is_valid() || !g_annotation_entity.is_alive()) {
-                            g_annotation_entity = world->entity()
-                                .set<WordAnnotationSelector>({
-                                    pending->draft,           // sentence_template
-                                    {},                       // ui_entities
-                                    {},                       // selection_entities
-                                    meta_response_data,       // parent_entity
-                                    0, 0,                     // start_index, end_index
-                                    0,                        // token_count
-                                    false,                    // active
-                                    true,                     // dirty
-                                    0x4488FFAA                // highlight_color
-                                })
-                                .set<Position, World>({0, 0})
-                                .set<RectRenderable>({0, 0, false, 0x4488FFAA})
-                                .set<RenderStatus>({true})
-                                .set<ZIndex>({15});
-                        } else {
-                            // Save current message state before switching
-                            WordAnnotationSelector& selector = g_annotation_entity.ensure<WordAnnotationSelector>();
-                            if (g_current_message_idx >= 0 && g_current_message_idx < (int)g_annotatable_messages.size()) {
-                                auto& old_msg = g_annotatable_messages[g_current_message_idx];
-                                old_msg.sentence_template = selector.sentence_template;
-                                old_msg.ui_entities = selector.ui_entities;
-                                old_msg.selection_entities = selector.selection_entities;
-                                old_msg.token_count = selector.token_count;
-                            }
-                            // Point selector to new message (don't destroy old entities!)
-                            selector.ui_entities.clear();
-                            selector.selection_entities.clear();
-                            selector.sentence_template = pending->draft;
-                            selector.parent_entity = meta_response_data;
-                            selector.start_index = 0;
-                            selector.end_index = 0;
-                            selector.dirty = true;
-                        }
-
-                        g_current_message_idx = msg_idx;
-
-                        // Create UI entities immediately
-                        WordAnnotationSelector& selector = g_annotation_entity.ensure<WordAnnotationSelector>();
-                        recreate_annotation_entities(selector);
-                    } else {
-                    // Parse JSON and create dynamic badges
-                    try {
-                        json result = json::parse(pending->result);
-
-                        // Binding type for relationship slots
-                        enum class SlotBindingType {
-                            Standard,  // Single bound entity
-                            Set,       // Multiple bound entities
-                            Wildcard   // Unbound/intensional slot
-                        };
-
-                        // Build a map of word indices to node/edge info
-                        struct Annotation {
-                            std::string label;
-                            uint32_t color;
-                            bool is_relationship;
-                            bool is_binding;  // True if this binds to an existing entity
-                            // For relationships: vectors of source/target IDs and colors
-                            std::vector<std::string> prefix_ids;   // Source node numbers (for relationships) or empty
-                            std::vector<uint32_t> prefix_tints;    // Source node colors
-                            std::vector<std::string> postfix_ids;  // Target node numbers (for relationships) or node's own number
-                            std::vector<uint32_t> postfix_tints;   // Target node colors or node's own color
-                            SlotBindingType prefix_type;   // Type of source binding
-                            SlotBindingType postfix_type;  // Type of target binding
-                            int end_idx;  // End index of this annotation span
-                        };
-                        std::map<int, Annotation> start_annotations;
-
-                        // Helper to determine slot binding type
-                        auto get_slot_type = [](const std::vector<std::string>& ids) -> SlotBindingType {
-                            if (ids.empty()) return SlotBindingType::Standard;
-                            if (ids.size() == 1 && ids[0] == "*") return SlotBindingType::Wildcard;
-                            if (ids.size() > 1) return SlotBindingType::Set;
-                            return SlotBindingType::Standard;
-                        };
-
-                        // Parse hex color string to uint32_t with alpha
-                        auto parse_hex_color = [](const std::string& hex) -> uint32_t {
-                            std::string clean_hex = hex;
-                            // Remove leading '#' if present
-                            if (!clean_hex.empty() && clean_hex[0] == '#') {
-                                clean_hex = clean_hex.substr(1);
-                            }
-                            // Parse as RGB, add full alpha
-                            uint32_t rgb = std::stoul(clean_hex, nullptr, 16);
-                            return (rgb << 8) | 0xff;
-                        };
-
-                        // Fallback color generator based on ID hash
-                        auto hash_color = [](const std::string& id) -> uint32_t {
-                            std::hash<std::string> hasher;
-                            size_t h = hasher(id);
-                            uint8_t r = 80 + (h % 150);
-                            uint8_t g = 80 + ((h >> 8) % 150);
-                            uint8_t b = 80 + ((h >> 16) % 150);
-                            return (r << 24) | (g << 16) | (b << 8) | 0xff;
-                        };
-
-                        std::map<std::string, uint32_t> node_colors;
-                        std::map<std::string, std::string> node_numbers;  // Map node ID to its display number
-                        std::vector<KnownEntity> new_entities;  // New entities to add after processing
-
-                        if (result.contains("nodes")) {
-                            for (auto& node : result["nodes"]) {
-                                std::string id = node["id"].get<std::string>();
-                                std::string label = node["label"].get<std::string>();
-                                int start_idx = node["start_index"].get<int>();
-                                int end_idx = node["end_index"].get<int>();
-                                bool is_new = node.value("is_new", true);
-                                std::string binds_to = node.value("binds_to", "");
-
-                                uint32_t color;
-                                std::string display_num;
-                                bool is_binding = false;
-                                std::string color_hex;
-
-                                if (!is_new && !binds_to.empty()) {
-                                    // This is a binding to an existing entity
-                                    is_binding = true;
-                                    std::lock_guard<std::mutex> lock(known_entities_mutex);
-                                    for (const auto& known : known_entities) {
-                                        if (known.id == binds_to) {
-                                            color = parse_hex_color(known.color);
-                                            display_num = known.display_symbol;
-                                            color_hex = known.color;
-                                            break;
-                                        }
-                                    }
-                                    // Fallback if binding target not found
-                                    if (display_num.empty()) {
-                                        color = hash_color(id);
-                                        display_num = "?";
-                                    }
-                                } else {
-                                    // This is a new entity
-                                    if (node.contains("color")) {
-                                        try {
-                                            color_hex = node["color"].get<std::string>();
-                                            color = parse_hex_color(color_hex);
-                                        } catch (...) {
-                                            color = hash_color(id);
-                                            // Convert hash color back to hex for storage
-                                            std::stringstream ss;
-                                            ss << std::hex << ((color >> 8) & 0xFFFFFF);
-                                            color_hex = ss.str();
-                                        }
-                                    } else {
-                                        color = hash_color(id);
-                                        std::stringstream ss;
-                                        ss << std::hex << ((color >> 8) & 0xFFFFFF);
-                                        color_hex = ss.str();
-                                    }
-
-                                    // Assign new display symbol (use next available number)
-                                    std::string assigned_symbol;
-                                    {
-                                        std::lock_guard<std::mutex> lock(known_entities_mutex);
-                                        assigned_symbol = std::to_string(next_entity_number++);
-                                    }
-                                    display_num = assigned_symbol;
-
-                                    // Queue this entity to be added to known entities
-                                    new_entities.push_back({id, label, color_hex, assigned_symbol});
-                                }
-
-                                node_colors[id] = color;
-                                node_numbers[id] = display_num;
-
-                                // For nodes: no prefix, single postfix with the node's number
-                                start_annotations[start_idx] = {label, color, false, is_binding, {}, {}, {display_num}, {color}, SlotBindingType::Standard, SlotBindingType::Standard, end_idx};
-                            }
-                        }
-
-                        // Add new entities to the global known entities list
-                        {
-                            std::lock_guard<std::mutex> lock(known_entities_mutex);
-                            for (const auto& entity : new_entities) {
-                                known_entities.push_back(entity);
-                            }
-                        }
-
-                        // Process edges (relationships)
-                        if (result.contains("edges")) {
-                            for (auto& edge : result["edges"]) {
-                                bool in_situ = edge.value("in-situ", false);
-                                if (in_situ && edge.contains("start_index")) {
-                                    std::string rel = edge["relationship"].get<std::string>();
-                                    int start_idx = edge["start_index"].get<int>();
-                                    int end_idx = edge["end_index"].get<int>();
-
-                                    // Use semantic color from API if available
-                                    uint32_t color;
-                                    if (edge.contains("color")) {
-                                        try {
-                                            color = parse_hex_color(edge["color"].get<std::string>());
-                                        } catch (...) {
-                                            color = 0xad734bff;
-                                        }
-                                    } else {
-                                        color = 0xad734bff;
-                                    }
-
-                                    // Wildcard color - muted purple/gray for unbound slots
-                                    const uint32_t WILDCARD_COLOR = 0x8866aaff;
-
-                                    // Collect source IDs and colors (now an array)
-                                    std::vector<std::string> source_nums;
-                                    std::vector<uint32_t> source_colors;
-                                    if (edge.contains("sources")) {
-                                        for (const auto& src : edge["sources"]) {
-                                            std::string source = src.get<std::string>();
-                                            if (source == "*") {
-                                                // Wildcard - unbound slot
-                                                source_nums.push_back("*");
-                                                source_colors.push_back(WILDCARD_COLOR);
-                                            } else {
-                                                source_nums.push_back(node_numbers.count(source) ? node_numbers[source] : "?");
-                                                source_colors.push_back(node_colors.count(source) ? node_colors[source] : 0x888888ff);
-                                            }
-                                        }
-                                    }
-
-                                    // Collect target IDs and colors (now an array)
-                                    std::vector<std::string> target_nums;
-                                    std::vector<uint32_t> target_colors;
-                                    if (edge.contains("targets")) {
-                                        for (const auto& tgt : edge["targets"]) {
-                                            std::string target = tgt.get<std::string>();
-                                            if (target == "*") {
-                                                // Wildcard - unbound slot
-                                                target_nums.push_back("*");
-                                                target_colors.push_back(WILDCARD_COLOR);
-                                            } else {
-                                                target_nums.push_back(node_numbers.count(target) ? node_numbers[target] : "?");
-                                                target_colors.push_back(node_colors.count(target) ? node_colors[target] : 0x888888ff);
-                                            }
-                                        }
-                                    }
-
-                                    // Determine binding types
-                                    SlotBindingType src_type = get_slot_type(source_nums);
-                                    SlotBindingType tgt_type = get_slot_type(target_nums);
-
-                                    start_annotations[start_idx] = {rel, color, true, false, source_nums, source_colors, target_nums, target_colors, src_type, tgt_type, end_idx};
-                                }
-                            }
-                        }
-
-                    } catch (const json::exception& e) {
-                        std::cerr << "[Interpretation] JSON parse error: " << e.what() << std::endl;
-                        std::cerr << "[Interpretation] Raw result: " << pending->result << std::endl;
-                    }
-                    } // end else (has result)
-
-                    it = pending_interpretations.erase(it);
-                } else {
-                    ++it;
-                }
-            }
-        }
 
         FrameMark;
         nvgEndFrame(vg);
