@@ -772,7 +772,13 @@ std::vector<std::string> previous_sentences;
 const int MAX_PREVIOUS_SENTENCES = 10;  // Keep last N sentences for context
 
 
-class VirtualList
+// Superseded by the VirtualList component in components.h, which is what the
+// Entities panel uses. This one never worked: Populate()'s element-creation
+// body is commented out, so `entities` stays empty, page_max resolves to 0 and
+// Refresh() iterates nothing -- the Condensate file list scans the directory
+// and then renders none of it. Kept only because Condensate still calls it.
+// TODO: port Condensate onto the VirtualList component and delete this.
+class LegacyVirtualList
 {
 public:
     size_t index = 0;
@@ -785,7 +791,7 @@ public:
     virtual flecs::entity CreatePrevElement(flecs::world*) = 0;
 };
 
-class FileNavVirtualList : public VirtualList {
+class FileNavVirtualList : public LegacyVirtualList {
 public:
     std::string path_to_scan;
     std::vector<std::string> file_names;
@@ -1839,29 +1845,120 @@ struct RenderCommand {
     bool useGradient;
     RenderGradient gradient;
 
+    // Hierarchy depth, as a tiebreaker within a layer. Nested UI draws above
+    // what contains it without every widget having to hand-allocate itself a
+    // higher ZIndex than its parent -- which does not scale, since a badge's
+    // layers are fixed constants and nesting can go arbitrarily deep.
+    int depth = 0;
+
     bool operator<(const RenderCommand& other) const {
-        return zIndex < other.zIndex;
+        if (zIndex != other.zIndex) return zIndex < other.zIndex;
+        return depth < other.depth;
     }
 };
 
+
+// Whether `text` would render wider than `width` on one line -- i.e. whether a
+// badge holding it is about to become a tall block rather than a wide one.
+static bool badge_text_exceeds(const std::string& text, float width)
+{
+    if (!g_yoga_vg || text.empty()) return false;
+    nvgFontSize(g_yoga_vg, 16.0f);
+    nvgFontFace(g_yoga_vg, "CharisSIL");
+    return measureText(g_yoga_vg, text, 0.0f).w > width;
+}
+
+// Longest prefix of `text` whose rendered width fits `max_width`, with an
+// ellipsis appended when anything was dropped.
+//
+// A badge is as wide as its label, so a label with no ceiling makes a badge with
+// no ceiling -- one long entity name pushes everything beside it off the panel.
+// Callers that can afford the vertical space use create_longform_badge instead,
+// which wraps rather than truncating; this is for the single-line contexts, a
+// list row above all, where the row pitch is fixed and wrapping is not an option.
+static std::string ellipsize_text(const std::string& text, const char* font_face,
+                                  float font_size, float max_width)
+{
+    if (!g_yoga_vg || max_width <= 0.0f || text.empty()) return text;
+
+    nvgFontSize(g_yoga_vg, font_size);
+    nvgFontFace(g_yoga_vg, font_face);
+
+    if (measureText(g_yoga_vg, text, 0.0f).w <= max_width) return text;
+
+    const std::string suffix = "...";
+    auto fits = [&](size_t n) {
+        return measureText(g_yoga_vg, text.substr(0, n) + suffix, 0.0f).w <= max_width;
+    };
+
+    // Largest prefix length that still fits once the ellipsis is added.
+    // Binary search rather than a character walk, so a pasted paragraph costs
+    // log(n) measurements instead of n.
+    size_t lo = 0, hi = text.size();          // lo always fits, hi may not
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo + 1) / 2;
+        // Never cut inside a UTF-8 sequence.
+        while (mid > lo && (static_cast<unsigned char>(text[mid]) & 0xC0) == 0x80) mid--;
+        if (mid == lo) break;                 // no boundary left to test
+        if (fits(mid)) lo = mid; else hi = mid - 1;
+    }
+
+    return text.substr(0, lo) + suffix;
+}
+
+// Calibrated badge height. A badge that nests another grows by NEST_PAD on the
+// top and bottom, so the inner block reads as contained rather than as exactly
+// filling its parent.
+static constexpr float BADGE_HEIGHT = 25.0f;
+static constexpr float BADGE_NEST_PAD = 4.0f;
+
+// Space between a relation's label and the block nested beside it.
+static constexpr float BADGE_NEST_GAP = 6.0f;
+
+// Horizontal padding a badge's content row reserves (xPad on each side).
+static constexpr float BADGE_LONGFORM_INSET = 12.0f;
+
+// Width of each arrowhead on a relationship badge. Shared by the geometry below
+// and by the horizontal padding create_badge_impl reserves, so a label can never
+// run into a tip.
+static constexpr float BADGE_ARROW_TIP = 12.0f;
+
+// Ceiling on a badge label's rendered width. Past this the label is ellipsized,
+// so no badge can grow without bound and shove its neighbours off the panel.
+static constexpr float BADGE_MAX_TEXT_WIDTH = 190.0f;
 
 void draw_double_arrow(NVGcontext* vg, const RenderCommand* cmd, const CustomRenderable& data)
 {
     float x = cmd->pos.x;
     float y = cmd->pos.y;
 
-    float leftArrowStartX = x - data.height/2.0f;
-    float rightArrowStartX = x + data.width-data.height/2.0f;
     float midY = y + data.height / 2.0f;
+
+    // A triangle at each end, both pointing outward -- so the shape reads as
+    // relating what is on its left to what is on its right, symmetrically.
+    //
+    // The previous form notched the left end *inward*, which made it a flag:
+    // one point, one bitten-out tail, and a direction it did not actually mean.
+    // It also drew half a height to the left of x, outside the box Yoga
+    // measured; both tips now sit inside [x, x + width], so the drawn shape and
+    // the laid-out shape are the same rectangle.
+    //
+    // The tip width is a constant rather than a fraction of height, so a block
+    // that grows to hold a nested badge keeps the same arrowheads instead of
+    // sprouting larger ones. Clamped so a very narrow badge degenerates to a
+    // plain diamond rather than turning itself inside out.
+    float tip = std::min(BADGE_ARROW_TIP, data.width * 0.5f);
+    float bodyLeft = x + tip;
+    float bodyRight = x + data.width - tip;
 
     nvgBeginPath(vg);
 
-    nvgMoveTo(vg, leftArrowStartX, y);
-    nvgLineTo(vg, x, midY);
-    nvgLineTo(vg, leftArrowStartX, y+data.height);
-    nvgLineTo(vg, rightArrowStartX, y+data.height);
-    nvgLineTo(vg, x+data.width, midY);
-    nvgLineTo(vg, rightArrowStartX, y);
+    nvgMoveTo(vg, x, midY);                        // left tip
+    nvgLineTo(vg, bodyLeft, y);
+    nvgLineTo(vg, bodyRight, y);
+    nvgLineTo(vg, x + data.width, midY);           // right tip
+    nvgLineTo(vg, bodyRight, y + data.height);
+    nvgLineTo(vg, bodyLeft, y + data.height);
 
     nvgClosePath(vg);
 
@@ -1894,7 +1991,14 @@ void draw_double_arrow(NVGcontext* vg, const RenderCommand* cmd, const CustomRen
     }
 }
 
-flecs::entity create_slot_image(flecs::entity parent_entity, const std::string& symbol, uint32_t tint) {
+// `yoga` opts the sprite into the Yoga tree, pinned to its native pixel size.
+// Callers still on the legacy layout (create_triple_block) leave it off, since
+// a Yoga node inside a LayoutBox parent would be sized by a different pass.
+//
+// `preserve_case` keeps a lowercase glyph lowercase. Off by default because
+// binding symbols are written lowercase but have always drawn as capitals; the
+// sprite-font path turns it on, since there a string's own casing is the point.
+flecs::entity create_slot_image(flecs::entity parent_entity, const std::string& symbol, uint32_t tint, bool yoga = false, bool preserve_case = false) {
     auto UIElement = world->lookup("UIElement");
     uint32_t tint_color = scale_color(tint, 1.3f);
     unsigned char r = (tint_color >> 24) & 0xFF;
@@ -1915,18 +2019,47 @@ flecs::entity create_slot_image(flecs::entity parent_entity, const std::string& 
         // Standard MNIST digit
         image_path = "mnist/set_0/" + symbol + ".png";
     } else {
-        // Non-digit - use uppercase letter_set sprite
-        std::string upper_symbol = symbol;
-        for (auto& c : upper_symbol) c = std::toupper(static_cast<unsigned char>(c));
-        image_path = "letter_sets/set_01/" + upper_symbol + ".png";
+        // Non-digit - letter_set sprite. The sheets ship both cases, so
+        // preserve_case just decides which file to reach for.
+        std::string letter = symbol;
+        if (!preserve_case) {
+            for (auto& c : letter) c = std::toupper(static_cast<unsigned char>(c));
+        }
+        image_path = "letter_sets/set_01/" + letter + ".png";
     }
 
-    return world->entity()
+    flecs::entity slot = world->entity()
         .is_a(UIElement)
         .child_of(parent_entity)
         .set<ImageCreator>({image_path, 0.9f, 0.9f, nvgRGBA(r, g, b, a)})
         .set<ZIndex>({25});
+
+    if (yoga) {
+        // UINativeImageSize reads back through ImageRenderable, which the
+        // ImageCreator observer above has already produced -- it runs
+        // synchronously on set, so the sprite has a size before Yoga measures.
+        slot.add<UIYoga>().add<UINativeImageSize>();
+    }
+
+    return slot;
 };
+
+// Renders a string as a run of sprite-sheet glyphs -- a sprite font, one image
+// entity per character, flowed by whatever row the caller passes as parent.
+//
+// This is what lets a symbol be a *string* rather than a single glyph: with more
+// entities than there are letters, ids run to "AA", "AB" and so on, and each
+// character has to come off the same sheet the one-letter ids do. Characters
+// with no sprite (spaces, punctuation) are skipped rather than drawn as a
+// missing-texture box.
+void create_sprite_text(flecs::entity parent, const std::string& text, uint32_t tint, bool yoga = true)
+{
+    for (char c : text) {
+        unsigned char uc = static_cast<unsigned char>(c);
+        if (!std::isalnum(uc)) continue;
+        create_slot_image(parent, std::string(1, c), tint, yoga, true);
+    }
+}
 
 void create_triple_block(flecs::entity parent, const SentenceToken& token) {
     auto UIElement = world->lookup("UIElement");
@@ -1965,14 +2098,67 @@ void create_triple_block(flecs::entity parent, const SentenceToken& token) {
     create_slot_image(content, token.target_symbol, tgt_color); // Object
 }
 
-// Forward declaration for vector-based version
+// What a badge is standing for, which decides how it is drawn.
+//
+// Symbol is the default and the common case: the badge names something -- a
+// word, a compound-word type, an instance of a physical object -- and reads as
+// a solid token, filled with its identifying gradient.
+//
+// String is for a badge whose content *is* the text: a message, a name someone
+// typed, a free-text value. Drawn as an outline rather than a filled gradient,
+// because there is no symbol here to give a colour identity to; the colour is a
+// border around content, not a fill standing in for a thing.
+enum class BadgeStyle {
+    Symbol,
+    String,
+};
+
+// Makes a badge wrap its label at `width` instead of running on in one line.
+// Shared by the automatic case (a label past the ceiling) and the deliberate
+// one (create_longform_badge), so both produce the same shape.
+static void badge_apply_wrap(flecs::entity badge, flecs::entity content,
+                             flecs::entity label, float width)
+{
+    if (TextRenderable* text = label.try_get_mut<TextRenderable>()) {
+        // Both Yoga's measure callback and the renderer key off wrapWidth.
+        text->wrapWidth = width;
+    }
+    // Height now follows the line count rather than the calibrated single line.
+    badge.ensure<UISize>().h = YGUndefined;
+    badge.set<UIPadding>({BADGE_NEST_PAD, 0.0f, BADGE_NEST_PAD, 0.0f});
+    // The single-line offset does not apply to wrapped text.
+    if (UIMargin* margin = label.try_get_mut<UIMargin>()) margin->top = 0.0f;
+    if (UIFlexContainer* row = content.try_get_mut<UIFlexContainer>()) {
+        row->items = YGAlignCenter;
+    }
+}
+
+static void badge_wrap_if_wide(flecs::entity badge, flecs::entity content,
+                               flecs::entity label, const std::string& text, float width)
+{
+    if (!g_yoga_vg || text.empty()) return;
+    nvgFontSize(g_yoga_vg, 16.0f);
+    nvgFontFace(g_yoga_vg, "CharisSIL");
+    if (measureText(g_yoga_vg, text, 0.0f).w <= width) return;
+    badge_apply_wrap(badge, content, label, width);
+}
+
+// Forward declaration for vector-based version.
+//
+// `out_content` receives the badge's inner row. Handed back directly rather than
+// left to be read off the BadgeContent component, because a caller that wants to
+// nest something needs the row in the same breath as the badge -- and reading a
+// component straight back after setting it only works while the world is not
+// deferred, which is not a condition a widget factory should impose on callers.
 flecs::entity create_badge_impl(flecs::entity parent, flecs::entity UIElement,
                            const char* text, uint32_t base_color,
                            bool is_capsule, bool is_double_arrow,
                            const std::vector<std::string>& prefix_ids,
                            const std::vector<uint32_t>& prefix_tints,
                            const std::vector<std::string>& postfix_ids,
-                           const std::vector<uint32_t>& postfix_tints);
+                           const std::vector<uint32_t>& postfix_tints,
+                           flecs::entity* out_content = nullptr,
+                           BadgeStyle style = BadgeStyle::Symbol);
 
 // Backward-compatible overload with single prefix/postfix
 flecs::entity create_badge(flecs::entity parent, flecs::entity UIElement,
@@ -2016,7 +2202,11 @@ flecs::entity create_badge_impl(flecs::entity parent, flecs::entity UIElement,
                            const std::vector<std::string>& prefix_ids,
                            const std::vector<uint32_t>& prefix_tints,
                            const std::vector<std::string>& postfix_ids,
-                           const std::vector<uint32_t>& postfix_tints) {
+                           const std::vector<uint32_t>& postfix_tints,
+                           flecs::entity* out_content,
+                           BadgeStyle style) {
+
+    const bool outlined = (style == BadgeStyle::String);
 
     // --- 1. Color Logic (matching comp_gen.py) ---
     uint32_t dark = base_color;
@@ -2029,7 +2219,11 @@ flecs::entity create_badge_impl(flecs::entity parent, flecs::entity UIElement,
 
     // --- 2. Dimensions & Shape ---
     float corner_radius = 4.0f;
-    float badge_height = 25.0f; // Base height
+    float badge_height = BADGE_HEIGHT;
+
+    // Distance from the badge's top edge to the top of the text's line box.
+    // Calibrated by eye against the sprites, which sit at y=0.
+    constexpr float BADGE_TEXT_TOP = 6.0f;
 
     if (is_capsule) {
         corner_radius = badge_height / 2.0f;
@@ -2037,46 +2231,85 @@ flecs::entity create_badge_impl(flecs::entity parent, flecs::entity UIElement,
 
     // --- 3. Create Entities ---
 
-    flecs::entity badge = flecs::entity::null();
-
     float xPad = 6.0f;
+    if (is_double_arrow) xPad += BADGE_ARROW_TIP;   // room for the arrow tips
 
-    // The badge's internal layout is deliberately left on the legacy path --
-    // it is calibrated. UIYoga + UIYogaLegacyLeaf only lets a Yoga parent
-    // position the badge as a whole, using the size the legacy layout computes.
+    // The badge is a Yoga flex row all the way down, not a UIYogaLegacyLeaf.
+    //
+    // The legacy pass runs at PostLoad, a phase *after* Yoga's PreFrame pass, so
+    // a legacy-sized badge was always placed using the size computed on the
+    // previous frame. A badge built this frame -- a list row scrolling in --
+    // therefore rendered its sprites at a stale offset for one frame, which
+    // read as the sprite popping in at the left edge and then jumping into
+    // place. Sizing and placing the whole subtree in one PreFrame pass removes
+    // the lag entirely.
+    //
+    // Height stays pinned to the calibrated 25px; width is left auto so Yoga
+    // derives it from the content, which is what UIContainer used to do.
+    //
+    // The horizontal padding lives on the inner content row, not here, so that
+    // the outline's zero insets are unambiguously the badge's own edges --
+    // absolute children resolve against the padding box, and a padded badge
+    // would inset the outline by xPad on each side.
+    flecs::entity badge = world->entity()
+        .is_a(UIElement)
+        .child_of(parent)
+        .add(flecs::OrderedChildren)
+        .add<UIYoga>()
+        .set<UISize>({YGUndefined, badge_height})
+        .set<UIFlexContainer>({
+            YGFlexDirectionRow, YGWrapNoWrap,
+            YGJustifyFlexStart, YGAlignStretch, 0.0f})
+        .set<ZIndex>({20});
+
+    if (!outlined) {
+        badge.set<RenderGradient>({dark, very_dark}); // Vertical gradient
+    }
+
     if (is_double_arrow)
     {
-        xPad += 25.0f/2;
-        badge = world->entity()
-            .is_a(UIElement)
-            .child_of(parent)
-            .add<UIYoga>()
-            .add<UIYogaLegacyLeaf>()
-            .set<CustomRenderable>({100.0f, 25.0f, true, outline_color, 0, 0, draw_double_arrow})
-            .set<RenderGradient>({dark, very_dark}) // Vertical gradient
-            .set<UIContainer>({xPad, 0})
-            .set<ZIndex>({20});
-
+        badge.set<CustomRenderable>({100.0f, badge_height, true, outline_color, 0, 0, draw_double_arrow});
     } else
     {
-        badge = world->entity()
-            .is_a(UIElement)
-            .child_of(parent)
-            .add<UIYoga>()
-            .add<UIYogaLegacyLeaf>()
-            .set<RoundedRectRenderable>({100.0f, badge_height, corner_radius, false, 0x000000FF})
-            .set<RenderGradient>({dark, very_dark}) // Vertical gradient
-            .set<UIContainer>({xPad, 0})
-            .set<ZIndex>({20});
+        // A string badge keeps a dark ground so its text stays legible against
+        // whatever is behind it, but no gradient -- the colour lives in the
+        // border instead.
+        badge.set<RoundedRectRenderable>({100.0f, badge_height, corner_radius, false,
+                                          outlined ? 0x141414E0 : 0x000000FF});
 
-        // Outline Overlay
+        // Outline overlay: out of flow, so it tracks the badge's auto width
+        // without being measured as content the way the old Expand fill was.
+        // Drawn at full strength for a string badge, since it is the only thing
+        // carrying the colour.
         world->entity()
             .is_a(UIElement)
             .child_of(badge)
-            .set<Expand>({true, 0, 0, 1.0f, true, 0, 0, 1.0f})
-            .set<RoundedRectRenderable>({100.0f, badge_height, corner_radius, true, outline_color})
+            .add<UIYoga>()
+            .set<UIAbsoluteEdges>({0.0f, 0.0f, 0.0f, 0.0f})
+            .set<RoundedRectRenderable>({100.0f, badge_height, corner_radius, true,
+                                         outlined ? (light | 0xFF) : outline_color})
             .set<ZIndex>({22});
     }
+
+    // Content row: carries the padding and holds prefix sprites, label and
+    // postfix sprites in order. The badge stretches it to the full 25px so this
+    // row's top *is* the badge's top, which is where the old badge_content sat.
+    //
+    // FlexStart, not centred. The old layout top-aligned the sprites at y=0 and
+    // gave the text a hand-tuned 6px offset, and that offset is not what
+    // centring produces: measureText reports the full line box (ascender to
+    // descender, times scaleY), which is taller than the glyphs actually drawn,
+    // so centring it rides the visible text too high. The margins below keep
+    // the calibrated positions.
+    flecs::entity content = world->entity()
+        .is_a(UIElement)
+        .child_of(badge)
+        .add(flecs::OrderedChildren)
+        .add<UIYoga>()
+        .set<UIFlexContainer>({
+            YGFlexDirectionRow, YGWrapNoWrap,
+            YGJustifyFlexStart, YGAlignFlexStart, 0.0f})
+        .set<UIPadding>({0.0f, xPad, 0.0f, xPad});
 
     // Helper lambda to create MNIST digit or wildcard image
     // auto create_slot_image = [&](flecs::entity parent_entity, const std::string& symbol, uint32_t tint) {
@@ -2112,12 +2345,15 @@ flecs::entity create_badge_impl(flecs::entity parent, flecs::entity UIElement,
     //         .set<ZIndex>({25});
     // };
 
-    // Helper lambda to create text element
+    // Helper lambda to create text element. The 6px that used to be a
+    // Position<Local> offset is now a top margin, so Yoga reproduces the
+    // calibrated baseline instead of the layout deciding one for us.
     auto create_text_element = [&](flecs::entity parent_entity, const char* txt, uint32_t color_val) {
         world->entity()
             .is_a(UIElement)
             .child_of(parent_entity)
-            .set<Position, Local>({0.0f, 6.0f})
+            .add<UIYoga>()
+            .set<UIMargin>({BADGE_TEXT_TOP, 0.0f, 0.0f, 0.0f})
             .set<TextRenderable>({txt, "CharisSIL", 16.0f, color_val})
             .set<ZIndex>({25});
     };
@@ -2137,7 +2373,7 @@ flecs::entity create_badge_impl(flecs::entity parent, flecs::entity UIElement,
                 create_text_element(parent_entity, ",", white);
             }
             uint32_t tint = (i < tints.size()) ? tints[i] : 0x888888ff;
-            create_slot_image(parent_entity, ids[i], tint);
+            create_slot_image(parent_entity, ids[i], tint, true);
         }
 
         if (is_set) {
@@ -2145,35 +2381,38 @@ flecs::entity create_badge_impl(flecs::entity parent, flecs::entity UIElement,
         }
     };
 
-    // Create content container if we have prefix or postfix
-    flecs::entity badge_text_parent = badge;
-    if (!prefix_ids.empty() || !postfix_ids.empty())
-    {
-        auto badge_content = world->entity()
-            .is_a(UIElement)
-            .set<LayoutBox>({LayoutBox::Horizontal, 0.0f})
-            .set<Position, Local>({xPad, 0.0f})
-            .add(flecs::OrderedChildren)
-            .child_of(badge);
-
-        badge_text_parent = badge_content;
-        badge.set<UIContainer>({xPad, 0});
-    }
+    // Published for later lookups, and handed straight back for callers nesting
+    // something right now.
+    badge.set<BadgeContent>({content});
+    if (out_content) *out_content = content;
 
     // Render prefix IDs (sources)
-    render_id_set(badge_text_parent, prefix_ids, prefix_tints);
+    render_id_set(content, prefix_ids, prefix_tints);
 
-    // Text with Gradient
-    world->entity()
+    // Text with Gradient. The full string, always -- a badge showing a value
+    // must show the value. When it is too wide the badge grows *downwards*
+    // instead, below.
+    flecs::entity label = world->entity()
         .is_a(UIElement)
-        .child_of(badge_text_parent)
-        .set<Position, Local>({xPad, 6.0f})
+        .child_of(content)
+        .add<UIYoga>()
+        .set<UIMargin>({BADGE_TEXT_TOP, 0.0f, 0.0f, 0.0f})
         .set<TextRenderable>({text, "CharisSIL", 16.0f, white, 1.2f})
-        .set<RenderGradient>({white, light})
         .set<ZIndex>({25});
 
+    if (!outlined) {
+        label.set<RenderGradient>({white, light});
+    }
+
     // Render postfix IDs (targets)
-    render_id_set(badge_text_parent, postfix_ids, postfix_tints);
+    render_id_set(content, postfix_ids, postfix_tints);
+
+    // A label wider than the ceiling wraps, turning a very wide badge into a
+    // taller one. Nothing is dropped: truncation would be wrong here, since
+    // most badges exist precisely to show a value. Callers that cannot spend
+    // the height -- a list row, whose pitch is fixed -- shorten the string
+    // themselves before calling, with ellipsize_text.
+    badge_wrap_if_wide(badge, content, label, text, BADGE_MAX_TEXT_WIDTH);
 
     return badge;
 }
@@ -2301,8 +2540,10 @@ void create_editor(flecs::entity leaf, EditorNodeArea& node_area, flecs::entity 
 
 }
 
+// Index-aligned with EditorType: the type selector adds (EditorType)index as a
+// tag, so a new panel has to be appended to both lists at the same position.
 // TODO: load this from config file
-std::vector<std::string> editor_types = 
+std::vector<std::string> editor_types =
 {
     "Void",
     // "ECS Graph", // Entity component relationship
@@ -2321,7 +2562,8 @@ std::vector<std::string> editor_types =
     "Episodic",
     "Ontology",
     "Scene Graph",
-    "Data Fusion"
+    "Data Fusion",
+    "Entities"
 };
 
 struct VNCData
@@ -2578,8 +2820,719 @@ void clicked_minilm(flecs::entity e)
     .set<ZIndex>({16});
 }
 
+// ============================================================================
+// Entities panel
+// ----------------------------------------------------------------------------
+// Rows come from a separate, headless flecs world, reached through the
+// entity_query bridge (scripts/entity_query.py). The panel holds no entity data
+// of its own -- everything below reads the panel's EntitySet, so what is on
+// screen is whatever that world currently answers with.
+
+// The query a freshly opened panel runs. "Person" is what the python_query demo
+// world is richest in; any flecs expression the far world understands works,
+// including range and spatial filters.
+static const char* ENTITY_DEFAULT_QUERY = "Person";
+
+// Empty set for panels that have no EntitySet yet, so callers can hold a
+// reference without checking for null at every use.
+static const EntitySet& entity_set_of(flecs::entity leaf)
+{
+    static const EntitySet empty;
+    const EntitySet* set = leaf.try_get<EntitySet>();
+    return set ? *set : empty;
+}
+
+// Distinct badge colour per row, derived locally. get_entity_color() would be
+// the semantically right call, but it round-trips a unix socket to a Python
+// embedding server per lookup -- 100 of those during panel construction would
+// stall startup for minutes on a cold cache.
+//
+// Golden-ratio hue stepping: successive rows land ~137.5 degrees apart on the
+// wheel, so no two neighbours read as the same colour and the set stays evenly
+// spread however long the list gets. The multiply is done in double because the
+// fractional part is the whole result -- a float mantissa loses it once the
+// product grows past 2^24.
+uint32_t entity_badge_color(size_t index)
+{
+    float hue = (float)std::fmod((double)index * 0.6180339887498949, 1.0) * 6.0f;
+    float sat = 0.62f, val = 0.78f;
+
+    int sector = (int)hue;
+    float frac = hue - sector;
+    float p = val * (1.0f - sat);
+    float q = val * (1.0f - sat * frac);
+    float t = val * (1.0f - sat * (1.0f - frac));
+
+    float r, g, b;
+    switch (sector) {
+        case 0:  r = val; g = t;   b = p;   break;
+        case 1:  r = q;   g = val; b = p;   break;
+        case 2:  r = p;   g = val; b = t;   break;
+        case 3:  r = p;   g = q;   b = val; break;
+        case 4:  r = t;   g = p;   b = val; break;
+        default: r = val; g = p;   b = q;   break;
+    }
+
+    return ((uint32_t)(r * 255.0f) << 24) | ((uint32_t)(g * 255.0f) << 16)
+         | ((uint32_t)(b * 255.0f) << 8)  | 0xFF;
+}
+
+// Uniform row height. The list's index <-> y arithmetic is only exact because
+// every row is this tall regardless of what the row builder puts inside it.
+static constexpr float ENTITY_ROW_PITCH = 28.0f;
+
+// Inset of the rows inside the list viewport, and the fixed height the
+// inspector subpanel takes off the top of the panel.
+static constexpr float ENTITY_LIST_PAD = 6.0f;
+static constexpr float ENTITY_INSPECTOR_HEIGHT = 44.0f;
+static constexpr float ENTITY_QUERY_HEIGHT = 26.0f;
+
+// Past this many characters a name stops being spelled out in letter sprites
+// and becomes wrapped text -- one sprite per character does not scale to a
+// sentence.
+static constexpr size_t ENTITY_SPRITE_NAME_LIMIT = 24;
+
+// Brings a list's realized window in line with where it is scrolled to.
+//
+// Cost is proportional to the visible row count, never to item_count: the first
+// visible index is a division, and rows outside the window are simply never
+// built. Rebuilding the whole window rather than recycling a row pool keeps the
+// order Yoga reads out of OrderedChildren correct without any shuffling, and is
+// affordable because it only happens when the window actually moves -- a
+// fractional scroll within one row just slides the container.
+void update_virtual_list(flecs::entity list_entity, VirtualList& list)
+{
+    if (!list.viewport.is_valid() || !list.build_row) return;
+
+    const UIElementSize* viewport_size = list.viewport.try_get<UIElementSize>();
+    if (!viewport_size) return;   // no measured height yet; try again next frame
+
+    // The visible band is the viewport inset by pad top and bottom -- the same
+    // rectangle the rows are cropped to. Scrolling to the end therefore lands
+    // the last row on the inset edge, not on the viewport's own edge.
+    float view_height = std::max(0.0f, viewport_size->height - list.pad * 2.0f);
+    if (view_height <= 0.0f) return;
+
+    float content_height = (float)list.item_count * list.row_pitch;
+    float max_scroll = std::max(0.0f, content_height - view_height);
+    list.scroll = std::clamp(list.scroll, 0.0f, max_scroll);
+
+    size_t first = (size_t)std::floor(list.scroll / list.row_pitch);
+    float remainder = list.scroll - (float)first * list.row_pitch;   // sub-row offset
+
+    // Exactly the rows that intersect the visible band: the band plus whatever
+    // of the first row is already scrolled past the top. No slack row -- every
+    // realized row beyond this is drawn outside the crop and thrown away.
+    size_t count = (size_t)std::ceil((view_height + remainder) / list.row_pitch);
+    count = std::min(count, list.item_count - std::min(first, list.item_count));
+
+    if (list.dirty || !list.realized
+        || first != list.first_realized || count != list.realized_count) {
+        // Collected before destructing: mutating the child list while iterating
+        // it is not safe even though the ops themselves are deferred.
+        std::vector<flecs::entity> stale;
+        list_entity.children([&](flecs::entity row) { stale.push_back(row); });
+        for (flecs::entity row : stale) row.destruct();
+
+        for (size_t i = 0; i < count; ++i) {
+            list.build_row(list_entity, first + i);
+        }
+
+        list.first_realized = first;
+        list.realized_count = count;
+        list.realized = true;
+        list.dirty = false;
+    }
+
+    // Sub-row scrolling, expressed as the container's absolute top inset rather
+    // than Position<Local>: the container sits inside a Yoga parent now, and
+    // readback owns Position<Local> for every non-root node. Yoga applies this
+    // later in the same PreFrame pass, so the wheel moves the list this frame.
+    list_entity.ensure<UIAbsoluteEdges>().top = list.pad - remainder;
+}
+
+// Stable colour for a type name -- a tag, a component, a relation. Same
+// golden-ratio spacing as the row colours, but keyed by the name so a component
+// keeps its colour across panels, queries and sessions instead of shifting with
+// whatever row it happened to appear on.
+//
+// The hash is reduced modulo a small number first: entity_badge_color multiplies
+// by the golden ratio and keeps the fraction, and a raw size_t hash is far past
+// the point where that product has any fraction left.
+// True when an entity's identity is prose rather than a symbol -- it carries a
+// Text component, or is tagged Chat.
+//
+// The distinction is the entity's, not the call site's: the same entity has to
+// read the same way in a list row and in the inspector, so both ask this rather
+// than each deciding for itself.
+static bool entity_is_prose(const EntitySet& set, size_t index)
+{
+    if (index < set.tags.size()) {
+        const std::vector<std::string>& tags = set.tags[index];
+        if (std::find(tags.begin(), tags.end(), "Chat") != tags.end()) return true;
+    }
+    if (index < set.components.size()) {
+        for (const std::string& entry : set.components[index]) {
+            // Entries are "Type<TAB>member<TAB>value"; only the type is compared.
+            size_t sep = entry.find('\t');
+            if (entry.substr(0, sep) == "Text") return true;
+        }
+    }
+    return false;
+}
+
+uint32_t entity_type_color(const std::string& name)
+{
+    return entity_badge_color(std::hash<std::string>{}(name) % 977);
+}
+
+
+// Width a longform badge wraps to. Fixed rather than derived: the text has no
+// natural width, so something has to choose one, and a column of messages that
+// all wrap to the same measure is far easier to read than one that ragged-edges
+// to each message's length.
+static constexpr float BADGE_LONGFORM_WIDTH = 300.0f;
+
+// A badge for a sentence or a paragraph rather than a label.
+//
+// Every other badge is one calibrated line tall and as wide as its text. This
+// one inverts that: width is fixed, the text wraps inside it, and the height
+// follows from however many lines that takes. Used for entities whose identity
+// *is* prose -- a chat message has no short name to show instead.
+flecs::entity create_longform_badge(flecs::entity parent, flecs::entity UIElement,
+                                    const std::string& text, uint32_t color)
+{
+    flecs::entity slot = flecs::entity::null();
+    flecs::entity badge = create_badge_impl(parent, UIElement, text.c_str(), color,
+                                            false, false, {}, {}, {}, {}, &slot,
+                                            BadgeStyle::String);
+    if (!slot.is_valid()) return badge;
+
+    // Forced, not conditional: prose gets one consistent measure even when a
+    // particular message happens to be short enough to fit on a line. A column
+    // of messages all wrapping to the same width reads far better than one that
+    // ragged-edges to each message's length.
+    flecs::entity label = flecs::entity::null();
+    slot.children([&label](flecs::entity child) {
+        if (child.has<TextRenderable>()) label = child;
+    });
+    if (label.is_valid()) {
+        badge_apply_wrap(badge, slot, label, BADGE_LONGFORM_WIDTH - BADGE_LONGFORM_INSET);
+    }
+
+    return badge;
+}
+
+// Turns a badge into a container for other badges.
+//
+// Every badge that holds something needs the same four things, so they live
+// here rather than being re-derived per call site: height from content instead
+// of the calibrated single-line height, an even inset all round, contents
+// centred against each other with a real gap, and the label's top offset
+// cleared -- that offset is calibrated for a badge that top-aligns its
+// contents, and a container centres them.
+static void badge_becomes_container(flecs::entity block, flecs::entity slot,
+                                    bool stacked)
+{
+    block.ensure<UISize>().h = YGUndefined;
+    block.set<UIPadding>({BADGE_NEST_PAD, 0.0f, BADGE_NEST_PAD, 0.0f});
+
+    UIFlexContainer& row = slot.ensure<UIFlexContainer>();
+    row.gap = BADGE_NEST_GAP;
+
+    if (stacked) {
+        // Wrapped text makes a block far taller than its own label, and a row
+        // centres that label against the whole height -- so a paragraph gets a
+        // header floating in the middle of a tall empty column. Stacking turns
+        // the label into a tab along the top instead: read down, not across.
+        row.direction = YGFlexDirectionColumn;
+        row.items = YGAlignFlexStart;
+    } else {
+        row.direction = YGFlexDirectionRow;
+        row.items = YGAlignCenter;
+    }
+
+    slot.children([](flecs::entity child) {
+        if (UIMargin* margin = child.try_get_mut<UIMargin>()) margin->top = 0.0f;
+    });
+}
+
+// Values are all one colour rather than one per value: a value is data, and
+// colouring each differently would imply a distinction that is not there.
+static constexpr uint32_t BADGE_VALUE_COLOR = 0x3f6d8aff;
+
+// A component rendered as a block holding one block per member, each holding
+// its value: Salary ( amount ( 100000 ) ).
+//
+// Nested rather than flattened to "amount: 100000" text because a member's
+// value is a thing in its own right -- something to select, edit, or eventually
+// bind to another entity -- and containment says which value belongs to which
+// member without leaning on punctuation to carry it.
+flecs::entity create_component_badge(flecs::entity parent, flecs::entity UIElement,
+                                     const std::string& type_name,
+                                     const std::vector<std::pair<std::string, std::string>>& members)
+{
+    flecs::entity slot = flecs::entity::null();
+    flecs::entity block = create_badge_impl(parent, UIElement, type_name.c_str(),
+                                            entity_type_color(type_name), false, false,
+                                            {}, {}, {}, {}, &slot);
+
+    if (members.empty() || !slot.is_valid()) return block;
+
+    bool stacked_component = false;
+
+    for (const auto& member : members) {
+        const std::string& name = member.first;
+        const std::string& value = member.second;
+
+        if (name.empty()) {
+            // A component with no reflected member names still has a value.
+            // It goes straight into the component block, unlabelled.
+            flecs::entity bare = create_badge_impl(slot, UIElement, value.c_str(),
+                                                   BADGE_VALUE_COLOR, true, false,
+                                                   {}, {}, {}, {}, nullptr,
+                                                   BadgeStyle::String);
+            continue;
+        }
+
+        flecs::entity value_slot = flecs::entity::null();
+        flecs::entity member_block = create_badge_impl(slot, UIElement, name.c_str(),
+                                                       entity_type_color(name), false, false,
+                                                       {}, {}, {}, {}, &value_slot);
+
+        // The value is a string, not a symbol naming something -- outlined, so a
+        // glance separates "this is data" from "this is a type".
+        flecs::entity value_badge = create_badge_impl(value_slot, UIElement, value.c_str(),
+                                                      BADGE_VALUE_COLOR, true, false,
+                                                      {}, {}, {}, {}, nullptr,
+                                                      BadgeStyle::String);
+
+        // A value that wrapped makes this member -- and the component holding
+        // it -- a tall block, so both stack their labels rather than centring
+        // them against that height.
+        bool tall = badge_text_exceeds(value, BADGE_MAX_TEXT_WIDTH);
+        badge_becomes_container(member_block, value_slot, tall);
+        if (tall) stacked_component = true;
+
+    }
+
+    badge_becomes_container(block, slot, stacked_component);
+    return block;
+}
+
+// A relationship rendered as a block that *contains* its target, rather than as
+// two badges sitting next to each other.
+//
+// "LocatedIn -> Room102" placed side by side reads as two separate facts; the
+// nested form reads as one, which is what a pair actually is. It is also the
+// shape natural language wants when these get composed -- a relation whose slot
+// holds an entity is a phrase, and a phrase can be dropped into another slot.
+flecs::entity create_relation_badge(flecs::entity parent, flecs::entity UIElement,
+                                    const std::string& relation, const std::string& target)
+{
+    flecs::entity slot = flecs::entity::null();
+    flecs::entity block = create_badge_impl(parent, UIElement, relation.c_str(),
+                                            entity_type_color(relation), false, true,
+                                            {}, {}, {}, {}, &slot);
+
+    if (target.empty() || !slot.is_valid()) return block;
+
+    uint32_t target_color = entity_type_color(target);
+    std::vector<std::string> postfix_ids{target.substr(0, 1)};
+    std::vector<uint32_t> postfix_tints{target_color};
+
+    // Capsule, matching how the Interlocutor draws an entity in a relationship.
+    flecs::entity nested = create_badge(slot, UIElement, target.c_str(), target_color,
+                                        true, false, {}, {}, postfix_ids, postfix_tints);
+
+    badge_becomes_container(block, slot, badge_text_exceeds(target, BADGE_MAX_TEXT_WIDTH));
+    return block;
+}
+
+void consume_ui_click();
+
+void clicked_entity_badge(flecs::entity e)
+{
+    const EntityBadge* badge = e.try_get<EntityBadge>();
+    if (!badge || !badge->panel.is_valid() || !badge->panel.is_alive()) return;
+
+    EntitySelection& selection = badge->panel.ensure<EntitySelection>();
+    if (selection.selected == badge->index) return;
+
+    selection.selected = badge->index;
+
+    // The rows themselves show which one is selected, and the realized window
+    // hasn't moved, so it has to be told to rebuild.
+    if (selection.list.is_valid() && selection.list.is_alive()) {
+        selection.list.ensure<VirtualList>().dirty = true;
+    }
+
+    // Nothing underneath should also act on this click -- the row sits over the
+    // list background, which is a click target in its own right.
+    consume_ui_click();
+}
+
+// Applies a result set returned by the entity_query bridge.
+//
+// Like every tradewinds response this arrives without context, so the panel is
+// recovered by matching on the query that was in flight. That is stricter than
+// the ChatPanel pattern it follows: two panels with different queries will not
+// take each other's rows.
+void entity_query_response(std::map<std::string, msgpack::object>& res_map)
+{
+    std::string status = res_map.count("status")
+        ? res_map["status"].as<std::string>() : std::string("ERROR");
+    std::string error = res_map.count("error")
+        ? res_map["error"].as<std::string>() : std::string();
+
+    using StringLists = std::vector<std::vector<std::string>>;
+    std::vector<std::string> names;
+    std::string unknown;
+    StringLists tags, components, relations;
+
+    if (status == "OK") {
+        try {
+            if (res_map.count("unknown"))    unknown    = res_map["unknown"].as<std::string>();
+            if (res_map.count("names"))      names      = res_map["names"].as<std::vector<std::string>>();
+            if (res_map.count("tags"))       tags       = res_map["tags"].as<StringLists>();
+            if (res_map.count("components")) components = res_map["components"].as<StringLists>();
+            if (res_map.count("relations"))  relations  = res_map["relations"].as<StringLists>();
+        } catch (const std::exception& e) {
+            status = "ERROR";
+            error = std::string("bad payload: ") + e.what();
+            names.clear(); tags.clear(); components.clear(); relations.clear();
+        }
+    }
+
+    world->query<EntitySet>()
+        .each([&](flecs::entity leaf, EntitySet& set) {
+            if (set.requested.empty()) return;   // not waiting on anything
+
+            set.status = status;
+            set.error = unknown.empty() ? error : ("unknown: " + unknown);
+            set.expr = set.requested;
+            set.requested.clear();
+
+            if (status != "OK") return;
+
+            set.names = names;
+            set.tags = tags;
+            set.components = components;
+            set.relations = relations;
+            // Resized rather than trusted: a short list from the bridge would
+            // otherwise make every lookup below a bounds check.
+            set.tags.resize(set.names.size());
+            set.components.resize(set.names.size());
+            set.relations.resize(set.names.size());
+            set.loaded = true;
+
+            // The rows are entirely different entities now, so nothing about the
+            // old selection or ordering survives.
+            EntitySelection& selection = leaf.ensure<EntitySelection>();
+            selection.selected = SIZE_MAX;
+            selection.ranked_for = SIZE_MAX;
+            selection.ranked_query.clear();
+            leaf.ensure<EntityOrder>().order.clear();
+
+            if (selection.list.is_valid() && selection.list.is_alive()) {
+                VirtualList& list = selection.list.ensure<VirtualList>();
+                list.item_count = set.names.size();
+                list.scroll = 0.0f;
+                list.dirty = true;
+            }
+        });
+}
+
+// Result of creating an entity in the headless world.
+//
+// On success every loaded panel is invalidated rather than patched: the new
+// entity may or may not match a given panel's query, and the world is the
+// authority on that -- re-asking is both simpler and correct.
+void entity_create_response(std::map<std::string, msgpack::object>& res_map)
+{
+    std::string status = res_map.count("status")
+        ? res_map["status"].as<std::string>() : std::string("ERROR");
+
+    if (status != "OK") {
+        std::string error = res_map.count("error")
+            ? res_map["error"].as<std::string>() : std::string();
+        std::cerr << "[entities] create failed: " << status << " " << error << std::endl;
+        return;
+    }
+
+    world->query<EntitySet>().each([](flecs::entity leaf, EntitySet& set) {
+        if (set.loaded) set.expr.clear();   // forces a re-query
+    });
+}
+
+// Creates an entity of `kind` carrying `text` in the headless world.
+void create_world_entity(const std::string& kind, const std::string& text)
+{
+    if (text.empty()) return;
+
+    flecs::entity client = world->lookup("EntityCreateClient");
+    if (!client.is_valid() || client.has<AwaitResponse>()) return;
+
+    client.set<SendMapRequest>({{
+        {"type", "create"},
+        {"kind", kind},
+        {"text", text},
+    }});
+    client.set<AwaitResponse>({entity_create_response});
+}
+
+// Sends the panel's flecs query to the bridge when it differs from what is
+// loaded. One request in flight at a time, for the same REQ/REP reason as the
+// ranking client.
+void request_entity_query(flecs::entity leaf, EntitySet& set)
+{
+    if (!set.requested.empty() || set.wanted.empty()) return;
+    // `status` guards the first attempt: expr matches wanted only after a reply
+    // has been recorded, so a failed query is not retried in a tight loop.
+    if (set.expr == set.wanted && !set.status.empty()) return;
+
+    flecs::entity client = world->lookup("EntityQueryClient");
+    if (!client.is_valid() || client.has<AwaitResponse>()) return;
+
+    set.requested = set.wanted;
+    client.set<SendMapRequest>({{
+        {"type", "query"},
+        {"expr", set.wanted},
+    }});
+    client.set<AwaitResponse>({entity_query_response});
+}
+
+// Applies a ranking returned by the entity semantics server.
+//
+// No context travels with a tradewinds response, so the panel is recovered by
+// querying for it -- the same shape interlocutor_response uses. With more than
+// one Entities panel open this would deliver to all of them; the ordering is a
+// pure function of the selected name, so that is wrong only if their selections
+// differ, and fixing it properly means routing context through AwaitResponse.
+void entity_semantics_response(std::map<std::string, msgpack::object>& res_map)
+{
+    std::string status = res_map.count("status")
+        ? res_map["status"].as<std::string>() : std::string("ERROR");
+
+    world->query<EntitySelection>()
+        .each([&](flecs::entity leaf, EntitySelection& selection) {
+            selection.rank_pending = false;
+
+            // LOADING means the model is still coming up. Leaving ranked_for
+            // untouched is what makes the request system try again next frame.
+            if (status != "OK" || !res_map.count("order")) return;
+
+            std::vector<size_t> order;
+            try {
+                order = res_map["order"].as<std::vector<size_t>>();
+            } catch (const std::exception& e) {
+                std::cerr << "[entity_semantics] bad order payload: " << e.what() << std::endl;
+                return;
+            }
+
+            // A short or malformed permutation would silently hide entities,
+            // so an ordering that does not cover the data is refused outright.
+            if (order.size() != entity_set_of(leaf).names.size()) {
+                std::cerr << "[entity_semantics] order covers " << order.size()
+                          << " of " << entity_set_of(leaf).names.size()
+                          << " entities; ignoring" << std::endl;
+                return;
+            }
+
+            leaf.ensure<EntityOrder>().order = std::move(order);
+            selection.ranked_for = selection.selected;
+            selection.ranked_query = selection.relation;
+
+            if (selection.list.is_valid() && selection.list.is_alive()) {
+                VirtualList& list = selection.list.ensure<VirtualList>();
+                list.dirty = true;
+                // The selected entity ranks nearest to itself, so it is now the
+                // top row -- scrolling back up is what makes that visible.
+                list.scroll = 0.0f;
+            }
+        });
+}
+
+// Asks the semantics server to rank the corpus against the current selection,
+// under whatever relation has been typed into the panel's query bar.
+//
+// Only ever one request in flight: the socket is REQ/REP, so a second send
+// before the reply arrives is silently dropped by ZeroMQ.
+void request_entity_ranking(flecs::entity leaf, EntitySelection& selection)
+{
+    if (selection.rank_pending) return;
+
+    const EntitySet& set = entity_set_of(leaf);
+    std::string instruct = selection.relation;
+    bool has_selection = selection.selected < set.names.size();
+
+    // Either half is enough to rank: an entity alone gives nearest neighbours,
+    // typed text alone is a free-text search, and both together read the text
+    // as a relation anchored on that entity.
+    if (!has_selection && instruct.empty()) {
+        // Neither. Fall back to the data's own order rather than leaving the
+        // list frozen in whatever ranking produced it.
+        if (selection.ranked_for == SIZE_MAX && selection.ranked_query.empty()) return;
+
+        leaf.ensure<EntityOrder>().order.clear();
+        selection.ranked_for = SIZE_MAX;
+        selection.ranked_query.clear();
+        if (selection.list.is_valid() && selection.list.is_alive()) {
+            VirtualList& list = selection.list.ensure<VirtualList>();
+            list.dirty = true;
+            list.scroll = 0.0f;
+        }
+        return;
+    }
+
+    if (selection.ranked_for == selection.selected
+        && selection.ranked_query == instruct) return;
+
+    flecs::entity client = world->lookup("EntitySemanticsClient");
+    if (!client.is_valid() || client.has<AwaitResponse>()) return;
+
+    if (set.names.empty()) return;
+
+    std::string corpus;
+    for (size_t i = 0; i < set.names.size(); ++i) {
+        if (i) corpus += "\n";
+        corpus += set.names[i];
+    }
+
+    selection.rank_pending = true;
+    client.set<SendMapRequest>({{
+        {"type", "rank"},
+        // Empty when nothing is selected -- the server reads that as a search
+        // with no anchor rather than as a missing field.
+        {"query", has_selection ? set.names[selection.selected] : std::string()},
+        {"instruct", instruct},
+        {"corpus", corpus},
+    }});
+    client.set<AwaitResponse>({entity_semantics_response});
+}
+
+// Rebuilds the inspector subpanel when the selection no longer matches what is
+// displayed. Comparing selected against shown means this converges from any
+// state, including a selection made in the same frame the panel was built.
+void update_entity_inspector(flecs::entity leaf, EntitySelection& selection)
+{
+    if (selection.shown == selection.selected) return;
+    if (!selection.inspector.is_valid() || !selection.inspector.is_alive()) return;
+
+    auto UIElement = world->lookup("UIElement");
+
+    std::vector<flecs::entity> stale;
+    selection.inspector.children([&](flecs::entity child) { stale.push_back(child); });
+    for (flecs::entity child : stale) child.destruct();
+
+    // The clip is declared on the direct children rather than on the inspector
+    // itself: ScissorContainer is a transitive relationship, so a self-target is
+    // a cycle and flecs asserts on it. resolve_scissor walks up from each
+    // renderable, so tagging the children covers everything beneath them --
+    // which is what keeps a badge wider than the subpanel from spilling onto the
+    // list below.
+    // Nothing at all when nothing is selected -- the subpanel is empty, not
+    // captioned.
+    const EntitySet& set = entity_set_of(leaf);
+    if (selection.selected < set.names.size()) {
+        const std::string& name = set.names[selection.selected];
+        uint32_t color = entity_badge_color(selection.selected);
+
+        // A Chat entity's identity is its message, which is prose -- spelling a
+        // paragraph out in letter sprites would be unreadable, so it gets the
+        // longform badge instead.
+        // Prose gets the wrapping badge; a short name gets sprite letters. Chat
+        // qualifies by type, but so does anything simply too long to spell out
+        // -- 24 letter sprites is not a label, it is a wall.
+        bool is_prose = entity_is_prose(set, selection.selected)
+                        || name.size() > ENTITY_SPRITE_NAME_LIMIT;
+        if (is_prose) {
+            create_longform_badge(selection.inspector, UIElement, name, color)
+                .add<ScissorContainer>(selection.inspector);
+        }
+
+        // The selected entity's name spelled out left to right in letter_set
+        // sprites, one glyph per character.
+        auto letters = is_prose ? flecs::entity::null() : world->entity()
+            .is_a(UIElement)
+            .child_of(selection.inspector)
+            .add(flecs::OrderedChildren)
+            .add<UIYoga>()
+            .add<ScissorContainer>(selection.inspector)
+            .set<UIFlexContainer>({
+                YGFlexDirectionRow, YGWrapNoWrap,
+                YGJustifyFlexStart, YGAlignFlexStart, 0.0f});
+
+        if (letters.is_valid()) create_sprite_text(letters, name, color);
+
+        // The numeric id, in the same face and size as the Interlocutor chat input.
+        world->entity()
+            .is_a(UIElement)
+            .child_of(selection.inspector)
+            .add<UIYoga>()
+            .add<ScissorContainer>(selection.inspector)
+            .set<TextRenderable>({"#" + std::to_string(selection.selected),
+                                  "JetBrainsMono", 16.0f, 0xFFFFFFFF})
+            .set<ZIndex>({25});
+
+        // What the far world says this entity is, as badges rather than text.
+        auto badge_of = [&](const std::string& label, bool capsule) {
+            uint32_t color = entity_type_color(label);
+            std::vector<std::string> postfix_ids{label.substr(0, 1)};
+            std::vector<uint32_t> postfix_tints{color};
+            create_badge(selection.inspector, UIElement, label.c_str(), color,
+                         capsule, false, {}, {}, postfix_ids, postfix_tints)
+                .add<ScissorContainer>(selection.inspector);
+        };
+
+        // A tag is a bare badge -- it has no data, which is the whole point of
+        // it being a tag rather than a component.
+        for (const std::string& tag : set.tags[selection.selected]) badge_of(tag, false);
+
+        // A component is a block holding its members. The wire form is
+        // "Type<TAB>member<TAB>value<TAB>member<TAB>value" -- flat, so it
+        // survives msgpack without depending on nested-container conversion.
+        for (const std::string& entry : set.components[selection.selected]) {
+            std::vector<std::string> fields;
+            size_t start = 0;
+            while (start <= entry.size()) {
+                size_t sep = entry.find('\t', start);
+                if (sep == std::string::npos) { fields.push_back(entry.substr(start)); break; }
+                fields.push_back(entry.substr(start, sep - start));
+                start = sep + 1;
+            }
+            if (fields.empty()) continue;
+
+            // Trailing odd field would be a member with no value; dropped
+            // rather than rendered as an empty badge.
+            std::vector<std::pair<std::string, std::string>> members;
+            for (size_t i = 1; i + 1 < fields.size(); i += 2) {
+                members.emplace_back(fields[i], fields[i + 1]);
+            }
+
+            create_component_badge(selection.inspector, UIElement, fields[0], members)
+                .add<ScissorContainer>(selection.inspector);
+        }
+
+        // Relations are one block holding their target, not two badges in a
+        // row. The subject is the selected entity, already spelled out in
+        // sprites to the left, so the block reads as the rest of the sentence.
+        for (const std::string& entry : set.relations[selection.selected]) {
+            size_t sep = entry.find('\t');
+            std::string relation = entry.substr(0, sep);
+            std::string target = (sep == std::string::npos) ? std::string()
+                                                            : entry.substr(sep + 1);
+
+            create_relation_badge(selection.inspector, UIElement, relation, target)
+                .add<ScissorContainer>(selection.inspector);
+        }
+    }
+
+    selection.shown = selection.selected;
+}
+
 // Factory function to populate editor content, whether the panel is initialized or changed
-// TODO: Refactor editor creation to unique files 
+// TODO: Refactor editor creation to unique files
 void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::entity UIElement)
 {
     PanelState& state = leaf.ensure<PanelState>();
@@ -2948,6 +3901,217 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
 
 
         leaf.set<ChatPanel>({messages_panel, input_panel, input_text, message_list});
+    }
+    else if (editor_type == EditorType::Entities)
+    {
+        auto canvas = leaf.target<EditorCanvas>();
+
+        world->entity()
+            .is_a(UIElement)
+            .child_of(canvas)
+            .add<UIYoga>()
+            .set<UIFillParent>({})
+            .set<RectRenderable>({0.0f, 0.0f, false, 0x050505FF})
+            .set<ZIndex>({9});
+
+        // Column filling the panel: the inspector takes a fixed height off the
+        // top and the list absorbs whatever is left, so selecting something
+        // never costs the list its visibility.
+        auto column = world->entity()
+            .is_a(UIElement)
+            .child_of(canvas)
+            .add(flecs::OrderedChildren)
+            .add<UIYoga>()
+            .set<UIFillParent>({8.0f, 8.0f, 8.0f, 8.0f})
+            .set<Position, Local>({8.0f, 8.0f})
+            .set<UIFlexContainer>({
+                YGFlexDirectionColumn, YGWrapNoWrap,
+                YGJustifyFlexStart, YGAlignStretch, 8.0f})
+            .set<ZIndex>({10});
+
+        // Inspector subpanel. Its contents are owned by update_entity_inspector,
+        // which rebuilds them whenever the selection changes.
+        auto inspector = world->entity()
+            .is_a(UIElement)
+            .child_of(column)
+            .add(flecs::OrderedChildren)
+            .add<UIYoga>()
+            .set<UIFlexItem>({0.0f, 0.0f, YGAlignAuto})
+            // Height from content, not fixed. An entity with several components
+            // plus a relationship block is wider than one line, and clipping it
+            // takes the rightmost thing first -- which is exactly the nested
+            // target. Wrapping keeps every badge on screen; the min-size stops
+            // the subpanel collapsing to nothing when the selection is cleared.
+            .set<UIMinSize>({YGUndefined, ENTITY_INSPECTOR_HEIGHT})
+            .set<UIFlexContainer>({
+                YGFlexDirectionRow, YGWrapWrap,
+                YGJustifyFlexStart, YGAlignCenter, 6.0f})
+            .set<UIPadding>({8.0f, 10.0f, 8.0f, 10.0f})
+            .set<RoundedRectRenderable>({0.0f, 0.0f, 4.0f, false, 0x161616FF})
+            .set<ZIndex>({11});
+
+        // Two input bars, identical machinery, different effect on Enter: the
+        // first re-queries the headless world for a new set of rows, the second
+        // reorders the rows already loaded.
+        auto make_query_bar = [&](EntityQuery::Kind kind, const char* placeholder,
+                                  const std::string& initial) {
+            auto bar = world->entity()
+                .is_a(UIElement)
+                .child_of(column)
+                .add(flecs::OrderedChildren)
+                .add<UIYoga>()
+                .set<UIFlexItem>({0.0f, 0.0f, YGAlignAuto})
+                .set<UISize>({YGUndefined, ENTITY_QUERY_HEIGHT})
+                .set<UIFlexContainer>({
+                    YGFlexDirectionRow, YGWrapNoWrap,
+                    YGJustifyFlexStart, YGAlignCenter, 0.0f})
+                .set<UIPadding>({0.0f, 8.0f, 0.0f, 8.0f})
+                .set<RoundedRectRenderable>({0.0f, 0.0f, 2.0f, false, 0x222327FF})
+                .add<AddTagOnLeftClick, FocusEntityQuery>()
+                .set<ZIndex>({11});
+
+            auto text = world->entity()
+                .is_a(UIElement)
+                .child_of(bar)
+                .add<UIYoga>()
+                .add<ScissorContainer>(bar)
+                .set<TextRenderable>({"", "JetBrainsMono", 16.0f, 0xFFFFFFFF})
+                .set<ZIndex>({25});
+
+            EntityQuery query;
+            query.panel = leaf;
+            query.input_text = text;
+            query.draft = initial;
+            query.applied = initial;
+            query.kind = kind;
+            query.placeholder = placeholder;
+            bar.set<EntityQuery>(query);
+            return bar;
+        };
+
+        make_query_bar(EntityQuery::Flecs, "flecs query...", ENTITY_DEFAULT_QUERY);
+        make_query_bar(EntityQuery::Semantic, "search entities, or relate to selection...", "");
+
+        // Seeded with the default query, which request_entity_query sends as
+        // soon as the bridge client is reachable.
+        EntitySet set;
+        set.wanted = ENTITY_DEFAULT_QUERY;
+        leaf.set<EntitySet>(set);
+
+        // List viewport: absorbs the remaining height and is what the rows are
+        // clipped to. It is also the height the virtual list measures itself
+        // against, so the realized window tracks the space actually left over.
+        auto viewport = world->entity()
+            .is_a(UIElement)
+            .child_of(column)
+            .add(flecs::OrderedChildren)
+            .add<UIYoga>()
+            .set<UIFlexItem>({1.0f, 1.0f, YGAlignAuto})
+            .set<RoundedRectRenderable>({0.0f, 0.0f, 4.0f, false, 0x0B0B0BFF})
+            .set<ZIndex>({11});
+
+        // Draws nothing; it exists only to define the crop rectangle, inset from
+        // the viewport on every edge. Clipping to the viewport itself would let
+        // a partially scrolled row reach the viewport's very top edge, which
+        // sits just under the inspector -- the rows would visibly crowd it. This
+        // keeps a constant margin of background there no matter where the list
+        // is scrolled to.
+        auto clip = world->entity()
+            .is_a(UIElement)
+            .child_of(viewport)
+            .add<UIYoga>()
+            .set<UIAbsoluteEdges>({ENTITY_LIST_PAD, ENTITY_LIST_PAD, ENTITY_LIST_PAD, ENTITY_LIST_PAD});
+
+        // The row container. Absolutely positioned inside the viewport so the
+        // scroll offset is a style value Yoga applies, and so its height is its
+        // own content rather than the viewport's -- the rows are meant to
+        // overflow and be cropped. Left/right insets stand in for padding,
+        // which would otherwise shift the absolute origin ambiguously.
+        auto entity_list = world->entity()
+            .is_a(UIElement)
+            .child_of(viewport)
+            .add(flecs::OrderedChildren)
+            .add<UIYoga>()
+            .set<UIAbsoluteEdges>({ENTITY_LIST_PAD, ENTITY_LIST_PAD, ENTITY_LIST_PAD, YGUndefined})
+            .set<UIFlexContainer>({
+                YGFlexDirectionColumn, YGWrapNoWrap,
+                YGJustifyFlexStart, YGAlignStretch, 0.0f})
+            .add<ScissorContainer>(clip)
+            .set<ZIndex>({12});
+
+        // shown is seeded to something selected can never equal, so the very
+        // first inspector pass builds the empty-state placeholder.
+        leaf.set<EntitySelection>({inspector, entity_list, SIZE_MAX, SIZE_MAX - 1});
+
+        VirtualList list;
+        list.viewport = viewport;
+        list.row_pitch = ENTITY_ROW_PITCH;
+        list.pad = ENTITY_LIST_PAD;
+        list.item_count = 0;   // set by entity_query_response once rows arrive
+        list.build_row = [UIElement, leaf](flecs::entity parent, size_t row_position) {
+            // `row_position` is a slot in the list; everything below keys off the
+            // data index it currently maps to, so a re-ranking moves rows around
+            // without disturbing selection or the per-entity colour.
+            const EntityOrder* ordering = leaf.try_get<EntityOrder>();
+            size_t index = ordering ? ordering->data_index(row_position) : row_position;
+
+            const EntitySet& set = entity_set_of(leaf);
+            if (index >= set.names.size()) return;
+
+            const std::string& name = set.names[index];
+            uint32_t color = entity_badge_color(index);
+
+            const EntitySelection* selection = leaf.try_get<EntitySelection>();
+            bool is_selected = selection && selection->selected == index;
+
+            // Fixed-height wrapper. The badge sizes itself from its text, but
+            // the list's arithmetic only holds if the row pitch is uniform, so
+            // the badge is centred inside a row of exactly ENTITY_ROW_PITCH
+            // rather than being allowed to set the row height itself.
+            auto row = world->entity()
+                .is_a(UIElement)
+                .child_of(parent)
+                .add(flecs::OrderedChildren)
+                .add<UIYoga>()
+                .set<UIFlexItem>({0.0f, 0.0f, YGAlignAuto})
+                .set<UISize>({YGUndefined, ENTITY_ROW_PITCH})
+                .set<UIFlexContainer>({
+                    YGFlexDirectionRow, YGWrapNoWrap,
+                    YGJustifyFlexStart, YGAlignCenter, 0.0f})
+                .set<ZIndex>({15});
+
+            // Selected rows are marked on the row, not the badge: recolouring
+            // the badge would fight the per-entity colour that identifies it.
+            if (is_selected) {
+                row.set<RoundedRectRenderable>({0.0f, 0.0f, 4.0f, false, 0x2A2A2AFF});
+            }
+
+            // A message is not named by its first letter, so the symbol sprite
+            // is dropped for prose -- it would be labelling content as if it
+            // were an identifier.
+            bool prose = entity_is_prose(set, index);
+            std::vector<std::string> postfix_ids;
+            std::vector<uint32_t> postfix_tints;
+            if (!prose) {
+                postfix_ids.push_back(name.substr(0, 1));
+                postfix_tints.push_back(color);
+            }
+
+            // The only place truncation is right: the list's index<->y
+            // arithmetic needs every row exactly ENTITY_ROW_PITCH tall, so a
+            // row cannot grow to fit its text. Selecting the entity shows it
+            // whole in the inspector.
+            std::string row_label = ellipsize_text(name, "CharisSIL", 16.0f,
+                                                   BADGE_MAX_TEXT_WIDTH);
+
+            create_badge_impl(row, UIElement, row_label.c_str(), color,
+                              false, false, {}, {}, postfix_ids, postfix_tints, nullptr,
+                              prose ? BadgeStyle::String : BadgeStyle::Symbol)
+                .set<EntityBadge>({name, index, leaf})
+                .set<CallbackOnLeftClick>({clicked_entity_badge});
+        };
+
+        entity_list.set<VirtualList>(list);
     }
     else if (editor_type == EditorType::Bookshelf)
     {
@@ -3338,6 +4502,17 @@ void replace_editor_content(flecs::entity leaf, EditorType editor_type, flecs::e
     if (leaf.has<ChatPanel>()) {
         leaf.remove<ChatPanel>();
     }
+    if (leaf.has<EntitySelection>()) {
+        leaf.remove<EntitySelection>();
+    }
+    if (leaf.has<EntityOrder>()) {
+        leaf.remove<EntityOrder>();
+    }
+    // EntityQuery lives on the bar entities, which die with the canvas; only
+    // the panel-level set has to be cleared here.
+    if (leaf.has<EntitySet>()) {
+        leaf.remove<EntitySet>();
+    }
     leaf.target<EditorHeader>().children([&](flecs::entity child)
     {
         child.destruct();
@@ -3434,12 +4609,12 @@ struct RenderQueue {
         commands.push_back({pos, renderable, RenderType::Rectangle, zIndex});
     }
 
-    void addRoundedRectCommand(const Position& pos, const RoundedRectRenderable& renderable, int zIndex, bool useGradient = false, RenderGradient renderGradient = {0, 0}) {
-        commands.push_back({pos, renderable, RenderType::RoundedRectangle, zIndex, 0, useGradient, renderGradient});
+    void addRoundedRectCommand(const Position& pos, const RoundedRectRenderable& renderable, int zIndex, bool useGradient = false, RenderGradient renderGradient = {0, 0}, ecs_entity_t scissorEntity = 0, int depth = 0) {
+        commands.push_back({pos, renderable, RenderType::RoundedRectangle, zIndex, scissorEntity, useGradient, renderGradient, depth});
     }
 
-    void addTextCommand(const Position& pos, const TextRenderable& renderable, int zIndex, bool useGradient = false, RenderGradient renderGradient = {0, 0}) {
-        commands.push_back({pos, renderable, RenderType::Text, zIndex, 0, useGradient, renderGradient});
+    void addTextCommand(const Position& pos, const TextRenderable& renderable, int zIndex, bool useGradient = false, RenderGradient renderGradient = {0, 0}, ecs_entity_t scissorEntity = 0, int depth = 0) {
+        commands.push_back({pos, renderable, RenderType::Text, zIndex, scissorEntity, useGradient, renderGradient, depth});
     }
 
     void addImageCommand(const Position& pos, const ImageRenderable& renderable, int zIndex) {
@@ -3459,7 +4634,12 @@ struct RenderQueue {
     }
 
     void sort() {
-        std::sort(commands.begin(), commands.end());
+        // Stable, so commands that tie on both layer and depth keep the order
+        // they were queued in. std::sort would reorder them arbitrarily, and
+        // since entity iteration order shifts whenever tables change -- which
+        // is every time the virtual list rebuilds a row -- that showed up as
+        // overlapping elements flickering between frames.
+        std::stable_sort(commands.begin(), commands.end());
     }
 };
 
@@ -3488,11 +4668,83 @@ bool point_in_bounds(float x, float y, UIElementBounds bounds)
     return (x >= bounds.xmin && x <= bounds.xmax && y >= bounds.ymin && y <= bounds.ymax);
 }
 
-// The only scroll consumer so far is the Droid panel's orbit camera, which
-// applies the delta on the next frame and only while the cursor is over it.
+// The rect a renderable is clipped to: its own ScissorContainer target if it
+// carries one, otherwise the nearest ancestor's.
+//
+// Resolving up the hierarchy is what lets a panel clip a whole subtree by
+// tagging one container. Without it every entity would have to be tagged
+// individually, which is impossible for subtrees built by shared factories like
+// create_badge() -- the caller never sees the internals it would need to tag.
+static ecs_entity_t resolve_scissor(flecs::entity e)
+{
+    for (flecs::entity c = e; c.is_valid(); c = c.parent()) {
+        if (c.has<ScissorContainer>(flecs::Wildcard)) {
+            flecs::entity target = c.target<ScissorContainer>();
+            if (target.is_valid()) return target;
+        }
+    }
+    return 0;
+}
+
+// The rectangle a ScissorContainer target clips to: its own layout box, taken
+// from Position<World> and UIElementSize.
+//
+// Read with try_get rather than ecs_ensure because the render queue runs inside
+// a system, where the world is deferred: ecs_ensure would hand back a pointer
+// into the command queue's temporary storage instead of the live component, and
+// the resulting rect does not clip anything.
+static bool scissor_rect(flecs::entity clip, float& x, float& y, float& w, float& h)
+{
+    if (!clip.is_valid() || !clip.is_alive()) return false;
+    const Position* world_pos = clip.try_get<Position, World>();
+    const UIElementSize* size = clip.try_get<UIElementSize>();
+    if (!world_pos || !size || size->width <= 0.0f || size->height <= 0.0f) return false;
+
+    x = world_pos->x;
+    y = world_pos->y;
+    w = size->width;
+    h = size->height;
+    return true;
+}
+
+// Whether a click at (x, y) can reach `e` -- inside its own bounds, and inside
+// the rect it is clipped to if it is clipped at all. A virtualized list keeps
+// one row hanging past the bottom of its panel so scrolling has something to
+// pull up; that row is invisible, and without this check it would still swallow
+// clicks landing on whatever panel is drawn below.
+static bool click_reaches(flecs::entity e, const UIElementBounds& bounds, float x, float y)
+{
+    if (!point_in_bounds(x, y, bounds)) return false;
+
+    ecs_entity_t scissor = resolve_scissor(e);
+    if (!scissor) return true;
+
+    float cx, cy, cw, ch;
+    if (!scissor_rect(world->entity(scissor), cx, cy, cw, ch)) return true;
+    return point_in_bounds(x, y, {cx, cy, cx + cw, cy + ch});
+}
+
 static void scroll_callback(GLFWwindow* window, double xoffset, double yoffset)
 {
-    panel3d::add_scroll(yoffset);
+    // A VirtualList under the cursor claims the wheel. Otherwise it falls
+    // through to the Droid panel's orbit camera, which was the only consumer
+    // before lists could scroll and which applies the delta on the next frame.
+    const CursorState& cursor = world->lookup("GLFWState").ensure<CursorState>();
+
+    static flecs::query<VirtualList> lists = world->query<VirtualList>();
+    bool consumed = false;
+    lists.each([&](flecs::entity e, VirtualList& list) {
+        if (consumed || !list.viewport.is_valid()) return;
+        const UIElementBounds* bounds = list.viewport.try_get<UIElementBounds>();
+        if (!bounds || !point_in_bounds(cursor.x, cursor.y, *bounds)) return;
+
+        // Clamped by VirtualListSystem, which is the only place that knows the
+        // current viewport height and therefore the maximum scroll.
+        list.scroll -= (float)yoffset * list.row_pitch * 3.0f;
+        consumed = true;
+    });
+
+    if (!consumed) panel3d::add_scroll(yoffset);
 }
 
 static void cursor_position_callback(GLFWwindow* window, double xpos, double ypos)
@@ -3610,7 +4862,7 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
             std::vector<ClickTarget> targets;
 
             interactive_elements.each([&](flecs::entity ui_element, AddTagOnLeftClick, UIElementBounds& bounds) {
-                if (point_in_bounds(cursor_state->x, cursor_state->y, bounds))
+                if (click_reaches(ui_element, bounds, cursor_state->x, cursor_state->y))
                 {
                     const ZIndex* z = ui_element.try_get<ZIndex>();
                     targets.push_back({ui_element, z ? z->layer : 0,
@@ -3621,7 +4873,7 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
             flecs::query callback_elements = world->query_builder<CallbackOnLeftClick, UIElementBounds>()
             .build();
             callback_elements.each([&](flecs::entity ui_element, CallbackOnLeftClick& callback, UIElementBounds& bounds) {
-                if (point_in_bounds(cursor_state->x, cursor_state->y, bounds))
+                if (click_reaches(ui_element, bounds, cursor_state->x, cursor_state->y))
                 {
                     // An element can carry both a tag and a callback; fold them
                     // into one target so it is only visited once.
@@ -3729,18 +4981,35 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
     });
 }
 
+// The Entities panel whose relation bar currently holds the keyboard, if any.
+static flecs::entity focused_entity_query()
+{
+    static flecs::query<EntityQuery> queries = world->query<EntityQuery>();
+    flecs::entity focused = flecs::entity::null();
+    queries.each([&](flecs::entity leaf, EntityQuery& query) {
+        if (!focused && query.focused) focused = leaf;
+    });
+    return focused;
+}
+
 static void char_callback(GLFWwindow* window, unsigned int codepoint)
 {
+    if (codepoint < 32 || codepoint >= 127) return;
+
+    // Checked ahead of the chat draft: focus is exclusive between the two, and
+    // whichever field the user last clicked owns the keystroke.
+    if (flecs::entity leaf = focused_entity_query())
+    {
+        leaf.ensure<EntityQuery>().draft.push_back(static_cast<char>(codepoint));
+        return;
+    }
+
     // Multiple chat query... only one active
     ChatState* chat = world->try_get_mut<ChatState>();
     if (chat && chat->input_focused)
     {
-        if (codepoint >= 32 && codepoint < 127)
-        {
-            chat->draft.push_back(static_cast<char>(codepoint));
-        }
+        chat->draft.push_back(static_cast<char>(codepoint));
     }
-
 }
 
 rfbKeySym glfw_key_to_rfb_keysym(int key, int mods) {
@@ -4800,6 +6069,39 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
             if (handled) return;
         }
 
+    // The Entities relation bar owns the keyboard when it is focused, so its
+    // editing keys are handled before the chat draft ever sees them.
+    if (flecs::entity query_leaf = focused_entity_query())
+    {
+        EntityQuery& query = query_leaf.ensure<EntityQuery>();
+
+        if (key == GLFW_KEY_BACKSPACE)
+        {
+            if (!query.draft.empty()) query.draft.pop_back();
+            return;
+        }
+        if (key == GLFW_KEY_ENTER || key == GLFW_KEY_KP_ENTER)
+        {
+            // Submitting is what acts; typing alone must not, since either kind
+            // of submit is a round trip to a server.
+            query.applied = query.draft;
+
+            if (query.panel.is_valid() && query.panel.is_alive()) {
+                if (query.kind == EntityQuery::Flecs) {
+                    query.panel.ensure<EntitySet>().wanted = query.applied;
+                } else {
+                    query.panel.ensure<EntitySelection>().relation = query.applied;
+                }
+            }
+            return;
+        }
+        if (key == GLFW_KEY_ESCAPE)
+        {
+            query.focused = false;
+            return;
+        }
+    }
+
     // Retrieve the singleton ChatState
     ChatState* chat = world->try_get_mut<ChatState>();
     if (chat)
@@ -4833,6 +6135,12 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                     auto i_client = world->lookup("InterlocutorClient");
                     i_client.set<SendMapRequest>({ { {"type", "message"}, {"content", chat->draft} } });
                     i_client.set<AwaitResponse>({interlocutor_response});
+
+                    // The message is also an entity. It lands in the headless
+                    // world tagged Chat, so it is queryable and selectable
+                    // alongside everything else rather than living only in this
+                    // panel's scrollback.
+                    create_world_entity("Chat", chat->draft);
                     
                     // TODO: Create thinking indicators...
 
@@ -4971,6 +6279,25 @@ int main(int, char *[]) {
     .set<SpawnRequest>({"python3", {"../scripts/interlocutor.py"}});
     flecs::entity interlocutor_client = world->entity("InterlocutorClient")
         .set<ZMQClient>({ "ipc:///tmp/thornfield_interlocutor_socket", zmq::socket_type::req });
+
+    // Embeddings for ordering the Entities panel by semantic proximity.
+    flecs::entity entity_semantics_server = world->entity("EntitySemanticsServer")
+        .set<SpawnRequest>({"python3", {"../scripts/entity_semantics.py"}});
+    flecs::entity entity_semantics_client = world->entity("EntitySemanticsClient")
+        .set<ZMQClient>({ "ipc:///tmp/thornfield_entity_semantics_socket", zmq::socket_type::req });
+
+    // Bridge to a separate headless flecs world; the Entities panel's rows come
+    // from whatever that world answers with.
+    flecs::entity entity_query_server = world->entity("EntityQueryServer")
+        .set<SpawnRequest>({"python3", {"../scripts/entity_query.py"}});
+    flecs::entity entity_query_client = world->entity("EntityQueryClient")
+        .set<ZMQClient>({ "ipc:///tmp/thornfield_entity_query_socket", zmq::socket_type::req });
+
+    // Its own socket rather than sharing the query client's: REQ/REP allows one
+    // request in flight per socket, and a message submitted while a panel is
+    // mid-query would otherwise be silently dropped.
+    flecs::entity entity_create_client = world->entity("EntityCreateClient")
+        .set<ZMQClient>({ "ipc:///tmp/thornfield_entity_query_socket", zmq::socket_type::req });
 
     // Initialize spatial index manager
     spatial::SpatialIndexManager spatial_manager(world);
@@ -5191,6 +6518,19 @@ int main(int, char *[]) {
 
     world->component<PanelState>();
 
+    // Registered up front because their first use is inside a deferred callback
+    // -- EntityOrder lands in the semantics server's response handler, which
+    // runs from a system, and registering a component while the world is in
+    // readonly mode is a fatal assert.
+    world->component<EntityBadge>();
+    world->component<EntitySelection>();
+    world->component<EntityOrder>();
+    world->component<EntityQuery>();
+    world->component<EntitySet>();
+    world->component<BadgeContent>();
+    world->component<FocusEntityQuery>();
+    world->component<VirtualList>();
+
     world->component<DragContext>().add(flecs::Singleton);
     world->set<DragContext>({false, flecs::entity::null(), PanelSplitType::Horizontal, 0.0f});
 
@@ -5198,11 +6538,26 @@ int main(int, char *[]) {
     .event(flecs::OnSet)
     .each([&](flecs::entity e, ImageCreator& img, Graphics& graphics)
     {
-        int imgHandle = nvgCreateImage(graphics.vg, ("../assets/" + img.path).c_str(), 0);
+        // Memoized by path: nvgCreateImage decodes the file and uploads a
+        // texture on every call, and nothing ever calls nvgDeleteImage. A list
+        // that rebuilds its rows as it scrolls sets ImageCreator over and over
+        // on the same handful of sprites, so uncached this would re-decode the
+        // same PNG thousands of times and leak a texture on each one. Tint
+        // lives on ImageRenderable, not in the texture, so sharing is safe.
+        static std::unordered_map<std::string, int> image_cache;
 
-        if (imgHandle == -1) {
-            std::cerr << "Failed to load " << img.path << std::endl;
+        int imgHandle;
+        auto cached = image_cache.find(img.path);
+        if (cached != image_cache.end()) {
+            imgHandle = cached->second;
+        } else {
+            imgHandle = nvgCreateImage(graphics.vg, ("../assets/" + img.path).c_str(), 0);
+            if (imgHandle == -1) {
+                std::cerr << "Failed to load " << img.path << std::endl;
+            }
+            image_cache[img.path] = imgHandle;
         }
+
         e.set<ImageRenderable>({imgHandle, img.scaleX, img.scaleY, 0.0f, 0.0f, img.tint});
         e.remove<ImageCreator>();
     });
@@ -5407,6 +6762,23 @@ int main(int, char *[]) {
     {
         ChatState& chat = world->ensure<ChatState>();
         chat.input_focused = true;
+        // Only one text field can own the keyboard.
+        world->query<EntityQuery>().each([](flecs::entity, EntityQuery& q) { q.focused = false; });
+    });
+
+    world->observer<UIElementBounds, AddTagOnLeftClick>()
+    .term_at(1).second<FocusEntityQuery>()
+    .event<LeftClickEvent>()
+    .each([&](flecs::entity e, UIElementBounds&, AddTagOnLeftClick)
+    {
+        // EntityQuery lives on the bar itself, so the clicked entity *is* the
+        // one to focus. Everything else loses focus, including the
+        // Interlocutor's chat draft.
+        world->ensure<ChatState>().input_focused = false;
+        world->query<EntityQuery>().each([&](flecs::entity bar, EntityQuery& query) {
+            query.focused = (bar == e);
+        });
+        consume_ui_click();
     });
 
     world->observer<UIElementBounds, AddTagOnLeftClick>()
@@ -5851,6 +7223,103 @@ int main(int, char *[]) {
     // yoga_layout_now() can run the same pipeline synchronously for UI built
     // inside an input handler.
     g_yoga_vg = graphics.vg;
+
+    // Virtualized lists realize their visible window before any of the layout
+    // below runs, so rows built this frame are laid out this frame. immediate()
+    // is what makes that true: a deferred create would not become a real entity
+    // until the next sync point, leaving scrolling a frame behind the wheel.
+    world->system<VirtualList>("VirtualListSystem")
+        .kind(flecs::PreFrame)
+        .immediate()
+        .run([](flecs::iter& it) {
+            // Handles are collected before any are updated: update_virtual_list
+            // creates and destroys row entities, and in immediate mode that can
+            // move tables out from under a live iterator.
+            std::vector<flecs::entity> lists;
+            while (it.next()) {
+                for (auto i : it) lists.push_back(it.entity(i));
+            }
+            for (flecs::entity list : lists) {
+                update_virtual_list(list, list.ensure<VirtualList>());
+            }
+        });
+
+    // Same phase and same reasoning as the list above: the inspector's contents
+    // are built before layout runs, so a freshly selected entity is positioned
+    // in the frame it is selected rather than the one after.
+    world->system<EntitySelection>("EntityInspectorSystem")
+        .kind(flecs::PreFrame)
+        .immediate()
+        .run([](flecs::iter& it) {
+            std::vector<flecs::entity> panels;
+            while (it.next()) {
+                for (auto i : it) panels.push_back(it.entity(i));
+            }
+            for (flecs::entity panel : panels) {
+                update_entity_inspector(panel, panel.ensure<EntitySelection>());
+            }
+        });
+
+    // Keeps the relation bar's text in sync with what has been typed, and shows
+    // a prompt when it is empty so the field reads as something to type into
+    // rather than as an empty strip.
+    world->system<EntityQuery>("EntityQueryTextSystem")
+        .kind(flecs::PreFrame)
+        .each([](flecs::entity bar, EntityQuery& query) {
+            if (!query.input_text.is_valid() || !query.input_text.is_alive()) return;
+            TextRenderable* text = query.input_text.try_get_mut<TextRenderable>();
+            if (!text) return;
+
+            if (query.draft.empty() && !query.focused) {
+                text->text = query.placeholder;
+                text->color = 0x555555FF;
+                return;
+            }
+
+            text->text = query.draft + (query.focused ? "|" : "");
+            text->color = 0xFFFFFFFF;
+
+            // The flecs bar is the one that can fail, so it carries the bridge's
+            // verdict: a query the far world rejected, or a world that is not
+            // running at all, has to be visible somewhere.
+            if (query.kind == EntityQuery::Flecs && !query.focused
+                && query.panel.is_valid() && query.panel.is_alive()) {
+                const EntitySet* set = query.panel.try_get<EntitySet>();
+                if (set && set->status == "OFFLINE") {
+                    text->text = query.draft + "   [world offline]";
+                    text->color = 0xB05A3CFF;
+                } else if (set && set->status == "ERROR") {
+                    text->text = query.draft + "   ["
+                               + (set->error.empty() ? std::string("bad query") : set->error) + "]";
+                    text->color = 0xB05A3CFF;
+                } else if (set && set->loaded) {
+                    // A name that matches nothing is reported alongside the
+                    // count, since "0" alone reads as "none exist" when the
+                    // truth is usually "that name does not exist".
+                    std::string note = std::to_string(set->names.size());
+                    if (!set->error.empty()) note += ", " + set->error;
+                    text->text = query.draft + "   [" + note + "]";
+                }
+            }
+        });
+
+    // Loads the panel's rows from the headless world whenever the query it
+    // should be showing has moved ahead of the one that produced them.
+    world->system<EntitySet>("EntityQueryRequestSystem")
+        .kind(flecs::OnUpdate)
+        .each([](flecs::entity leaf, EntitySet& set) {
+            request_entity_query(leaf, set);
+        });
+
+    // Issues the ranking request when the selection has moved ahead of the
+    // ordering. Retrying every frame is what recovers from the server's LOADING
+    // replies while the model is still warming up -- request_entity_ranking is
+    // a no-op unless the socket is actually free.
+    world->system<EntitySelection>("EntityRankingRequestSystem")
+        .kind(flecs::OnUpdate)
+        .each([](flecs::entity leaf, EntitySelection& selection) {
+            request_entity_ranking(leaf, selection);
+        });
 
     // 0. Yoga roots that fill a legacy-laid-out parent take their UISize from
     //    that parent's UIElementSize. The parent's size is finalised later in
@@ -6679,7 +8148,7 @@ int main(int, char *[]) {
     .kind(flecs::PostUpdate)
         .each([&](flecs::entity e, Position& pos, RoundedRectRenderable& renderable, ZIndex& zIndex, RenderGradient* rg) {
             RenderQueue& queue = world->ensure<RenderQueue>();
-            queue.addRoundedRectCommand(pos, renderable, zIndex.layer, rg, rg ? *rg : RenderGradient{0, 0});
+            queue.addRoundedRectCommand(pos, renderable, zIndex.layer, rg, rg ? *rg : RenderGradient{0, 0}, resolve_scissor(e), ui_hierarchy_depth(e));
         });
 
 
@@ -6690,16 +8159,7 @@ int main(int, char *[]) {
             if (status.visible)
             {
                 RenderQueue& queue = world->ensure<RenderQueue>();
-                // flecs::entity scissorEntity = flecs::entity::null();
-                if (e.has<ScissorContainer>(flecs::Wildcard))
-                {
-                    flecs::entity scissorEntity = e.target<ScissorContainer>();
-                    queue.commands.push_back({pos, renderable, RenderType::Rectangle, zIndex.layer, scissorEntity});
-                    // TODO: Pushback target UIElementBounds as the scissorRegion of RenderCommand
-                } else
-                {
-                    queue.commands.push_back({pos, renderable, RenderType::Rectangle, zIndex.layer, 0});
-                }
+                queue.commands.push_back({pos, renderable, RenderType::Rectangle, zIndex.layer, resolve_scissor(e), false, {0, 0}, ui_hierarchy_depth(e)});
             }
         });
 
@@ -6718,7 +8178,7 @@ int main(int, char *[]) {
     .term_at(3).optional()
     .each([&](flecs::entity e, Position& pos, TextRenderable& renderable, ZIndex& zIndex, RenderGradient* rg) {
         RenderQueue& queue = world->ensure<RenderQueue>();
-        queue.addTextCommand(pos, renderable, zIndex.layer, rg, rg ? *rg : RenderGradient{0, 0});
+        queue.addTextCommand(pos, renderable, zIndex.layer, rg, rg ? *rg : RenderGradient{0, 0}, resolve_scissor(e), ui_hierarchy_depth(e));
     });
 
     auto imageQueueSystem = world->system<Position, ImageRenderable, ZIndex, RenderStatus>()
@@ -6728,15 +8188,7 @@ int main(int, char *[]) {
         RenderQueue& queue = world->ensure<RenderQueue>();
         if (status.visible)
         {
-            // queue.addImageCommand(pos, renderable, zIndex.layer);
-                if (e.has<ScissorContainer>(flecs::Wildcard))
-                {
-                    flecs::entity scissorEntity = e.target<ScissorContainer>();
-                    queue.commands.push_back({pos, renderable, RenderType::Image, zIndex.layer, scissorEntity});
-                } else
-                {
-                    queue.commands.push_back({pos, renderable, RenderType::Image, zIndex.layer, 0});
-                }
+            queue.commands.push_back({pos, renderable, RenderType::Image, zIndex.layer, resolve_scissor(e), false, {0, 0}, ui_hierarchy_depth(e)});
         }
     });
 
@@ -6761,15 +8213,7 @@ int main(int, char *[]) {
     .term_at(0).second<World>()
     .each([&](flecs::entity e, Position& pos, CustomRenderable& renderable, ZIndex& zIndex) {
         RenderQueue& queue = world->ensure<RenderQueue>();
-        if (e.has<ScissorContainer>(flecs::Wildcard))
-        {
-            flecs::entity scissorEntity = e.target<ScissorContainer>();
-            queue.commands.push_back({pos, renderable, RenderType::CustomRenderable, zIndex.layer, scissorEntity});
-            // TODO: Pushback target UIElementBounds as the scissorRegion of RenderCommand
-        } else
-        {
-            queue.commands.push_back({pos, renderable, RenderType::CustomRenderable, zIndex.layer, 0});
-        }
+        queue.commands.push_back({pos, renderable, RenderType::CustomRenderable, zIndex.layer, resolve_scissor(e), false, {0, 0}, ui_hierarchy_depth(e)});
     });
 
     world->system<Position, EditorNodeArea, EditorLeafData, EditorRoot>()
@@ -6909,13 +8353,13 @@ int main(int, char *[]) {
     auto renderExecutionSystem = world->system<RenderQueue, Graphics>()
         .kind(flecs::PostUpdate)
         .each([&](flecs::entity e, RenderQueue& queue, Graphics& graphics) {
-            queue.sort();            
-            // TODO: Apply scissor regions to relevant entity
+            queue.sort();
             for (const auto& cmd : queue.commands) {
-                if (ecs_is_valid(*world, cmd.scissorEntity) && ecs_is_alive(*world, cmd.scissorEntity))
-                {
-                    UIElementBounds* scissorBounds = ecs_ensure(*world, cmd.scissorEntity, UIElementBounds);
-                    nvgScissor(graphics.vg, scissorBounds->xmin, scissorBounds->ymin, scissorBounds->xmax - scissorBounds->xmin, scissorBounds->ymax - scissorBounds->ymin);
+                if (cmd.scissorEntity) {
+                    float cx, cy, cw, ch;
+                    if (scissor_rect(world->entity(cmd.scissorEntity), cx, cy, cw, ch)) {
+                        nvgScissor(graphics.vg, cx, cy, cw, ch);
+                    }
                 }
                 switch (cmd.type) {
                     case RenderType::CustomRenderable: {

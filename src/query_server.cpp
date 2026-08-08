@@ -36,10 +36,148 @@ void query_error_handler(int sig) {
     }
 }
 
+
+// Serialized responses are built into one buffer and sent in a single write.
+// 16KB truncated an unfiltered listing partway through flecs' own builtins,
+// before any of the world's entities were reached -- the tail was silently
+// dropped, so a query looked like it had simply returned less.
+static constexpr size_t QUERY_RESPONSE_CAPACITY = 1u << 20;
+
+// Text carried by entities the editor creates. Registered here rather than by
+// the host application so any world running a query server can accept created
+// entities without first defining a schema for them. Named "Text" explicitly,
+// since the C++ symbol would otherwise surface in the UI as query_server::EntityText.
+struct EntityText {
+    std::string value;
+};
+
+// create <Type> <text...>
+//
+// Everything after the type name is the text, spaces included, so no quoting or
+// escaping is needed for the thing this exists to carry: a typed message.
+// The type is created on demand if the world has never seen it, which is what
+// lets the editor introduce a kind of entity the world was not compiled with.
+static bool handle_create(int client_socket, const char* request) {
+    if (strncmp(request, "create ", 7) != 0) return false;
+
+    const char* cursor = request + 7;
+    while (*cursor == ' ') cursor++;
+
+    const char* type_end = cursor;
+    while (*type_end && *type_end != ' ') type_end++;
+
+    std::string type_name(cursor, type_end - cursor);
+    const char* text = type_end;
+    while (*text == ' ') text++;
+
+    char response[512];
+    if (type_name.empty()) {
+        snprintf(response, sizeof(response), "{\"error\": \"create needs a type\"}\n");
+        send(client_socket, response, strlen(response), 0);
+        return true;
+    }
+
+    flecs::entity type = g_world->lookup(type_name.c_str());
+    if (!type.is_valid()) {
+        type = g_world->entity(type_name.c_str());
+    }
+
+    // Anonymous: the text is the identity here, not a path-safe name. Entity
+    // names are scoped and separator-sensitive, and a sentence is neither.
+    flecs::entity created = g_world->entity();
+    created.add(type);
+    created.set<EntityText>({std::string(text)});
+
+    snprintf(response, sizeof(response),
+             "{\"status\": \"OK\", \"id\": %llu}\n",
+             (unsigned long long)created.id());
+    send(client_socket, response, strlen(response), 0);
+    return true;
+}
+
+// The first identifier in `expr` that names nothing in this world, or empty.
+//
+// A query bar is typed into, and a name the world has never seen is the normal
+// case rather than an error: "Chat" matches nothing until the first chat entity
+// exists, and a user browsing types should get an empty list, not a failure.
+// flecs itself refuses to compile such a query, so the check happens first.
+//
+// Deliberately conservative -- only bare identifiers are judged. Anything with
+// an operator, a variable, or a wildcard is left for flecs to rule on.
+static std::string first_unknown_identifier(const std::string& expr) {
+    size_t pos = 0;
+    while (pos <= expr.size()) {
+        size_t end = expr.find(',', pos);
+        if (end == std::string::npos) end = expr.size();
+
+        std::string term = expr.substr(pos, end - pos);
+        pos = end + 1;
+
+        // Trim, then drop the operators that may lead a term.
+        size_t b = term.find_first_not_of(" \t!?[|");
+        if (b == std::string::npos) continue;
+        size_t e = term.find_last_not_of(" \t]|");
+        term = term.substr(b, e - b + 1);
+
+        // A relation term names its relation before the parenthesis.
+        size_t paren = term.find('(');
+        if (paren != std::string::npos) term = term.substr(0, paren);
+
+        if (term.empty() || term == "_" || term == "*" || term[0] == '$') continue;
+
+        bool plain = true;
+        for (char c : term) {
+            if (!(isalnum((unsigned char)c) || c == '_' || c == '.' || c == ':')) {
+                plain = false;
+                break;
+            }
+        }
+        if (!plain) continue;   // ranges, comparisons, anything else: flecs decides
+
+        if (!g_world->lookup(term.c_str()).is_valid()) return term;
+    }
+    return std::string();
+}
+
+// True for entities flecs defines for its own bookkeeping -- traits, builtin
+// components, module scopes. A query of "_" matches literally everything, so
+// without this an unfiltered listing is ~40 entities of ECS plumbing before any
+// of the world's own data. Anything under the `flecs` scope is internal.
+static bool is_internal_entity(flecs::entity e) {
+    if (e.has(flecs::Module) || e.has(flecs::Prefab) ||
+        e.has<flecs::Member>() || e.has<flecs::Type>()) {
+        return true;
+    }
+    // Anything scoped under the `flecs` module is the ECS describing itself.
+    // Walked rather than matched on the path string, which is not reliably
+    // prefixed for builtins.
+    for (flecs::entity p = e.parent(); p.is_valid(); p = p.parent()) {
+        if (p.id() == flecs::Flecs) return true;
+    }
+    return false;
+}
+
+// entity.to_json() carries name, tags, pairs and components, but not the entity
+// id -- and a caller that wants to refer back to an entity needs the id, not a
+// position in a result list. Spliced in rather than rebuilt, so flecs keeps
+// owning the serialization of everything else.
+static std::string entity_json_with_id(flecs::entity e) {
+    std::string json = e.to_json().c_str();
+    std::string prefix = "{\"id\": " + std::to_string((uint64_t)e.id()) + ", ";
+    if (!json.empty() && json[0] == '{') {
+        return prefix + json.substr(1);
+    }
+    return json;
+}
+
 // Initialize the query server
 void initialize(flecs::world* world, spatial::SpatialIndexManager* spatial_index) {
     g_world = world;
     g_spatial_index = spatial_index;
+
+    // Reflection metadata, so a created entity's text round-trips through
+    // to_json() like any component the host declared itself.
+    world->component<EntityText>("Text").member<std::string>("value");
 }
 
 // Register component serializer
@@ -576,9 +714,10 @@ void handle_query(int client_socket, const char* query_str) {
                 printf("  - Entity ID in partition_filter: %lu\n", eid);
             }
 
-            char response[16384];
+            std::vector<char> response_storage(QUERY_RESPONSE_CAPACITY);
+            char* response = response_storage.data();
             int offset = 0;
-            int remaining = sizeof(response) - offset;
+            int remaining = response_storage.size() - offset;
             offset += snprintf(response + offset, remaining, "{\"results\": [\n");
 
             int count = 0;
@@ -586,25 +725,24 @@ void handle_query(int client_socket, const char* query_str) {
                 flecs::entity e = g_world->entity(eid);
 
                 // Skip flecs internal entities (metadata, modules, etc.)
-                if (e.has(flecs::Module) || e.has(flecs::Prefab) ||
-                    e.has<flecs::Member>() || e.has<flecs::Type>()) {
+                if (is_internal_entity(e)) {
                     continue;
                 }
 
-                if (offset >= sizeof(response) - 1000) break;
+                if (offset >= response_storage.size() - 1000) break;
 
                 if (count > 0) {
-                    remaining = sizeof(response) - offset;
+                    remaining = response_storage.size() - offset;
                     offset += snprintf(response + offset, remaining, ",\n");
                 }
 
                 // Use flecs reflection to serialize entity with all components
-                remaining = sizeof(response) - offset;
-                offset += snprintf(response + offset, remaining, "  %s", e.to_json().c_str());
+                remaining = response_storage.size() - offset;
+                offset += snprintf(response + offset, remaining, "  %s", entity_json_with_id(e).c_str());
                 count++;
             }
 
-            offset += snprintf(response + offset, sizeof(response) - offset, "\n], \"count\": %d}\n", count);
+            offset += snprintf(response + offset, response_storage.size() - offset, "\n], \"count\": %d}\n", count);
             send(client_socket, response, strlen(response), 0);
 
             // Clean up signal handler
@@ -615,6 +753,20 @@ void handle_query(int client_socket, const char* query_str) {
 
         // Parse and execute the flecs query
         std::string flecs_query_str = remove_partition_queries(query_str);
+
+        // A name this world has never heard of yields nothing, rather than
+        // failing the whole query.
+        std::string unknown = first_unknown_identifier(flecs_query_str);
+        if (!unknown.empty()) {
+            char empty_response[256];
+            snprintf(empty_response, sizeof(empty_response),
+                     "{\"results\": [], \"count\": 0, \"unknown\": \"%s\"}\n",
+                     unknown.c_str());
+            send(client_socket, empty_response, strlen(empty_response), 0);
+            error_handler_set = false;
+            sigaction(SIGSEGV, &old_sa, nullptr);
+            return;
+        }
 
         // Skip if the cleaned query is empty
         if (flecs_query_str.empty()) {
@@ -630,9 +782,10 @@ void handle_query(int client_socket, const char* query_str) {
             .build();
 
         // Build JSON response
-        char response[16384];
+        std::vector<char> response_storage(QUERY_RESPONSE_CAPACITY);
+            char* response = response_storage.data();
         int offset = 0;
-        int remaining = sizeof(response) - offset;
+        int remaining = response_storage.size() - offset;
         offset += snprintf(response + offset, remaining, "{\"results\": [\n");
 
         int count = 0;
@@ -643,28 +796,27 @@ void handle_query(int client_socket, const char* query_str) {
             }
 
             // Skip flecs internal entities (metadata, modules, etc.)
-            if (e.has(flecs::Module) || e.has(flecs::Prefab) ||
-                e.has<flecs::Member>() || e.has<flecs::Type>()) {
+            if (is_internal_entity(e)) {
                 return;
             }
 
             // Safety check for buffer overflow
-            if (offset >= sizeof(response) - 1000) {
+            if (offset >= response_storage.size() - 1000) {
                 return;
             }
 
             if (count > 0) {
-                remaining = sizeof(response) - offset;
+                remaining = response_storage.size() - offset;
                 offset += snprintf(response + offset, remaining, ",\n");
             }
 
             // Use flecs reflection to serialize entity with all components
-            remaining = sizeof(response) - offset;
-            offset += snprintf(response + offset, remaining, "  %s", e.to_json().c_str());
+            remaining = response_storage.size() - offset;
+            offset += snprintf(response + offset, remaining, "  %s", entity_json_with_id(e).c_str());
             count++;
         });
 
-        offset += snprintf(response + offset, sizeof(response) - offset, "\n], \"count\": %d}\n", count);
+        offset += snprintf(response + offset, response_storage.size() - offset, "\n], \"count\": %d}\n", count);
 
         send(client_socket, response, strlen(response), 0);
 
@@ -707,8 +859,20 @@ void* client_handler(void* arg) {
             buffer[bytes_read - 1] = '\0';
         }
 
-        printf("Received query: %s\n", buffer);
-        handle_query(client_socket, buffer);
+        // An empty request means "everything". `_` is flecs' Any wildcard, which
+        // matches each entity exactly once -- unlike `*`, which yields an entity
+        // once per component it holds.
+        const char* query = buffer;
+        while (*query == ' ' || *query == '\t') query++;
+        if (*query == '\0') query = "_";
+
+        if (handle_create(client_socket, query)) {
+            close(client_socket);
+            return nullptr;
+        }
+
+        printf("Received query: %s\n", query);
+        handle_query(client_socket, query);
     }
 
     close(client_socket);

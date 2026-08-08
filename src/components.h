@@ -3,6 +3,7 @@
 #include <unordered_map>
 #include <string>
 #include <vector>
+#include <functional>
 
 #include <nanovg.h>
 #include <flecs.h>
@@ -424,6 +425,164 @@ struct ChatMessageView {
 struct FocusChatInput {};
 struct SendChatMessage {};
 
+// The inner row of a badge, where its label and symbols live. Published so a
+// caller can nest another badge *inside* this one -- a relationship block that
+// holds its target, Scratch-style -- rather than only placing badges beside
+// each other. The badge entity itself is the block; this is its slot.
+struct BadgeContent {
+    flecs::entity row;
+};
+
+// Backs one row of the Entities panel. The badge entity is a presentation
+// element built by create_badge(); this carries what it stands for, so a click
+// handler can recover the subject without reading it back out of a TextRenderable.
+struct EntityBadge {
+    std::string name;
+    size_t index = 0;
+    flecs::entity panel;   // leaf carrying the EntitySelection this row reports to
+};
+
+// Which row of an Entities panel is selected, and what the inspector subpanel
+// currently shows. Two fields rather than an event: the rebuild is driven by
+// comparing them, so a selection made while the panel is being rebuilt can't be
+// missed, and setting the same index twice costs nothing.
+//
+// `selected` and `ranked_for` are indices into the *backing data*, never row
+// positions, so they survive the list being reordered underneath them.
+struct EntitySelection {
+    flecs::entity inspector;   // subpanel the selected entity is built into
+    flecs::entity list;        // list content, marked dirty so rows can restyle
+    size_t selected = SIZE_MAX;
+    size_t shown = SIZE_MAX;
+
+    // Which selection and relation the current ordering was computed for, and
+    // whether a request is in flight. Together they stop the panel re-asking
+    // the embedding server for a ranking it already has.
+    size_t ranked_for = SIZE_MAX;
+    std::string ranked_query;
+    bool rank_pending = false;
+
+    // Semantic relation currently in force, submitted from the panel's semantic
+    // bar. Held here rather than on the bar because the bar is a view -- this is
+    // the panel's state, and it has to outlive a rebuild of the panel chrome.
+    std::string relation;
+};
+
+// The entities an Entities panel is showing, pulled from a separate headless
+// flecs world over the entity_query bridge.
+//
+// The panel owns its result set rather than reading a global, so two panels can
+// hold two different queries against the same world. `names` and `detail` are
+// index-aligned; a row is an index into both.
+struct EntitySet {
+    // Three stages of the same string: what the panel should be showing, what
+    // is in flight, and what actually produced the current rows. A request goes
+    // out whenever `wanted` has moved ahead of `expr` and nothing is pending.
+    std::string wanted;
+    std::string requested;
+    std::string expr;
+
+    std::vector<std::string> names;
+
+    // Index-aligned with names, one list per entity. Kept apart because the
+    // inspector draws each kind differently: tags and component types as plain
+    // badges, relations as an arrow badge followed by its target.
+    std::vector<std::vector<std::string>> tags;
+    std::vector<std::vector<std::string>> components;
+
+    // Each entry is "Relation\tTarget" -- tab, because flecs paths contain
+    // colons and a relation target is often a path.
+    std::vector<std::vector<std::string>> relations;
+
+    // Last reply from the bridge: "OK", "OFFLINE" (world not running),
+    // "ERROR" (bad query), or empty before the first request.
+    std::string status;
+    std::string error;
+
+    bool loaded = false;
+};
+
+// Natural-language relation typed into an Entities panel, applied to whatever
+// entity is selected: select "Giraffe", type "lives nearby", and the list
+// reorders by that relation rather than by bare name similarity.
+//
+// `draft` is what is being typed; `applied` is what was last submitted. Keeping
+// them apart means the list only re-ranks on Enter, not on every keystroke --
+// each rank is a round trip to the embedding server.
+// Lives on the input bar entity itself, not the panel leaf, because a panel has
+// two of them -- a flecs query bar and a semantic one -- and flecs allows only
+// one instance of a component per entity.
+struct EntityQuery {
+    flecs::entity panel;         // leaf this bar belongs to
+    flecs::entity input_text;    // TextRenderable kept in sync with the draft
+    std::string draft;
+    std::string applied;
+    bool focused = false;
+
+    // What submitting the bar does. Both share the keyboard plumbing; only the
+    // effect of Enter differs.
+    enum Kind {
+        Semantic,   // re-rank the loaded rows by proximity / relation
+        Flecs,      // re-query the headless world for a new set of rows
+    } kind = Semantic;
+
+    std::string placeholder;
+};
+
+struct FocusEntityQuery {};
+
+// Display order for an Entities panel: row position -> index into the backing
+// data. Empty means identity, which is also what it falls back to whenever a
+// ranking is unavailable, so the list is never blocked on the server.
+struct EntityOrder {
+    std::vector<size_t> order;
+
+    size_t data_index(size_t row) const {
+        return row < order.size() ? order[row] : row;
+    }
+};
+
+// A vertical list whose rows exist as entities only while they are on screen.
+//
+// The backing data can hold a million rows: every row is exactly row_pitch tall,
+// so the window of visible indices is arithmetic rather than a search, and only
+// that window is ever built. Bounding the entity count -- not just the draw call
+// count -- is the point, because the legacy layout pass walks the whole UI
+// hierarchy every frame, so a row that merely exists offscreen costs as much as
+// a visible one.
+//
+// Lives on the row container itself rather than the panel leaf, so it dies with
+// the canvas children when the panel type changes and can never be left
+// pointing at destroyed rows.
+struct VirtualList {
+    // Clips the rows and supplies the visible height. Rows overflow it by at
+    // most one pitch, which the scissor crops.
+    flecs::entity viewport;
+
+    // Builds row `index` under `parent`. The list owns nothing about what a row
+    // looks like; it only guarantees every row it asks for is row_pitch tall.
+    std::function<void(flecs::entity parent, size_t index)> build_row;
+
+    float row_pitch = 28.0f;
+    float pad = 8.0f;
+    size_t item_count = 0;
+
+    // Pixels scrolled from the top of the virtual content. Written by input,
+    // clamped by the list system against the current viewport height.
+    float scroll = 0.0f;
+
+    // The window currently built as entities. realized stays false until the
+    // viewport has a measured height, so the first build waits for layout.
+    size_t first_realized = 0;
+    size_t realized_count = 0;
+    bool realized = false;
+
+    // Forces a rebuild of the current window even though it hasn't moved. Set
+    // when something outside the list changes how a row should look -- the
+    // selection moving, for instance.
+    bool dirty = false;
+};
+
 
 // Particle animation for grid triangles - moving with velocity to collide at target
 struct TriangleParticle {
@@ -607,6 +766,7 @@ enum class EditorType
     BFO,
     SceneGraph,
     DataFusion,
+    Entities,
     // SystemNavigator,
 
     // Bookshelf,
