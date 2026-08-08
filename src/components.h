@@ -6,6 +6,7 @@
 
 #include <nanovg.h>
 #include <flecs.h>
+#include <yoga/Yoga.h>
 
 #include <raymath.h>
 
@@ -102,6 +103,114 @@ struct PanelState
         return option_indices.count(option_name) && options[option_indices[option_name]].active;
     }
 };
+
+// ============================================================================
+// Yoga (flexbox) layout
+// ----------------------------------------------------------------------------
+// Marker tag: any entity with this participates in the Yoga layout tree.
+// An OnAdd observer creates its YogaNode; an OnRemove observer frees it.
+// Entities without UIYoga are invisible to the Yoga tree even when their
+// flecs parent is a Yoga node, so Yoga can be adopted subtree by subtree.
+struct UIYoga {};
+
+struct YogaNode {
+    YGNodeRef node = nullptr;
+};
+
+struct UISize { float w = YGUndefined, h = YGUndefined; };
+struct UIMaxSize { float w = YGUndefined, h = YGUndefined; };
+struct UIMinSize { float w = YGUndefined, h = YGUndefined; };
+
+// Absolute positioning with per-edge offsets (any edge = NaN means "unset").
+// Used for "fill parent" and "fill parent with padding" cases -- the Yoga
+// equivalent of the old Expand component.
+struct UIAbsoluteEdges {
+    float left = YGUndefined;
+    float top = YGUndefined;
+    float right = YGUndefined;
+    float bottom = YGUndefined;
+};
+
+// Aspect ratio (width / height). When set, Yoga uses it to compute the
+// opposite axis from the known one.
+struct UIAspectRatio { float ratio = YGUndefined; };
+
+// Flex Container Properties (Parent-level)
+struct UIFlexContainer {
+    YGFlexDirection direction = YGFlexDirectionColumn;
+    YGWrap wrap = YGWrapNoWrap;
+    YGJustify justify = YGJustifyFlexStart;
+    YGAlign items = YGAlignFlexStart;
+    float gap = 0.0f;
+};
+
+// Flex Item Properties (Child-level)
+struct UIFlexItem {
+    float grow = 0.0f;
+    float shrink = 1.0f;
+    YGAlign alignSelf = YGAlignAuto;
+};
+
+// Box Model
+struct UIMargin  { float top, right, bottom, left; };
+struct UIPadding { float top, right, bottom, left; };
+
+// Adopts a subtree that is still laid out by the legacy pipeline
+// (LayoutBox / UIContainer / Expand) as a single leaf in a Yoga row or column.
+// Yoga takes the node's size from whatever size the old layout computed for the
+// entity and only decides *where* it goes; nothing inside it is touched, and
+// YogaReadback will not write its renderable size back. This is how calibrated
+// widgets -- badges, triple blocks -- get flex spacing without being rebuilt.
+struct UIYogaLegacyLeaf {};
+
+// Opt-in intrinsic sizing for a Yoga image leaf: style width/height are pinned
+// to the image's native pixel size (times ImageRenderable scale). Without this
+// an image leaf carries only an aspect ratio, so it needs a definite size from
+// somewhere -- a flex stretch, a parent, or this tag.
+struct UINativeImageSize {};
+
+// Caps a Yoga image leaf at its native pixel size (times ImageRenderable
+// scale), so flex stretching can shrink it but never upscale past 1:1.
+// Overrides UIMaxSize when both are present.
+struct UIMaxNativeImageSize {};
+
+// Sizes a Yoga image leaf to the largest size that fits inside its parent's
+// content box while keeping the image's native aspect ratio -- flexbox
+// "contain". Pair it with a parent that centres (JustifyCenter / AlignCenter)
+// to place the result.
+//
+// This can't be expressed with aspectRatio + UIMaxSize: when a max constraint
+// clamps one axis, Yoga leaves the other at its styled value instead of
+// re-deriving it from the ratio, and the image comes out skewed. Computing both
+// axes here keeps the proportions exact and, because it happens in the same
+// PreFrame pass as the rest of layout, without the frame of lag the old
+// Expand/Constrain pair had.
+struct UIContainParent {
+    float pad_left = 0.0f, pad_top = 0.0f, pad_right = 0.0f, pad_bottom = 0.0f;
+    bool allow_upscale = false;
+};
+
+// Bridges a legacy-laid-out parent into a Yoga root: each frame the parent's
+// UIElementSize is copied into this entity's UISize, minus the given insets.
+// This is how a Yoga subtree fills an editor panel whose own sizing is still
+// owned by the old Expand/LayoutBox pipeline, so panels can be ported to Yoga
+// one at a time. Position<Local> of the root should match pad_left/pad_top.
+struct UIFillParent {
+    float pad_left = 0.0f, pad_top = 0.0f, pad_right = 0.0f, pad_bottom = 0.0f;
+};
+
+// Remembers what a Yoga text leaf was last measured with. Yoga caches measure
+// results, so the node is only marked dirty when the text actually changes --
+// otherwise every text node would force a full relayout every frame.
+struct YogaTextCache {
+    std::string text;
+    std::string fontFace;
+    float fontSize = 0.0f;
+    float wrapWidth = 0.0f;
+    float scaleY = 0.0f;
+};
+
+// ============================================================================
 
 // Unified layout box - used for both horizontal and vertical layouts
 struct LayoutBox
@@ -223,6 +332,11 @@ struct ImageRenderable
     float texOffsetY = 0.0f;
 };
 
+// Marks the ImageRenderable whose texture is the offscreen render3d scene (see
+// panel3d.h). The panel's laid-out bounds drive the viewport's resolution and
+// its hit test, so the tag is how that per-frame sync finds the element.
+struct Panel3DViewport {};
+
 struct ZIndex {
     int layer;
 };
@@ -239,6 +353,17 @@ struct CursorState
 
 struct CallbackOnLeftClick {
     std::function<void(flecs::entity)> onClicked;
+};
+
+// Tracks the pointer event currently being dispatched. Click targets under the
+// cursor are visited in priority order -- highest ZIndex first, deepest in the
+// hierarchy first on ties -- and a handler that acts on the click marks it
+// consumed, which stops the event reaching anything beneath. Without this,
+// every overlapping element receives the same click: clicking an option row in
+// a popup also "clicks" the dropdown icon whose bubbled-up bounds contain the
+// popup, which immediately toggles the menu shut.
+struct UIInputDispatch {
+    bool consumed = false;
 };
 
 struct AddTagOnLeftClick{};

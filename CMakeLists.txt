@@ -12,7 +12,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # add_definitions(AOTInductor_CUDA)
-add_executable(${PROJECT_NAME} src/main.cpp src/mel_spec_render.cpp src/glad.c src/vision_processor.cpp src/x11_outline.cpp src/dino_embedder.cpp src/thorn_vfx.cpp src/tradewinds.cpp)
+add_executable(${PROJECT_NAME} src/main.cpp src/mel_spec_render.cpp src/glad.c src/vision_processor.cpp src/x11_outline.cpp src/dino_embedder.cpp src/thorn_vfx.cpp src/tradewinds.cpp src/stl_mesh.cpp src/panel3d.cpp)
 # deps/tracy-0.13.1/public/TracyClient.cpp
 
 target_include_directories(${PROJECT_NAME} PRIVATE "deps/cppzmq")
@@ -40,6 +40,11 @@ include_directories("deps/enet-1.3.18/include")
 
 add_definitions(-DTRACY_ENABLE)
 add_subdirectory("deps/tracy-0.13.1")
+
+# Yoga (flexbox layout). Point at the yoga/ subdir rather than the repo root so
+# we skip its tests target (which wants gtest). yogacore exports the repo root
+# as a PUBLIC include dir, so <yoga/Yoga.h> resolves for anything linking it.
+add_subdirectory("deps/yoga-3.2.1/yoga")
 
 # Flecs
 include_directories("deps/flecs-4.1.1/include")
@@ -83,11 +88,14 @@ add_subdirectory("deps/enet-1.3.18")
 
 include_directories("deps/raylib")
 
-# GLAD
+# GLAD. glad_compat/include supplies <glad/gl.h> for render3d, which expects the
+# glad 2.x header name, plus the two instancing entrypoints this 0.1.36 gl=3.0
+# loader omits -- see deps/glad_compat/include/glad/gl.h.
 add_library(glad STATIC
     deps/glad/src/glad.c
+    deps/glad_compat/src/gl_compat.c
 )
-target_include_directories(glad PUBLIC deps/glad/include)
+target_include_directories(glad PUBLIC deps/glad/include deps/glad_compat/include)
 
 # NanoVG
 add_library(nanovg STATIC
@@ -106,6 +114,15 @@ target_compile_options(fpng PRIVATE -msse4.1 -mpclmul)
 
 # mel_spec libraries (audio streaming and mel spectrogram generation)
 add_subdirectory("deps/mel_spec")
+
+# glm (header-only). The light distribution has no top-level CMakeLists, so the
+# INTERFACE target render3d links against is declared here.
+add_library(glm INTERFACE)
+target_include_directories(glm INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/deps/glm")
+
+# render3d -- flecs module for the rasterized 3D scene drawn into the Droid
+# panel. Links flecs/glfw/glad/glm, all of which exist above.
+add_subdirectory("deps/render3d")
 
 find_package(SDL2 REQUIRED)
 find_package(SDL2_image REQUIRED)
@@ -143,7 +160,7 @@ target_link_libraries(query_server flecs spatialindex lmdb pthread)
 set_property(TARGET query_server PROPERTY CXX_STANDARD 20)
 # ----
 
-target_link_libraries(${PROJECT_NAME} flecs enet glfw glad nanovg fpng X11 Xi Xtst SDL2 SDL2_image ${OpenCV_LIBS} query_server Tracy::TracyClient libssh2::libssh2 dinov2 msgpack-cxx libzmq)
+target_link_libraries(${PROJECT_NAME} flecs enet glfw glad nanovg fpng X11 Xi Xtst SDL2 SDL2_image ${OpenCV_LIBS} query_server Tracy::TracyClient libssh2::libssh2 dinov2 msgpack-cxx libzmq yogacore render3d)
 
 # Add audio stream client executable
 add_executable(audio_stream_client src/audio_stream_client.c)

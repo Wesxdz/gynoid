@@ -76,6 +76,7 @@ using json = nlohmann::json;
 
 #include "components.h"
 #include "thorn_vfx.h"
+#include "panel3d.h"
 
 #include "tradewinds.h"
 
@@ -1064,6 +1065,14 @@ void process_layout_recursive(flecs::entity e, float available_width) {
         process_layout_recursive(child, my_width);
     });
 
+    // An entity is either Yoga-managed or legacy-managed, never both: Yoga
+    // already positioned this entity's children and sized the entity itself
+    // back at PreFrame, so the legacy layout must not touch it. Note we still
+    // recursed above -- a Yoga subtree may contain legacy LayoutBox subtrees.
+    // UIYogaLegacyLeaf is the deliberate exception: Yoga only positions it, so
+    // its own UIContainer/LayoutBox sizing must still run here.
+    if (e.has<UIYoga>() && !e.has<UIYogaLegacyLeaf>()) return;
+
     // Then update this entity's size based on its type
     if (e.has<LayoutBox>()) {
         LayoutBox& box = e.ensure<LayoutBox>();
@@ -1139,6 +1148,414 @@ void propagate_bounds_containment(flecs::entity parent) {
         parent_bounds->xmax = std::max(parent_bounds->xmax, child_bounds->xmax);
         parent_bounds->ymax = std::max(parent_bounds->ymax, child_bounds->ymax);
     });
+}
+
+// ============================================================================
+// Yoga (flexbox) layout
+// ----------------------------------------------------------------------------
+// The per-entity steps below have two callers: the PreFrame systems that lay out
+// every Yoga tree once per frame, and yoga_layout_now(), which lays out a single
+// subtree synchronously. The latter exists because UI is frequently built inside
+// an input handler -- a popup menu, say -- and has to be correct, drawable and
+// hit-testable at that instant, not one frame later.
+// ============================================================================
+
+// nanovg context for text measurement and image queries. Yoga's measure
+// callback signature has no room for user data beyond the node, so this is
+// stashed at file scope; it is assigned once the Graphics singleton exists.
+static NVGcontext* g_yoga_vg = nullptr;
+
+static flecs::entity yoga_node_entity(YGNodeConstRef node)
+{
+    return world->entity((flecs::entity_t)(uintptr_t)YGNodeGetContext(node));
+}
+
+// Text leaves have no intrinsic size as far as Yoga is concerned, so they get a
+// measure func that calls back into nanovg during layout. Without it, text in a
+// flex container collapses to zero and the container can't size to its label.
+static YGSize yoga_measure_text(YGNodeConstRef node,
+                                float width, YGMeasureMode widthMode,
+                                float height, YGMeasureMode heightMode)
+{
+    YGSize out{0.0f, 0.0f};
+    if (!g_yoga_vg) return out;
+
+    flecs::entity e = yoga_node_entity(node);
+    if (!e.is_valid() || !e.is_alive()) return out;
+
+    const TextRenderable* text = e.try_get<TextRenderable>();
+    if (!text) return out;
+
+    nvgFontSize(g_yoga_vg, text->fontSize);
+    nvgFontFace(g_yoga_vg, text->fontFace.c_str());
+
+    // Honour an explicit wrapWidth; otherwise wrap to the width Yoga is
+    // offering, when it gives us a bound to work with.
+    float wrap = text->wrapWidth;
+    if (wrap <= 0.0f && widthMode != YGMeasureModeUndefined && width > 0.0f
+        && !std::isnan(width)) {
+        wrap = width;
+    }
+
+    TextSize ts = measureText(g_yoga_vg, text->text, wrap);
+    out.width = ts.w;
+    out.height = ts.h * text->scaleY;
+    return out;
+}
+
+// Step 0: a Yoga root that fills a legacy-laid-out parent takes its UISize from
+// that parent's UIElementSize.
+static void yoga_sync_fill_parent(flecs::entity e)
+{
+    const UIFillParent* fill = e.try_get<UIFillParent>();
+    if (!fill) return;
+    flecs::entity parent = e.parent();
+    if (!parent.is_valid()) return;
+    const UIElementSize* parent_size = parent.try_get<UIElementSize>();
+    if (!parent_size) return;
+
+    UISize& sz = e.ensure<UISize>();
+    sz.w = std::max(0.0f, parent_size->width  - fill->pad_left - fill->pad_right);
+    sz.h = std::max(0.0f, parent_size->height - fill->pad_top  - fill->pad_bottom);
+}
+
+// The content box available to a Yoga entity's children: the parent's resolved
+// size less its padding. Reads the parent's UISize first (Yoga's own input,
+// already written by yoga_sync_fill_parent this pass) and falls back to the
+// size the rest of the pipeline computed. Returns false if neither is known.
+static bool yoga_parent_content_size(flecs::entity e, float& out_w, float& out_h)
+{
+    flecs::entity parent = e.parent();
+    if (!parent.is_valid()) return false;
+
+    float w = YGUndefined, h = YGUndefined;
+    if (const UISize* sz = parent.try_get<UISize>()) { w = sz->w; h = sz->h; }
+    if (std::isnan(w) || std::isnan(h)) {
+        if (const UIElementSize* sz = parent.try_get<UIElementSize>()) {
+            if (std::isnan(w)) w = sz->width;
+            if (std::isnan(h)) h = sz->height;
+        }
+    }
+    if (std::isnan(w) || std::isnan(h) || w <= 0.0f || h <= 0.0f) return false;
+
+    if (const UIPadding* p = parent.try_get<UIPadding>()) {
+        w -= p->left + p->right;
+        h -= p->top + p->bottom;
+    }
+    out_w = std::max(0.0f, w);
+    out_h = std::max(0.0f, h);
+    return true;
+}
+
+// Step 1: make the Yoga node's child list match the flecs hierarchy. Entities
+// without UIYoga are skipped, so they stay invisible to the Yoga tree even when
+// their flecs parent is a Yoga node.
+static void yoga_sync_topology(flecs::entity e, YogaNode& yn)
+{
+    if (!yn.node) return;
+    uint32_t desired_idx = 0;
+    e.children([&](flecs::entity child) {
+        if (!child.has<UIYoga>()) return;
+        const YogaNode* cyn = child.try_get<YogaNode>();
+        if (!cyn || !cyn->node) return;
+        YGNodeRef cur_owner = YGNodeGetOwner(cyn->node);
+        YGNodeRef at_idx = (desired_idx < YGNodeGetChildCount(yn.node))
+            ? YGNodeGetChild(yn.node, desired_idx)
+            : nullptr;
+        if (cur_owner != yn.node || at_idx != cyn->node) {
+            if (cur_owner) YGNodeRemoveChild(cur_owner, cyn->node);
+            // Yoga asserts when inserting into a node that measures itself; an
+            // entity that gains Yoga children stops being a measured leaf.
+            if (YGNodeHasMeasureFunc(yn.node))
+                YGNodeSetMeasureFunc(yn.node, nullptr);
+            YGNodeInsertChild(yn.node, cyn->node, desired_idx);
+        }
+        desired_idx++;
+    });
+}
+
+// Step 2: push UI* component values into the YGNode. Cheap -- Yoga detects
+// no-op writes and won't dirty the node.
+static void yoga_sync_style(flecs::entity e, YogaNode& yn)
+{
+    if (!yn.node) return;
+    YGNodeRef n = yn.node;
+
+    // Absolute edge positioning (e.g. "fill parent with padding").
+    if (const UIAbsoluteEdges* ae = e.try_get<UIAbsoluteEdges>()) {
+        YGNodeStyleSetPositionType(n, YGPositionTypeAbsolute);
+        if (!std::isnan(ae->left))   YGNodeStyleSetPosition(n, YGEdgeLeft, ae->left);
+        if (!std::isnan(ae->top))    YGNodeStyleSetPosition(n, YGEdgeTop, ae->top);
+        if (!std::isnan(ae->right))  YGNodeStyleSetPosition(n, YGEdgeRight, ae->right);
+        if (!std::isnan(ae->bottom)) YGNodeStyleSetPosition(n, YGEdgeBottom, ae->bottom);
+    } else {
+        YGNodeStyleSetPositionType(n, YGPositionTypeRelative);
+    }
+
+    if (const UISize* sz = e.try_get<UISize>()) {
+        if (!std::isnan(sz->w)) YGNodeStyleSetWidth(n, sz->w);
+        if (!std::isnan(sz->h)) YGNodeStyleSetHeight(n, sz->h);
+    }
+    if (const UIMaxSize* mx = e.try_get<UIMaxSize>()) {
+        if (!std::isnan(mx->w)) YGNodeStyleSetMaxWidth(n, mx->w);
+        if (!std::isnan(mx->h)) YGNodeStyleSetMaxHeight(n, mx->h);
+    }
+    if (const UIMinSize* mn = e.try_get<UIMinSize>()) {
+        if (!std::isnan(mn->w)) YGNodeStyleSetMinWidth(n, mn->w);
+        if (!std::isnan(mn->h)) YGNodeStyleSetMinHeight(n, mn->h);
+    }
+    if (const UIAspectRatio* ar = e.try_get<UIAspectRatio>()) {
+        if (!std::isnan(ar->ratio) && ar->ratio > 0.0f)
+            YGNodeStyleSetAspectRatio(n, ar->ratio);
+    }
+    if (const UIFlexContainer* fc = e.try_get<UIFlexContainer>()) {
+        YGNodeStyleSetFlexDirection(n, fc->direction);
+        YGNodeStyleSetFlexWrap(n, fc->wrap);
+        YGNodeStyleSetJustifyContent(n, fc->justify);
+        YGNodeStyleSetAlignItems(n, fc->items);
+        YGNodeStyleSetGap(n, YGGutterAll, fc->gap);
+    }
+    if (const UIFlexItem* fi = e.try_get<UIFlexItem>()) {
+        YGNodeStyleSetFlexGrow(n, fi->grow);
+        YGNodeStyleSetFlexShrink(n, fi->shrink);
+        YGNodeStyleSetAlignSelf(n, fi->alignSelf);
+    }
+    if (const UIMargin* m = e.try_get<UIMargin>()) {
+        YGNodeStyleSetMargin(n, YGEdgeTop, m->top);
+        YGNodeStyleSetMargin(n, YGEdgeRight, m->right);
+        YGNodeStyleSetMargin(n, YGEdgeBottom, m->bottom);
+        YGNodeStyleSetMargin(n, YGEdgeLeft, m->left);
+    }
+    if (const UIPadding* p = e.try_get<UIPadding>()) {
+        YGNodeStyleSetPadding(n, YGEdgeTop, p->top);
+        YGNodeStyleSetPadding(n, YGEdgeRight, p->right);
+        YGNodeStyleSetPadding(n, YGEdgeBottom, p->bottom);
+        YGNodeStyleSetPadding(n, YGEdgeLeft, p->left);
+    }
+}
+
+// Step 3: intrinsic sizing for leaves Yoga cannot measure by itself.
+static void yoga_apply_intrinsic(flecs::entity e, YogaNode& yn)
+{
+    if (!yn.node) return;
+    YGNodeRef n = yn.node;
+
+    // A legacy leaf is sized by the old pipeline: mirror whatever size it
+    // computed into the Yoga style so the flex parent can place it, and never
+    // measure or descend into it.
+    if (e.has<UIYogaLegacyLeaf>()) {
+        float lw = YGUndefined, lh = YGUndefined;
+        if (const RoundedRectRenderable* rr = e.try_get<RoundedRectRenderable>()) {
+            lw = rr->width;  lh = rr->height;
+        } else if (const CustomRenderable* cr = e.try_get<CustomRenderable>()) {
+            lw = cr->width;  lh = cr->height;
+        } else if (const RectRenderable* rect = e.try_get<RectRenderable>()) {
+            lw = rect->width; lh = rect->height;
+        } else if (const ImageRenderable* img = e.try_get<ImageRenderable>()) {
+            lw = img->width; lh = img->height;
+        }
+        // TextRenderable leaves have no renderable size of their own, so fall
+        // back to the measured size the legacy sizing system wrote.
+        if (e.has<TextRenderable>()) {
+            if (const UIElementSize* sz = e.try_get<UIElementSize>()) {
+                lw = sz->width; lh = sz->height;
+            }
+        }
+        if (!std::isnan(lw) && lw > 0.0f) YGNodeStyleSetWidth(n, lw);
+        if (!std::isnan(lh) && lh > 0.0f) YGNodeStyleSetHeight(n, lh);
+        if (YGNodeHasMeasureFunc(n)) YGNodeSetMeasureFunc(n, nullptr);
+        return;
+    }
+
+    // Yoga forbids a measure func on a node with children, so only childless
+    // text entities get one.
+    bool wants_measure = (YGNodeGetChildCount(n) == 0) && e.has<TextRenderable>();
+
+    if (wants_measure) {
+        if (!YGNodeHasMeasureFunc(n)) YGNodeSetMeasureFunc(n, yoga_measure_text);
+
+        // Yoga caches measure results, so only dirty the node when the text (or
+        // its styling) actually changed. Dirtying every frame would force a full
+        // relayout of every ancestor.
+        const TextRenderable& t = e.get<TextRenderable>();
+        YogaTextCache& cache = e.ensure<YogaTextCache>();
+        if (cache.text != t.text || cache.fontFace != t.fontFace
+            || cache.fontSize != t.fontSize || cache.wrapWidth != t.wrapWidth
+            || cache.scaleY != t.scaleY) {
+            cache = {t.text, t.fontFace, t.fontSize, t.wrapWidth, t.scaleY};
+            YGNodeMarkDirty(n);
+        }
+        return;
+    }
+    if (YGNodeHasMeasureFunc(n)) YGNodeSetMeasureFunc(n, nullptr);
+
+    // Images: publish native aspect ratio so a known width yields the right
+    // height (and vice versa). This must come from nvgImageSize, NOT from
+    // ImageRenderable::width/height -- readback overwrites those with the
+    // laid-out size, so feeding them back would let the ratio drift a little
+    // further every frame.
+    if (const ImageRenderable* img = e.try_get<ImageRenderable>()) {
+        if (g_yoga_vg && img->imageHandle != -1) {
+            int nw = 0, nh = 0;
+            nvgImageSize(g_yoga_vg, img->imageHandle, &nw, &nh);
+            if (nw > 0 && nh > 0) {
+                float base_w = nw * img->scaleX;
+                float base_h = nh * img->scaleY;
+
+                // "Contain": fit inside the parent's content box, preserving
+                // proportions. Both axes are written explicitly, so no aspect
+                // ratio is published -- publishing one and letting a max
+                // constraint clamp a single axis is what skews the image.
+                if (const UIContainParent* fit = e.try_get<UIContainParent>()) {
+                    float aw = 0.0f, ah = 0.0f;
+                    if (yoga_parent_content_size(e, aw, ah)
+                        && base_w > 0.0f && base_h > 0.0f) {
+                        aw = std::max(0.0f, aw - fit->pad_left - fit->pad_right);
+                        ah = std::max(0.0f, ah - fit->pad_top - fit->pad_bottom);
+                        float scale = std::min(aw / base_w, ah / base_h);
+                        if (!fit->allow_upscale) scale = std::min(scale, 1.0f);
+                        YGNodeStyleSetWidth(n, base_w * scale);
+                        YGNodeStyleSetHeight(n, base_h * scale);
+                    }
+                    return;
+                }
+
+                if (!e.has<UIAspectRatio>())
+                    YGNodeStyleSetAspectRatio(n, (float)nw / (float)nh);
+                // Opt-in: pin the node to the image's native size.
+                if (e.has<UINativeImageSize>() && !e.has<UISize>()) {
+                    YGNodeStyleSetWidth(n, nw * img->scaleX);
+                    YGNodeStyleSetHeight(n, nh * img->scaleY);
+                }
+                // Opt-in: allow shrinking below 1:1 but never above it.
+                if (e.has<UIMaxNativeImageSize>()) {
+                    YGNodeStyleSetMaxWidth(n, nw * img->scaleX);
+                    YGNodeStyleSetMaxHeight(n, nh * img->scaleY);
+                }
+            }
+        }
+    }
+}
+
+// True when this entity owns its Yoga tree (its flecs parent isn't a Yoga node).
+static bool yoga_is_root(flecs::entity e)
+{
+    flecs::entity parent = e.parent();
+    return !(parent && parent.has<UIYoga>());
+}
+
+// Step 4: run layout for a Yoga root. Roots with a UISize get a fixed size;
+// roots without one auto-size to their content (e.g. a popup list).
+static void yoga_calculate(flecs::entity e, YogaNode& yn)
+{
+    if (!yn.node) return;
+    float rw = YGUndefined, rh = YGUndefined;
+    if (const UISize* sz = e.try_get<UISize>()) {
+        if (!std::isnan(sz->w)) rw = sz->w;
+        if (!std::isnan(sz->h)) rh = sz->h;
+    }
+    YGNodeCalculateLayout(yn.node, rw, rh, YGDirectionLTR);
+}
+
+// Step 5: pull Yoga's computed layout back into flecs. Writes Position<Local>
+// for non-root nodes plus the renderable width/height, so the existing render
+// queue (which reads those directly) keeps working unchanged.
+static void yoga_readback(flecs::entity e, YogaNode& yn)
+{
+    if (!yn.node) return;
+    float left = YGNodeLayoutGetLeft(yn.node);
+    float top  = YGNodeLayoutGetTop(yn.node);
+    float w    = YGNodeLayoutGetWidth(yn.node);
+    float h    = YGNodeLayoutGetHeight(yn.node);
+
+    // Roots keep whatever Position<Local> their owner set (panel code, scroll
+    // systems, ...); only non-roots are positioned by Yoga.
+    if (!yoga_is_root(e)) {
+        Position& p = e.ensure<Position, Local>();
+        p.x = left;
+        p.y = top;
+    }
+
+    // A legacy leaf owns its own size -- Yoga only placed it. Writing the
+    // computed size back would fight the calibrated layout inside.
+    if (e.has<UIYogaLegacyLeaf>()) return;
+
+    if (e.has<UIElementSize>()) {
+        UIElementSize& usz = e.ensure<UIElementSize>();
+        usz.width = w;
+        usz.height = h;
+    }
+    if (e.has<RectRenderable>()) {
+        RectRenderable& rect = e.ensure<RectRenderable>();
+        rect.width = w;  rect.height = h;
+    }
+    if (e.has<RoundedRectRenderable>()) {
+        RoundedRectRenderable& rect = e.ensure<RoundedRectRenderable>();
+        rect.width = w;  rect.height = h;
+    }
+    if (e.has<CustomRenderable>()) {
+        CustomRenderable& custom = e.ensure<CustomRenderable>();
+        custom.width = w; custom.height = h;
+    }
+    if (e.has<ImageRenderable>()) {
+        ImageRenderable& img = e.ensure<ImageRenderable>();
+        img.width = w;   img.height = h;
+    }
+}
+
+// Apply steps 1-3 to a Yoga subtree, top-down.
+static void yoga_prepare_subtree(flecs::entity e)
+{
+    if (!e.has<UIYoga>()) return;
+    if (YogaNode* yn = e.try_get_mut<YogaNode>()) {
+        yoga_sync_fill_parent(e);
+        yoga_sync_topology(e, *yn);
+        yoga_sync_style(e, *yn);
+        yoga_apply_intrinsic(e, *yn);
+    }
+    e.children([](flecs::entity child) { yoga_prepare_subtree(child); });
+}
+
+// Apply step 5 to a Yoga subtree, top-down.
+static void yoga_readback_subtree(flecs::entity e)
+{
+    if (!e.has<UIYoga>()) return;
+    if (YogaNode* yn = e.try_get_mut<YogaNode>()) yoga_readback(e, *yn);
+    e.children([](flecs::entity child) { yoga_readback_subtree(child); });
+}
+
+// Refresh UIElementBounds from Position<World> + UIElementSize for a subtree.
+// Mirrors boundsCalculationSystem, but runs now instead of at OnLoad.
+static void update_bounds_recursive(flecs::entity e)
+{
+    const Position* world_pos = e.try_get<Position, World>();
+    const UIElementSize* size = e.try_get<UIElementSize>();
+    if (world_pos && size) {
+        UIElementBounds& bounds = e.ensure<UIElementBounds>();
+        bounds.xmin = world_pos->x;
+        bounds.ymin = world_pos->y;
+        bounds.xmax = world_pos->x + ((size->width  > 0) ? size->width  : 0.0f);
+        bounds.ymax = world_pos->y + ((size->height > 0) ? size->height : 0.0f);
+    }
+    e.children([](flecs::entity child) { update_bounds_recursive(child); });
+}
+
+// Lay out a Yoga subtree immediately, so UI created inside an input handler is
+// correct in the very frame it appears -- position, size, and hit-test bounds --
+// rather than snapping into place after the next PreFrame pass.
+void yoga_layout_now(flecs::entity root)
+{
+    if (!root.is_valid() || !root.is_alive() || !root.has<UIYoga>()) return;
+
+    yoga_prepare_subtree(root);
+    if (YogaNode* yn = root.try_get_mut<YogaNode>()) yoga_calculate(root, *yn);
+    yoga_readback_subtree(root);
+
+    // Sizes changed, so world positions and bounds must be recomputed for the
+    // subtree before anything reads them (Align, hit-testing, the render queue).
+    propagate_world_positions(root);
+    update_bounds_recursive(root);
+    propagate_bounds_containment(root);
 }
 
 // VNC Stream
@@ -1520,9 +1937,13 @@ void create_triple_block(flecs::entity parent, const SentenceToken& token) {
     uint32_t tgt_color = get_entity_color(token.target_symbol, "");
     uint32_t bridge_color = (scale_color(src_color, 0.5f) & 0xFFFFFF00) | (scale_color(tgt_color, 0.5f) & 0xFFFFFF00) | 0xFF;
 
+    // UIYoga + UIYogaLegacyLeaf: the internals below stay on the calibrated
+    // legacy layout; Yoga only positions the bridge within its parent row.
     flecs::entity bridge = world->entity()
         .is_a(UIElement)
         .child_of(parent)
+        .add<UIYoga>()
+        .add<UIYogaLegacyLeaf>()
         .set<CustomRenderable>({100.0f, 25.0f, true, bridge_color, 0, 0, draw_double_arrow})
         .set<UIContainer>({12, 0}) // Space for the arrow tips
         .set<ZIndex>({20});
@@ -1536,7 +1957,7 @@ void create_triple_block(flecs::entity parent, const SentenceToken& token) {
 
     // 3. Add the three parts of the triple
     create_slot_image(content, token.source_symbol, src_color); // Subject
-    
+
     world->entity().is_a(UIElement).child_of(content) // Predicate Text
         .set<TextRenderable>({token.text, "CharisSIL", 16.0f, 0xFFFFFFFF})
         .set<ZIndex>({25});
@@ -1620,12 +2041,17 @@ flecs::entity create_badge_impl(flecs::entity parent, flecs::entity UIElement,
 
     float xPad = 6.0f;
 
+    // The badge's internal layout is deliberately left on the legacy path --
+    // it is calibrated. UIYoga + UIYogaLegacyLeaf only lets a Yoga parent
+    // position the badge as a whole, using the size the legacy layout computes.
     if (is_double_arrow)
     {
         xPad += 25.0f/2;
         badge = world->entity()
             .is_a(UIElement)
             .child_of(parent)
+            .add<UIYoga>()
+            .add<UIYogaLegacyLeaf>()
             .set<CustomRenderable>({100.0f, 25.0f, true, outline_color, 0, 0, draw_double_arrow})
             .set<RenderGradient>({dark, very_dark}) // Vertical gradient
             .set<UIContainer>({xPad, 0})
@@ -1636,6 +2062,8 @@ flecs::entity create_badge_impl(flecs::entity parent, flecs::entity UIElement,
         badge = world->entity()
             .is_a(UIElement)
             .child_of(parent)
+            .add<UIYoga>()
+            .add<UIYogaLegacyLeaf>()
             .set<RoundedRectRenderable>({100.0f, badge_height, corner_radius, false, 0x000000FF})
             .set<RenderGradient>({dark, very_dark}) // Vertical gradient
             .set<UIContainer>({xPad, 0})
@@ -2139,13 +2567,15 @@ void create_process_segment(flecs::entity UIElement, flecs::entity leaf, flecs::
 void clicked_minilm(flecs::entity e)
 {
     std::cout << "clicked_minilm" << std::endl;
+    // Lands centred along the icon's bottom edge: the server icon is a column
+    // flex container with JustifyFlexEnd / AlignCenter.
     world->entity()
     .is_a(e.world().lookup("UIElement"))
     .child_of(e)
+    .add<UIYoga>()
+    .add<UINativeImageSize>()
     .set<ImageCreator>({"../assets/server_dot.png", 1.0f, 1.0f})
-    .set<Align>({-0.5f, -0.5f, 0.5f, 0.9f})
-    .set<ZIndex>({16})
-    .set<Expand>({false, 0.0f, 0.0f, 1.0f, false, 0.0f, 0.0f, 1.0f, true});
+    .set<ZIndex>({16});
 }
 
 // Factory function to populate editor content, whether the panel is initialized or changed
@@ -2158,39 +2588,58 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
     if (editor_type == EditorType::PeachCore)
     {
 
+        auto canvas = leaf.target<EditorCanvas>();
+
+        // Server icon strip. A Yoga row filling the panel: each icon stretches
+        // to the row height, takes its width from the image's native aspect
+        // ratio, and shrinks uniformly if the strip would overflow.
         auto server_hud = world->entity("ServerHUD")
         .is_a(UIElement)
-        .set<LayoutBox>({LayoutBox::Horizontal, 0.0f})
-        .add<FitChildren>()
-        .set<Expand>({true, 4.0f, 4.0f, 1.0f, true, 4.0f, 4.0f, 1.0f})
+        .child_of(canvas)
         .add(flecs::OrderedChildren)
-        .child_of(leaf.target<EditorCanvas>());
+        .add<UIYoga>()
+        .set<UIFillParent>({4.0f, 4.0f, 4.0f, 4.0f})
+        .set<Position, Local>({4.0f, 4.0f})
+        .set<UIFlexContainer>({
+            YGFlexDirectionRow, YGWrapNoWrap,
+            YGJustifyCenter, YGAlignStretch, 0.0f});
 
+        // Hover description backdrop: its own Yoga root covering the panel.
         auto panel_overlay = world->entity()
         .is_a(UIElement)
-        .set<ZIndex>({15})
-        .set<Expand>({true, 0.0f, 0.0f, 1.0f, true, 0.0f, 0.0f, 1.0f})
+        .child_of(canvas)
+        .add<UIYoga>()
+        .set<UIFillParent>({})
         .set<RectRenderable>({0.0f, 0.0f, false, 0x000000DD})
         .add<ServerDescription>()
-        .child_of(leaf.target<EditorCanvas>());
+        .set<ZIndex>({15});
 
-        std::vector<std::string> server_icons = {"aeri_memory", "zmq", "flecs", "x11", "parakeet", "chatterbox", "doctr", "opencv", "minilm", "dino2", "alpaca", "modal", "borg"}; // , "autodistill", "yolo", 
+        std::vector<std::string> server_icons = {"aeri_memory", "zmq", "flecs", "x11", "parakeet", "chatterbox", "doctr", "opencv", "minilm", "dino2", "alpaca", "modal", "borg"}; // , "autodistill", "yolo",
         // std::vector<std::string> server_icons = {"peach_core"};
 
         for (const auto& icon : server_icons)
         {
             // .set<ServerScript>({"chatterbox", "chatterbox", "../chatter_server"})
             // .add(ServerStatus::Offline)
-            // .add<AddTagOnLeftClick, SelectServer>(); 
+            // .add<AddTagOnLeftClick, SelectServer>();
             flecs::entity server_icon = world->entity()
             .is_a(UIElement)
+            .child_of(server_hud)
+            .add<UIYoga>()
+            // Height comes from the row's AlignStretch, width from the image
+            // aspect ratio; shrink lets the whole strip scale down to fit.
+            // Capped at 1:1 so a tall panel doesn't upscale the icons.
+            .add<UIMaxNativeImageSize>()
+            .set<UIFlexItem>({0.0f, 1.0f, YGAlignAuto})
+            // Column so the status dot sits centred along the bottom edge.
+            .set<UIFlexContainer>({
+                YGFlexDirectionColumn, YGWrapNoWrap,
+                YGJustifyFlexEnd, YGAlignCenter, 0.0f})
+            .set<UIPadding>({0.0f, 0.0f, 4.0f, 0.0f})
             .add<ServerHUDOverlay>(panel_overlay)
             // TODO: Replace these events with callback functions?
             .add<AddTagOnHoverEnter, ShowServerHUDOverlay>()
             .add<AddTagOnHoverExit, HideServerHUDOverlay>()
-            .child_of(server_hud)
-            .set<Constrain>({true, true}) 
-            .set<Expand>({false, 4.0f, 4.0f, 1.0f, true, 0.0f, 0.0f, 1.0f, true})
             .set<ImageCreator>({"../assets/server_hud/" + icon + ".png", 1.0f, 1.0f})
             .set<ZIndex>({10});
 
@@ -2203,13 +2652,13 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
                 world->entity()
                 .is_a(UIElement)
                 .child_of(server_icon)
+                .add<UIYoga>()
+                .add<UINativeImageSize>()
                 .set<ImageCreator>({"../assets/server_dot.png", 1.0f, 1.0f})
-                .set<Align>({-0.5f, -0.5f, 0.5f, 0.9f})
-                .set<ZIndex>({12})
-                .set<Expand>({false, 0.0f, 0.0f, 1.0f, false, 0.0f, 0.0f, 1.0f, true});
+                .set<ZIndex>({12});
             }
         }
-        
+
     } else if (editor_type == EditorType::Condensate)
     {
         // TODO: Generate list of files/directories
@@ -2296,20 +2745,36 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
     }
     else if (editor_type == EditorType::InSilicoLab)
     {
+        auto canvas = leaf.target<EditorCanvas>();
+
         auto grey_bkg = world->entity()
         .is_a(UIElement)
-        .set<ZIndex>({9})
-        .set<Expand>({true, 0.0f, 0.0f, 1.0f, true, 0.0f, 0.0f, 1.0f})
+        .child_of(canvas)
+        .add<UIYoga>()
+        .set<UIFillParent>({})
         .set<RectRenderable>({0.0f, 0.0f, false, 0x868485ff})
-        .child_of(leaf.target<EditorCanvas>());
+        .set<ZIndex>({9});
+
+        // Portrait frame: a Yoga root filling the panel that centres the image.
+        // Replaces Expand + Align + Constrain, all of which read bounds that
+        // aren't final until a later phase -- the source of the flicker.
+        auto profile_frame = world->entity()
+        .is_a(UIElement)
+        .child_of(canvas)
+        .add<UIYoga>()
+        .set<UIFillParent>({})
+        .set<UIFlexContainer>({
+            YGFlexDirectionColumn, YGWrapNoWrap,
+            YGJustifyCenter, YGAlignCenter, 0.0f})
+        .set<ZIndex>({10});
 
         auto profile = world->entity()
         .is_a(UIElement)
-        .child_of(leaf.target<EditorCanvas>())
+        .child_of(profile_frame)
+        .add<UIYoga>()
+        // allow_upscale: the old Constrain path scaled up to fill the panel too.
+        .set<UIContainParent>({0.0f, 0.0f, 0.0f, 0.0f, true})
         .set<ImageCreator>({"../assets/heonae_profile.png", 1.0f, 1.0f})
-        .set<Expand>({true, 0.0f, 0.0f, 1.0f, false, 0.0f, 0.0f, 1.0f})
-        .set<Align>({-0.5f, -0.5f, 0.5f, 0.5f})
-        .set<Constrain>({true, true})
         .set<ZIndex>({10});
 
         auto badges = world->entity()
@@ -2328,20 +2793,33 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
     }
     else if (editor_type == EditorType::Droid)
     {
+        auto canvas = leaf.target<EditorCanvas>();
+
         auto grey_bkg = world->entity()
         .is_a(UIElement)
-        .set<ZIndex>({9})
-        .set<Expand>({true, 0.0f, 0.0f, 1.0f, true, 0.0f, 0.0f, 1.0f})
+        .child_of(canvas)
+        .add<UIYoga>()
+        .set<UIFillParent>({})
         .set<RectRenderable>({0.0f, 0.0f, false, 0x3b3b3bff})
-        .child_of(leaf.target<EditorCanvas>());
+        .set<ZIndex>({9});
 
-        auto profile = world->entity()
+        // The droid is a live render3d scene rather than a portrait bitmap: the
+        // texture behind this ImageRenderable is the offscreen viewport in
+        // panel3d.cpp, redrawn each frame before nanovg flushes. It fills the
+        // canvas, and Panel3DSyncSystem keeps the render resolution matched to
+        // whatever size Yoga gives it.
+        //
+        // UIAspectRatio with an undefined ratio opts out of the intrinsic
+        // aspect ratio images normally publish -- the viewport is whatever
+        // shape the panel is, not whatever shape the texture happens to be.
+        auto viewport = world->entity()
         .is_a(UIElement)
-        .child_of(leaf.target<EditorCanvas>())
-        .set<ImageCreator>({"../assets/robot.png", 1.0f, 1.0f})
-        .set<Expand>({true, 0.0f, 0.0f, 1.0f, false, 0.0f, 0.0f, 1.0f})
-        .set<Align>({-0.5f, -1.0f, 0.5f, 1.0f})
-        .set<Constrain>({true, true})
+        .child_of(canvas)
+        .add<UIYoga>()
+        .set<UIFillParent>({})
+        .add<UIAspectRatio>()
+        .add<Panel3DViewport>()
+        .set<ImageRenderable>({panel3d::image_handle(), 1.0f, 1.0f, 0.0f, 0.0f})
         .set<ZIndex>({10});
 
         world->entity()
@@ -2374,78 +2852,95 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
 
         auto annotator = world->entity("InterlocutorAnnotator");
 
+        auto black_bkg = world->entity()
+        .is_a(UIElement)
+        .child_of(canvas)
+        .add<UIYoga>()
+        .set<UIFillParent>({})
+        .set<RectRenderable>({0.0f, 0.0f, false, 0x000000FF})
+        .set<ZIndex>({9});
+
+        // Chat column: message history takes all the space the fixed-height
+        // input bar doesn't. One Yoga root fills the panel; everything below
+        // is laid out by flex, so nothing needs manual per-frame sizing.
         auto chat_root = world->entity()
             .is_a(UIElement)
             .child_of(canvas)
+            .add(flecs::OrderedChildren)
+            .add<UIYoga>()
+            .set<UIFillParent>({})
+            .set<UIFlexContainer>({
+                YGFlexDirectionColumn, YGWrapNoWrap,
+                YGJustifyFlexStart, YGAlignStretch, 8.0f})
+            .set<UIPadding>({8.0f, 8.0f, 8.0f, 8.0f})
             .set<ZIndex>({5});
-
-        // auto input_text_bar = world->entity()
-        //     .is_a(UIElement)
-        //     .child_of(chat_root)
-        //     .set<RoundedRectRenderable>({100.0f, 32.0f, 2.0f, false, 0x444444FF})
-        //     .set<Expand>({true, 0.0f, 4.0f, 1.0f, false, 0, 0, 0})
-        //     .set<ZIndex>({10});
 
         auto messages_panel = world->entity()
             .is_a(UIElement)
             .child_of(chat_root)
+            .add(flecs::OrderedChildren)
+            .add<UIYoga>()
+            .set<UIFlexItem>({1.0f, 1.0f, YGAlignAuto})   // absorbs leftover height
+            .set<UIFlexContainer>({
+                YGFlexDirectionColumn, YGWrapNoWrap,
+                YGJustifyFlexEnd, YGAlignStretch, 4.0f})
+            .set<UIPadding>({16.0f, 12.0f, 12.0f, 12.0f})
             .set<RoundedRectRenderable>({100.0f, 100.0f, 4.0f, false, 0x050505FF})
-            // TODO: Expand to fill remaining space in VerticalLayout...
-            // .set<Expand>({true, 8.0f, 8.0f, 1.0f, true, 8.0f, 36.0f, })
             .set<ZIndex>({11});
 
-        auto input_panel = world->entity()
-            .is_a(UIElement)
-            .child_of(chat_root)
-            .set<RoundedRectRenderable>({100.0f, 36.0f, 2.0f, true, 0x555555FF})
-            .add<AddTagOnLeftClick, FocusChatInput>()
-            .set<ZIndex>({11});
-
-            // TODO: We need to scale the input bkg to the text/content size...
-        auto input_bkg = world->entity()
-            .is_a(UIElement)
-            .child_of(input_panel)
-            .set<RoundedRectRenderable>({10.0f, 10.0f, 2.0f, false, 0x222327FF})
-            .set<Expand>({true, 0, 0, 1, true, 0, 0, 1})
-            .set<ZIndex>({10});
-
-        auto input_text = world->entity()
-            .is_a(UIElement)
-            // .add<DebugRenderBounds>()
-            .child_of(input_panel)
-            .set<Position, Local>({8.0f, 8.0f})
-            .set<TextRenderable>({"", "JetBrainsMono", 16.0f, 0xFFFFFFFF})
-            .set<ZIndex>({12});
-
+        // Messages stack upward from the bottom of the history panel.
+        // AlignStretch (not FlexStart) is what keeps each message row bound to
+        // the panel width -- a FlexStart column gives children no definite
+        // cross size, so they size to their content and overrun the frame.
         auto message_list = world->entity()
             .is_a(UIElement)
             .child_of(messages_panel)
             .add(flecs::OrderedChildren)
-            .set<Position, Local>({12.0f, 16.0f})
-            // .add<DebugRenderBounds>()
-            .set<LayoutBox>({LayoutBox::Vertical, 4.0f, 1.0f})
-            .set<Expand>({true, 0.0f, 0.0f, 1.0f, false, 0.0f, 0.0f, 0.0f});
+            .add<UIYoga>()
+            .set<UIFlexItem>({1.0f, 1.0f, YGAlignAuto})
+            .set<UIFlexContainer>({
+                YGFlexDirectionColumn, YGWrapNoWrap,
+                YGJustifyFlexEnd, YGAlignStretch, 4.0f});
 
-        auto msg_container = world->entity()
-        .is_a(UIElement)
-        .set<UIContainer>({4, 4})
-        .child_of(message_list);
-
+        // Sibling *after* message_list so the badge row always sits below the
+        // transcript. Inside message_list it would be pinned above every
+        // message, since messages are appended to it later.
         auto meta_input = world->entity()
         .is_a(UIElement)
-        .set<LayoutBox>({LayoutBox::Horizontal, 2.0f})
+        .child_of(messages_panel)
         .add(flecs::OrderedChildren)
-        // .add<DebugRenderBounds>()
-        .set<Align>({-1.0f, 0.0f, 0.98, 0.0f})
-        .child_of(message_list);
+        .add<UIYoga>()
+        .set<UIFlexItem>({0.0f, 0.0f, YGAlignAuto})
+        .set<UIFlexContainer>({
+            YGFlexDirectionRow, YGWrapWrap,
+            YGJustifyFlexEnd, YGAlignCenter, 2.0f});
 
-        auto black_bkg = world->entity()
-        .is_a(UIElement)
-        .set<ZIndex>({9})
-        .set<Expand>({true, 0.0f, 0.0f, 1.0f, true, 0.0f, 0.0f, 1.0f})
-        .set<RectRenderable>({0.0f, 0.0f, false, 0x000000FF})
-        .child_of(leaf.target<EditorCanvas>());
-        
+        auto input_panel = world->entity()
+            .is_a(UIElement)
+            .child_of(chat_root)
+            .add<UIYoga>()
+            .set<UIFlexItem>({0.0f, 0.0f, YGAlignAuto})
+            .set<UISize>({YGUndefined, 72.0f})   // taller input for multi-line text
+            .set<UIPadding>({8.0f, 8.0f, 8.0f, 8.0f})
+            .set<RoundedRectRenderable>({100.0f, 36.0f, 2.0f, true, 0x555555FF})
+            .add<AddTagOnLeftClick, FocusChatInput>()
+            .set<ZIndex>({11});
+
+        auto input_bkg = world->entity()
+            .is_a(UIElement)
+            .child_of(input_panel)
+            .add<UIYoga>()
+            .set<UIAbsoluteEdges>({0.0f, 0.0f, 0.0f, 0.0f})
+            .set<RoundedRectRenderable>({10.0f, 10.0f, 2.0f, false, 0x222327FF})
+            .set<ZIndex>({10});
+
+        auto input_text = world->entity()
+            .is_a(UIElement)
+            .child_of(input_panel)
+            .add<UIYoga>()
+            .set<TextRenderable>({"", "JetBrainsMono", 16.0f, 0xFFFFFFFF})
+            .set<ZIndex>({12});
+
         create_badge(meta_input, UIElement, "Wesley", 0x6df0ffff, true, false, {}, {0}, {"W"}, {0x6df0ffff});
         create_badge(meta_input, UIElement, "advises", 0xa34d1aff, false, true);
         create_badge(meta_input, UIElement, "Heonae", 0xff75baff, true, false, {}, {0}, {"H"}, {0xff75baff});
@@ -2993,6 +3488,13 @@ bool point_in_bounds(float x, float y, UIElementBounds bounds)
     return (x >= bounds.xmin && x <= bounds.xmax && y >= bounds.ymin && y <= bounds.ymax);
 }
 
+// The only scroll consumer so far is the Droid panel's orbit camera, which
+// applies the delta on the next frame and only while the cursor is over it.
+static void scroll_callback(GLFWwindow* window, double xoffset, double yoffset)
+{
+    panel3d::add_scroll(yoffset);
+}
+
 static void cursor_position_callback(GLFWwindow* window, double xpos, double ypos)
 {
     // TODO: Move to Observer?
@@ -3062,6 +3564,25 @@ void drop_callback(GLFWwindow* window, int count, const char** paths)
 // Track mouse button state for VNC
 static int g_vncButtonMask = 0;
 
+// Called from a click handler to stop the event propagating to lower-priority
+// elements under the same cursor position. See UIInputDispatch.
+void consume_ui_click()
+{
+    world->ensure<UIInputDispatch>().consumed = true;
+}
+
+// Depth in the ChildOf hierarchy; deeper elements draw over their ancestors, so
+// they get the click first when ZIndex ties.
+static int ui_hierarchy_depth(flecs::entity e)
+{
+    int depth = 0;
+    for (flecs::entity p = e.parent(); p.is_valid(); p = p.parent())
+    {
+        if (++depth > 64) break; // guard against cycles
+    }
+    return depth;
+}
+
 void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
 {
     flecs::entity glfw_state = world->lookup("GLFWState");
@@ -3074,14 +3595,27 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
             .build();
             // TODO: Eventually this should use a more efficient partition bound check as the first layer
             const CursorState* cursor_state = world->lookup("GLFWState").try_get<CursorState>();
+
+            // Gather every hit element, then dispatch in priority order so that
+            // a handler can consume the click and stop it reaching whatever is
+            // underneath. Emitting to all hits unordered lets a popup's option
+            // row and the dropdown icon beneath it both fire, which closed the
+            // menu the moment you clicked an option.
+            struct ClickTarget {
+                flecs::entity entity;
+                int z;
+                int depth;
+                bool has_callback;
+            };
+            std::vector<ClickTarget> targets;
+
             interactive_elements.each([&](flecs::entity ui_element, AddTagOnLeftClick, UIElementBounds& bounds) {
                 if (point_in_bounds(cursor_state->x, cursor_state->y, bounds))
                 {
-                    world->event<LeftClickEvent>()
-                    .id<UIElementBounds>()
-                    .entity(ui_element)
-                    .emit();
-                } 
+                    const ZIndex* z = ui_element.try_get<ZIndex>();
+                    targets.push_back({ui_element, z ? z->layer : 0,
+                                       ui_hierarchy_depth(ui_element), false});
+                }
             });
 
             flecs::query callback_elements = world->query_builder<CallbackOnLeftClick, UIElementBounds>()
@@ -3089,9 +3623,48 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
             callback_elements.each([&](flecs::entity ui_element, CallbackOnLeftClick& callback, UIElementBounds& bounds) {
                 if (point_in_bounds(cursor_state->x, cursor_state->y, bounds))
                 {
-                    callback.onClicked(ui_element);
-                } 
+                    // An element can carry both a tag and a callback; fold them
+                    // into one target so it is only visited once.
+                    for (auto& t : targets) {
+                        if (t.entity == ui_element) { t.has_callback = true; return; }
+                    }
+                    const ZIndex* z = ui_element.try_get<ZIndex>();
+                    targets.push_back({ui_element, z ? z->layer : 0,
+                                       ui_hierarchy_depth(ui_element), true});
+                }
             });
+
+            std::stable_sort(targets.begin(), targets.end(),
+                [](const ClickTarget& a, const ClickTarget& b) {
+                    if (a.z != b.z) return a.z > b.z;         // topmost layer first
+                    return a.depth > b.depth;                  // then innermost
+                });
+
+            UIInputDispatch& dispatch = world->ensure<UIInputDispatch>();
+            dispatch.consumed = false;
+
+            for (const ClickTarget& target : targets)
+            {
+                // A previous handler may have destroyed this entity (menus close
+                // by destructing their subtree), so re-check before dispatching.
+                if (!target.entity.is_alive()) continue;
+
+                if (target.entity.has<AddTagOnLeftClick>(flecs::Wildcard))
+                {
+                    world->event<LeftClickEvent>()
+                    .id<UIElementBounds>()
+                    .entity(target.entity)
+                    .emit();
+                }
+
+                if (target.has_callback && target.entity.is_alive())
+                {
+                    if (const CallbackOnLeftClick* cb = target.entity.try_get<CallbackOnLeftClick>())
+                        cb->onClicked(target.entity);
+                }
+
+                if (world->ensure<UIInputDispatch>().consumed) break;
+            }
 
             world->event<LeftClickEvent>()
             .id<CursorState>()
@@ -3418,52 +3991,57 @@ bool load_editor_layout(flecs::entity editor_root, flecs::entity UIElement) {
 
 flecs::entity create_message(flecs::entity& UIElement, ChatPanel& chat_panel, flecs::entity speaker, std::string message)
 {
+    bool is_self = (speaker.name() == "Wesley"); // TODO: Obviously...
+
+    // The row spans the full panel width (message_list stretches it) and
+    // justifies its bubble to one side, so own messages sit right and replies
+    // left without either being able to escape the frame.
     auto messageBox = world->entity()
     .is_a(UIElement)
     .child_of(chat_panel.message_list)
-    // .add<DebugRenderBounds>()
-    .set<LayoutBox>({LayoutBox::Horizontal});
-    
-    // Create the background bubble
+    .add(flecs::OrderedChildren)
+    .add<UIYoga>()
+    .set<UIFlexContainer>({
+        YGFlexDirectionRow, YGWrapNoWrap,
+        is_self ? YGJustifyFlexEnd : YGJustifyFlexStart, YGAlignCenter, 4.0f});
+
+    // The background bubble is the text's flex container, so it auto-sizes to
+    // the message plus padding. flexShrink lets it give way at the panel edge,
+    // which is what forces the text inside to wrap rather than overflow.
     auto example_message_bkg = world->entity()
         .is_a(UIElement)
         .child_of(messageBox) // Attached to the ChatPanel found via query
+        .add<UIYoga>()
+        .set<UIFlexItem>({0.0f, 1.0f, YGAlignAuto})
+        .set<UIFlexContainer>({
+            YGFlexDirectionColumn, YGWrapNoWrap,
+            YGJustifyFlexStart, YGAlignFlexStart, 0.0f})
+        .set<UIPadding>({6.0f, 8.0f, 6.0f, 8.0f})
         .set<RoundedRectRenderable>({100.0f, 16.0f, 2.0f, false, 0x121212FF})
-    // .set<Expand>({true, 4.0f, 4.0f, 1.0f, false, 0, 0, 0})
-        .set<UIContainer>({8, 6})
-        // .add<DebugRenderBounds>()
         .set<ZIndex>({15});
 
-        auto message_content = world->entity()
-        .is_a(UIElement)
-        .set<Position, Local>({8, 8})
-        // .child_of(example_message_bkg)
-        .child_of(example_message_bkg)
-        // .add<DebugRenderBounds>()
-        .set<LayoutBox>({LayoutBox::Vertical});
-
-    // Create the text content using the actual draft
+    // Create the text content using the actual draft. No DynamicTextWrap here:
+    // Yoga offers the measure func the width the bubble actually got, so the
+    // wrap width follows the panel instead of being pushed in from outside.
     auto example_message_text = world->entity()
         .is_a(UIElement)
-        .child_of(message_content)
+        .child_of(example_message_bkg)
+        .add<UIYoga>()
         .set<TextRenderable>({message, "JetBrainsMono", 16.0f, 0xFFFFFFFF})
-        .add<DynamicTextWrapContainer>(chat_panel.messages_panel)
-        .set<DynamicTextWrap>({48.0f})
         .set<ZIndex>({17});
-        
-    if (speaker.name() == "Wesley") // TODO: Obviously...
+
+    if (is_self)
     {
-        messageBox.set<Align>({-1.1f, 0.0f, 1.0, 0.0f});
-        // TODO: Set a wraparound width...
-        
         // I put it outside the message since it is a meta annotation
         // This might only need to be visible during certain 'entity binding' interface modes...
         auto messageBfoSprite = world->entity()
         .is_a(UIElement)
         .child_of(messageBox)
+        .add<UIYoga>()
+        .add<UINativeImageSize>()
         .set<ZIndex>({20})
         .set<ImageCreator>({"../assets/bfo/generically_dependent_continuant.png", 1.0f, 1.0f});
-        
+
     } else if (speaker.name() == "Heonae")
     {
         example_message_bkg.set<RoundedRectRenderable>({100.0f, 16.0f, 2.0f, false, 0x12121200});
@@ -3502,7 +4080,7 @@ void sync_representation_grounding(WordAnnotationSelector& selector, const std::
             // Triple Blocks have 3 selectable slots: Source, Badge, Target
             // We need to capture the entities created inside create_triple_block
             create_triple_block(container, token);
-            
+
             // Get the children we just created to fill the selection map
             // Note: Order matters here! Should match: [Source, Bridge, Target]
             container.children([&](flecs::entity child) {
@@ -3524,6 +4102,8 @@ void sync_representation_grounding(WordAnnotationSelector& selector, const std::
         } else {
             // Plain text
             flecs::entity text_ent = world->entity().is_a(UIElement).child_of(container)
+                .add<UIYoga>()
+                .add<UIYogaLegacyLeaf>()
                 .set<TextRenderable>({token.text.c_str(), "CharisSIL", 16.0f, 0x777777FF})
                 .set<ZIndex>({17});
                 
@@ -3538,6 +4118,15 @@ void sync_representation_grounding(WordAnnotationSelector& selector, const std::
 // TODO: The key callback needs to be refactored to callback functions or observers with semantic description
 static void key_callback(GLFWwindow* window, int key, int scancode, int action, int mods)
 {
+    // Blender-style numpad views for the Droid panel's 3D scene. Consumed only
+    // while the pointer is over that panel, so the numpad still reaches text
+    // fields and the VNC passthrough everywhere else. Repeats are honoured so
+    // holding 4/6/8/2 orbits continuously.
+    if ((action == GLFW_PRESS || action == GLFW_REPEAT) && panel3d::view_key(key, mods))
+    {
+        return;
+    }
+
     if (action == GLFW_PRESS)
     {
         if (key == GLFW_KEY_S && mods & GLFW_MOD_CONTROL)
@@ -4248,12 +4837,17 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                     // TODO: Create thinking indicators...
 
                     world->defer_suspend();
+                    // Annotation badges for the message just sent: a wrapping
+                    // Yoga row, so they flow onto further lines instead of
+                    // running off the edge of the history panel.
                     auto representation_ux = world->entity()
                         .is_a(UIElement)
                         // .add<DebugRenderBounds>()
-                        .set<FlowLayoutBox>({0.0f, 0.0f, 2.0f, 0.0f, 2.0f})
-                        .set<Expand>({true, 0, 0, 1, false, 0, 0, 0})
                         .add(flecs::OrderedChildren)
+                        .add<UIYoga>()
+                        .set<UIFlexContainer>({
+                            YGFlexDirectionRow, YGWrapWrap,
+                            YGJustifyFlexStart, YGAlignCenter, 2.0f})
                         .child_of(chat_panel.message_list);
 
                         // Register message in global list
@@ -4453,6 +5047,7 @@ int main(int, char *[]) {
 
     glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
     glfwSetCursorPosCallback(window, cursor_position_callback);
+    glfwSetScrollCallback(window, scroll_callback);
     glfwSetMouseButtonCallback(window, mouse_button_callback);
     glfwSetWindowSizeCallback(window, window_size_callback);
     glfwSetCharCallback(window, char_callback);
@@ -4530,6 +5125,60 @@ int main(int, char *[]) {
     world->component<LayoutBox>();
     world->component<FlowLayoutBox>();
 
+    // ------------------------------------------------------------------
+    // Yoga (flexbox) layout components + node lifecycle.
+    // Registered here (rather than next to the Yoga systems further down)
+    // because UI entities are created during setup *above* the system
+    // registrations; the OnAdd observer must already exist by then or those
+    // entities would never get a YogaNode.
+    // ------------------------------------------------------------------
+    world->component<UIYoga>();
+    world->component<YogaNode>();
+    world->component<UISize>();
+    world->component<UIMaxSize>();
+    world->component<UIMinSize>();
+    world->component<UIAbsoluteEdges>();
+    world->component<UIAspectRatio>();
+    world->component<UIFlexContainer>();
+    world->component<UIFlexItem>();
+    world->component<UIMargin>();
+    world->component<UIPadding>();
+    world->component<UIFillParent>();
+    world->component<UINativeImageSize>();
+    world->component<UIMaxNativeImageSize>();
+    world->component<UIContainParent>();
+    world->component<UIYogaLegacyLeaf>();
+    world->component<YogaTextCache>();
+    world->component<UIInputDispatch>().add(flecs::Singleton);
+    world->set<UIInputDispatch>({false});
+
+    // Any entity tagged with UIYoga participates in a Yoga layout tree. When
+    // the tag is added we allocate a YGNode and stash the entity id on it so
+    // measure funcs / readback can recover the entity. When the backing
+    // YogaNode is removed we detach from its Yoga parent, orphan its Yoga
+    // children (their own observers will free them), and free the node.
+    world->observer<UIYoga>()
+        .event(flecs::OnAdd)
+        .each([](flecs::entity e, UIYoga) {
+            if (e.has<YogaNode>()) return;
+            YGNodeRef n = YGNodeNew();
+            YGNodeSetContext(n, (void*)(uintptr_t)e.id());
+            e.set<YogaNode>({n});
+        });
+
+    world->observer<YogaNode>()
+        .event(flecs::OnRemove)
+        .each([](flecs::entity e, YogaNode& yn) {
+            if (!yn.node) return;
+            YGNodeRef owner = YGNodeGetOwner(yn.node);
+            if (owner) YGNodeRemoveChild(owner, yn.node);
+            while (YGNodeGetChildCount(yn.node) > 0) {
+                YGNodeRemoveChild(yn.node, YGNodeGetChild(yn.node, 0));
+            }
+            YGNodeFree(yn.node);
+            yn.node = nullptr;
+        });
+
     world->component<DiurnalHour>();
 
     world->component<ChatMessage>();
@@ -4581,6 +5230,14 @@ int main(int, char *[]) {
     // Initialize 3D rendering for plane
     Graphics& graphics = graphicsEntity.ensure<Graphics>();
     initialize3DRendering(graphics, 1200, 800);
+
+    // The Droid panel's 3D scene. Imports render3d and compiles its shaders, so
+    // it needs the GL context and nanovg, both of which exist by now. The
+    // starting size is a placeholder -- Panel3DSyncSystem resizes the viewport
+    // to the panel the first time one is laid out.
+    if (!panel3d::init(*world, vg, window, "../assets/truncated_frame.stl", 512, 512)) {
+        std::cerr << "[panel3d] disabled; the Droid panel will show only its background" << std::endl;
+    }
 
     auto renderQueueEntity = world->entity("RenderQueue")
         .set<RenderQueue>({});
@@ -4736,7 +5393,11 @@ int main(int, char *[]) {
         std::string active = option.active ? "true" : "false";
         // std::string active = option.active ? "true" : "false";
         e.target<CheckBox>().set<ImageCreator>({("../assets/checkbox_" + active + ".png").c_str(), 1.0f, 1.0f});
-        // TODO: 
+
+        // Keep the menu open: without consuming, this click would also reach the
+        // dropdown icon underneath (whose bubbled-up bounds contain the popup)
+        // and immediately toggle the popup shut.
+        consume_ui_click();
     });
 
     world->observer<UIElementBounds, AddTagOnLeftClick>()
@@ -4806,31 +5467,31 @@ int main(int, char *[]) {
         .set<RectRenderable>({32.0f, 12.0f, false, 0x282828FF})
         .set<ZIndex>({7});
 
-        auto editor_type_selector = world->entity()
-        .is_a(UIElement)
-        .child_of(editor_hover_region)
-        // .add<DebugRenderBounds>()
-        .set<Position, Local>({-1.0f, 19.0f});
-
+        // Square corner hides the list's rounded top-left where the popup meets
+        // the dropdown icon. ZIndex 31 > list (30) so it draws on top.
         auto editor_type_selector_square_corner = world->entity()
         .is_a(UIElement)
-        .child_of(editor_type_selector)
+        .child_of(editor_hover_region)
+        .set<Position, Local>({-1.0f, 19.0f})
         .set<RectRenderable>({16.0f, 16.0f, false, 0x282828FF})
-        .set<ZIndex>({30});
+        .set<ZIndex>({31});
 
-        auto editor_type_selector_bkg = world->entity()
-        .is_a(UIElement)
-        .child_of(editor_type_selector)
-        .set<RoundedRectRenderable>({196.0f, 256.0f, 4.0f, false, 0x282828FF})
-        .set<Expand>({false, 0, 0, 1.0f, true, 0.0f, 0.0f, 1.0f})
-        .set<ZIndex>({30});
-
+        // The list is its own Yoga root: a vertical flex column that auto-sizes
+        // to its option rows plus padding, and draws the popup background
+        // itself. That replaces the old fixed-256px backing rect that had to be
+        // stretched to fit with Expand.
         auto editor_type_list = world->entity()
         .is_a(UIElement)
-        .child_of(editor_type_selector)
-        .set<LayoutBox>({LayoutBox::Vertical, 2.0f})
-        // .add<DebugRenderBounds>()
-        .set<Position, Local>({4.0f, 4.0f});
+        .child_of(editor_hover_region)
+        .add(flecs::OrderedChildren)
+        .add<UIYoga>()
+        .set<UIFlexContainer>({
+            YGFlexDirectionColumn, YGWrapNoWrap,
+            YGJustifyFlexStart, YGAlignFlexStart, 2.0f})
+        .set<UIPadding>({4.0f, 6.0f, 4.0f, 6.0f})
+        .set<Position, Local>({-1.0f, 19.0f})
+        .set<RoundedRectRenderable>({0.0f, 0.0f, 4.0f, false, 0x282828FF})
+        .set<ZIndex>({30});
 
         flecs::entity leaf = e.parent().parent();
         PanelState& state = leaf.ensure<PanelState>();
@@ -4840,8 +5501,17 @@ int main(int, char *[]) {
             auto editor_option_btn = world->entity()
             .is_a(UIElement)
             .child_of(editor_type_list)
+            .add<UIYoga>()
+            .set<UISize>({196.0f-12.0f, 28.0f})
+            // Row so the checkbox is placed by Yoga against the right edge and
+            // vertically centred. It used to rely on Align, which reads bounds
+            // that aren't computed until a later phase -- so the checkbox
+            // snapped into position a frame after the popup appeared.
+            .set<UIFlexContainer>({
+                YGFlexDirectionRow, YGWrapNoWrap,
+                YGJustifyFlexEnd, YGAlignCenter, 0.0f})
+            .set<UIPadding>({0.0f, 10.0f, 0.0f, 0.0f})
             .set<RoundedRectRenderable>({196.0f-12.0f, 28.0f, 2.0f, false, 0x383838FF})
-            .set<Position, Local>({2.0f, 0.0f})
             .add<AddTagOnHoverEnter, SetMenuHighlightColor>()
             .add<AddTagOnHoverExit, SetMenuStandardColor>()
             .add<AddTagOnLeftClick, ToggleBooleanOption>()
@@ -4860,8 +5530,9 @@ int main(int, char *[]) {
             flecs::entity checkbox = world->entity()
             .is_a(UIElement)
             .child_of(editor_option_btn)
+            .add<UIYoga>()
+            .add<UINativeImageSize>()
             .set<ImageCreator>({("../assets/checkbox_" + active + ".png").c_str(), 1.0f, 1.0f})
-            .set<Align>({-0.5f, -0.5f, 0.9f, 0.5f})
             .set<ZIndex>({42});
 
             editor_option_btn.add<CheckBox>(checkbox);
@@ -4870,6 +5541,9 @@ int main(int, char *[]) {
 
         }
 
+        // Built inside a click handler, so lay it out now: the popup is drawn
+        // and hit-tested this frame at its final size, with no settling pass.
+        yoga_layout_now(editor_type_list);
     });
 
     world->observer<UIElementBounds, AddTagOnLeftClick>()
@@ -4904,31 +5578,29 @@ int main(int, char *[]) {
         .set<RectRenderable>({32.0f, 12.0f, false, 0x282828FF})
         .set<ZIndex>({7});
 
-        auto editor_type_selector = world->entity()
-        .is_a(UIElement)
-        .child_of(editor_hover_region)
-        // .add<DebugRenderBounds>()
-        .set<Position, Local>({-1.0f, 19.0f});
-
+        // Square corner hides the list's rounded top-left where the popup meets
+        // the dropdown icon. ZIndex 31 > list (30) so it draws on top.
         auto editor_type_selector_square_corner = world->entity()
         .is_a(UIElement)
-        .child_of(editor_type_selector)
+        .child_of(editor_hover_region)
+        .set<Position, Local>({-1.0f, 19.0f})
         .set<RectRenderable>({16.0f, 16.0f, false, 0x282828FF})
-        .set<ZIndex>({30});
+        .set<ZIndex>({31});
 
-        auto editor_type_selector_bkg = world->entity()
-        .is_a(UIElement)
-        .child_of(editor_type_selector)
-        .set<RoundedRectRenderable>({196.0f, 256.0f, 4.0f, false, 0x282828FF})
-        .set<Expand>({false, 0, 0, 1.0f, true, 0.0f, 0.0f, 1.0f})
-        .set<ZIndex>({30});
-
+        // Self-sizing Yoga column: height follows the number of editor types
+        // instead of the old fixed 256px backing rect.
         auto editor_type_list = world->entity()
         .is_a(UIElement)
-        .child_of(editor_type_selector)
-        .set<LayoutBox>({LayoutBox::Vertical, 2.0f})
-        // .add<DebugRenderBounds>()
-        .set<Position, Local>({4.0f, 4.0f});
+        .child_of(editor_hover_region)
+        .add(flecs::OrderedChildren)
+        .add<UIYoga>()
+        .set<UIFlexContainer>({
+            YGFlexDirectionColumn, YGWrapNoWrap,
+            YGJustifyFlexStart, YGAlignFlexStart, 2.0f})
+        .set<UIPadding>({4.0f, 6.0f, 4.0f, 6.0f})
+        .set<Position, Local>({-1.0f, 19.0f})
+        .set<RoundedRectRenderable>({0.0f, 0.0f, 4.0f, false, 0x282828FF})
+        .set<ZIndex>({30});
 
         size_t editor_type_index = 0;
         for (std::string editor_type_name : editor_types)
@@ -4940,8 +5612,9 @@ int main(int, char *[]) {
             auto edtior_type_btn = world->entity()
             .is_a(UIElement)
             .child_of(editor_type_list)
+            .add<UIYoga>()
+            .set<UISize>({196.0f-12.0f, 20.0f})
             .set<RoundedRectRenderable>({196.0f-12.0f, 20.0f, 2.0f, false, 0x383838FF})
-            .set<Position, Local>({2.0f, 0.0f})
             .add<AddTagOnHoverEnter, SetMenuHighlightColor>()
             .add<AddTagOnHoverExit, SetMenuStandardColor>()
             .add<AddTagOnLeftClick, SetPanelEditorType>()
@@ -4961,6 +5634,9 @@ int main(int, char *[]) {
             editor_type_index++;
         }
 
+        // Built inside a click handler, so lay it out now: the popup is drawn
+        // and hit-tested this frame at its final size, with no settling pass.
+        yoga_layout_now(editor_type_list);
     });
 
     auto movementSystem = world->system<Position, Velocity>()
@@ -5158,6 +5834,73 @@ int main(int, char *[]) {
     });
 
 
+    // ========================================================================
+    // PHASE 1b2: Yoga (flexbox) layout
+    // ------------------------------------------------------------------------
+    // Runs at PreFrame, registered *before* sizeCalculationSystem so that the
+    // ordering within the phase is:
+    //   topology sync -> style sync -> measure -> calculate -> readback
+    //     -> sizeCalculationSystem (Phase 1c)
+    // Readback writes Position<Local> plus renderable width/height, which
+    // Phase 1c then lifts into UIElementSize and OnLoad turns into world
+    // positions + UIElementBounds. Only entities tagged UIYoga participate,
+    // so Yoga subtrees and legacy LayoutBox subtrees can coexist.
+    // ========================================================================
+
+    // The per-entity steps live at file scope (see yoga_sync_* above) so that
+    // yoga_layout_now() can run the same pipeline synchronously for UI built
+    // inside an input handler.
+    g_yoga_vg = graphics.vg;
+
+    // 0. Yoga roots that fill a legacy-laid-out parent take their UISize from
+    //    that parent's UIElementSize. The parent's size is finalised later in
+    //    the frame (OnLoad/PostLoad), so this reads last frame's value -- one
+    //    frame of lag on panel resize, same as the old Expand systems had.
+    world->system<UIFillParent>("YogaFillParentSize")
+        .kind(flecs::PreFrame)
+        .each([](flecs::entity e, UIFillParent&) { yoga_sync_fill_parent(e); });
+
+    // 1. Topology sync: ensure each Yoga node's parent + child order in the
+    //    Yoga tree matches the flecs hierarchy. Entities without UIYoga are
+    //    skipped, so they stay invisible to the Yoga tree even if their flecs
+    //    parent is a Yoga node.
+    world->system<YogaNode>("YogaTopologySync")
+        .with<UIYoga>()
+        .kind(flecs::PreFrame)
+        .each([](flecs::entity e, YogaNode& yn) { yoga_sync_topology(e, yn); });
+
+    // 2. Style sync: push UI* component values to the YGNode each frame.
+    //    Cheap -- Yoga detects no-op writes and won't dirty the node.
+    world->system<YogaNode>("YogaStyleSync")
+        .with<UIYoga>()
+        .kind(flecs::PreFrame)
+        .each([](flecs::entity e, YogaNode& yn) { yoga_sync_style(e, yn); });
+
+    // 3. Intrinsic sizing for leaves Yoga can't measure on its own: text leaves
+    //    get a measure func, images publish their native aspect ratio.
+    world->system<YogaNode>("YogaIntrinsicSize")
+        .with<UIYoga>()
+        .kind(flecs::PreFrame)
+        .each([](flecs::entity e, YogaNode& yn) { yoga_apply_intrinsic(e, yn); });
+
+    // 4. Calculate: for each Yoga *root* (a UIYoga entity whose flecs parent is
+    //    not itself UIYoga), run layout. Roots with a UISize get a fixed size;
+    //    roots without one auto-size to their content.
+    world->system<YogaNode>("YogaCalculate")
+        .with<UIYoga>()
+        .kind(flecs::PreFrame)
+        .each([](flecs::entity e, YogaNode& yn) {
+            ZoneScoped;
+            if (!yoga_is_root(e)) return;
+            yoga_calculate(e, yn);
+        });
+
+    // 5. Readback: pull Yoga's computed layout into flecs.
+    world->system<YogaNode>("YogaReadback")
+        .with<UIYoga>()
+        .kind(flecs::PreFrame)
+        .each([](flecs::entity e, YogaNode& yn) { yoga_readback(e, yn); });
+
     // Phase 1c: Set UIElementSize from basic renderables
     auto sizeCalculationSystem = world->system<UIElementSize, Graphics>()
         .kind(flecs::PreFrame)
@@ -5209,31 +5952,17 @@ int main(int, char *[]) {
                 leaf.remove<ChatPanel>();
                 return;
             }
-            auto canvas = leaf.target<EditorCanvas>();
-            const RectRenderable* canvas_rect = canvas.try_get<RectRenderable>();
-            if (!canvas_rect) return;
-
-            float canvas_w = canvas_rect->width;
-            float canvas_h = canvas_rect->height;
-            const float pad = 8.0f;
-            const float input_h = 72.0f;  // Taller input to accommodate multi-line text
-
-            auto& messages_rect = panel.messages_panel.ensure<RoundedRectRenderable>();
-            messages_rect.width = canvas_w - pad * 2.0f;
-            messages_rect.height = canvas_h - input_h - pad * 3.0f;
-            panel.messages_panel.ensure<Position, Local>() = {pad, pad};
-
-            auto& input_rect = panel.input_panel.ensure<RoundedRectRenderable>();
-            input_rect.width = canvas_w - pad * 2.0f;
-            input_rect.height = input_h;
-            panel.input_panel.ensure<Position, Local>() = {pad, canvas_h - input_h - pad};
-
+            // Panel geometry is Yoga's job now (chat_root is a UIFillParent
+            // root, the history panel flex-grows, the input bar is fixed
+            // height) -- this system only keeps the draft text in sync.
             ChatState& chat = world->ensure<ChatState>();
             std::string caret = chat.input_focused ? "|" : "";
             if (auto* input_tr = panel.input_text.try_get_mut<TextRenderable>())
             {
                 input_tr->text = chat.draft + caret;
-                input_tr->wrapWidth = input_rect.width - 16.0f;  // Wrap within input panel with padding
+                // Wrap within the input panel, allowing for its padding.
+                if (const UIElementSize* input_size = panel.input_panel.try_get<UIElementSize>())
+                    input_tr->wrapWidth = std::max(0.0f, input_size->width - 16.0f);
             }
 
             const int kMaxMessages = 30;
@@ -5670,7 +6399,13 @@ int main(int, char *[]) {
                 bool parent_locked_x = parent_expand && parent_expand->x_enabled;
                 bool parent_locked_y = parent_expand && parent_expand->y_enabled;
 
-                if (!expand) {
+                // UIFillParent roots take their size *from* the parent, so
+                // letting them bubble back into it would feed panel bounds into
+                // their own sizing. This is the Yoga equivalent of the Expand
+                // opt-out above. Auto-sizing Yoga entities (e.g. a popup list)
+                // must still bubble, so containers without a renderable of
+                // their own get usable bounds for hit-testing.
+                if (!expand && !e.has<UIFillParent>()) {
                     // FlowLayoutBox only propagates height, not width (allows wrapping)
                     if (!e.has<FlowLayoutBox>()) {
                         parent_bounds->xmin = std::min(parent_bounds->xmin, bounds.xmin);
@@ -5705,7 +6440,9 @@ int main(int, char *[]) {
                     bounds.ymax = parent_bounds->ymax;
                 }
 
-                if (!expand) {
+                // See the primary bubble-up system: UIFillParent is sized by its
+                // parent, so it must not size its parent back.
+                if (!expand && !e.has<UIFillParent>()) {
                     // FlowLayoutBox only propagates height, not width (allows wrapping)
                     if (!e.has<FlowLayoutBox>()) {
                         parent_bounds->xmin = std::min(parent_bounds->xmin, bounds.xmin);
@@ -6811,6 +7548,55 @@ int main(int, char *[]) {
         }
     });
 
+    // The 3D viewport is the one element whose *pixels* depend on its layout, so
+    // the size Yoga gave it has to reach the renderer before the passes run.
+    // Registered after boundsCalculationSystem (also OnLoad) so the bounds read
+    // here are this frame's, and before Panel3DInput on PreUpdate so a drag is
+    // applied in the frame it happened.
+    //
+    // With no Droid panel open the query is empty and the whole render3d chain
+    // is switched off rather than drawing a scene nothing samples.
+    auto panel3d_viewports = world->query_builder<const UIElementBounds>()
+        .with<Panel3DViewport>()
+        .cached()
+        .build();
+
+    world->system("Panel3DSyncSystem")
+    .kind(flecs::OnLoad)
+    .run([panel3d_viewports, window](flecs::iter& it)
+    {
+        flecs::world w = it.world();
+        bool live = false;
+
+        panel3d_viewports.each([&](flecs::entity e, const UIElementBounds& bounds)
+        {
+            if (live) return;   // one scene, so the first laid-out panel wins
+            int panel_w = (int)std::lround(bounds.xmax - bounds.xmin);
+            int panel_h = (int)std::lround(bounds.ymax - bounds.ymin);
+            if (panel_w <= 0 || panel_h <= 0) return;
+            live = true;
+
+            panel3d::set_active(true);
+            panel3d::resize(w, panel_w, panel_h);
+
+            // The image handle is minted per viewport allocation, so a resize
+            // invalidates whatever the panel was created with.
+            ImageRenderable& img = e.ensure<ImageRenderable>();
+            img.imageHandle = panel3d::image_handle();
+
+            double cursor_x = 0.0, cursor_y = 0.0;
+            if (const CursorState* cursor = w.lookup("GLFWState").try_get<CursorState>()) {
+                cursor_x = cursor->x;
+                cursor_y = cursor->y;
+            }
+            const bool left_down = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
+            panel3d::set_pointer(cursor_x, cursor_y, left_down,
+                                 point_in_bounds(cursor_x, cursor_y, bounds));
+        });
+
+        if (!live) panel3d::set_active(false);
+    });
+
     // Sync mel spec position during fill phase only
     // After fill, mel spec stays anchored at rightmost position (no texture offset)
     // Filmstrip scroll is offset instead to match mel spec timing
@@ -7364,6 +8150,11 @@ int main(int, char *[]) {
         glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
 
+        // The Droid panel's 3D passes run inside world->progress() below and
+        // bind framebuffers of their own; this is where they hand control back,
+        // so nanovg's flush at nvgEndFrame still lands in the UI framebuffer.
+        panel3d::set_ui_target(graphics.fbo, graphics.uiWidth, graphics.uiHeight);
+
         glfwStateEntity.set<Window>({window, winWidth, winHeight});
 
         nvgBeginFrame(vg, graphics.uiWidth, graphics.uiHeight, 1.0f);
@@ -7491,6 +8282,7 @@ int main(int, char *[]) {
 
     // Cleanup 3D rendering resources
     cleanup3DRendering(graphics);
+    panel3d::shutdown(*world);
 
     nvgDeleteGL2(vg);
 
