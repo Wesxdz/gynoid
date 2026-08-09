@@ -1,0 +1,38 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cmake --build:*)",
+      "Bash(ls:*)",
+      "Bash(find:*)",
+      "Bash(git log:*)",
+      "Bash(gdb:*)",
+      "Bash(make:*)",
+      "Bash(cmake:*)",
+      "Bash(docker logs:*)",
+      "Bash(grep:*)",
+      "Bash(ping:*)",
+      "Bash(ss:*)",
+      "Bash(netstat:*)",
+      "Bash(./remote_productivity.sh:*)",
+      "Bash(sshpass -p 'GrokValentine42!' ssh:*)",
+      "Bash(sshpass -p 'GrokValentine42!' ssh -o StrictHostKeyChecking=no grok@192.168.1.104 \"docker exec plasma-productivity-1 cat /opt/startup/xstartup.turbovnc 2>/dev/null || docker exec plasma-productivity-1 cat /home/maid/.vnc/xstartup.turbovnc 2>/dev/null\")",
+      "Bash(sshpass:*)",
+      "Bash(python3:*)",
+      "Bash(sudo iptables:*)",
+      "Bash(chmod:*)",
+      "Bash(timeout 10:*)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Read(//home/wesxdz/arc/3/entailment/heatshield/src/**)",
+      "Bash(timeout 25 ./project)",
+      "Bash(echo \"exit=$?\")",
+      "Bash(xxd)",
+      "Bash(echo \"rc=$?\")",
+      "Read(//usr/**)",
+      "Bash(mkdir -p /home/wesxdz/paphos/gynoid/deps/glm)",
+      "Bash(cp -r /tmp/claude-1000/-home-wesxdz-paphos-gynoid/784689f0-4a68-43b8-be0d-ab3d10c03cbf/scratchpad/glm /home/wesxdz/paphos/gynoid/deps/glm/glm)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git push *)"
+    ]
+  }
+}

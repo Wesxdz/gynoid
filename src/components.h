@@ -442,9 +442,57 @@ struct BadgeContent {
 // strip of character glyphs -- the subword representation the neurosymbolic
 // rule layers will operate over. `shown` is what the strip currently renders,
 // so the panel only rebuilds when the selection actually moves to a new word.
+// One row of a paradigm in the Lexicon panel: a word form's current
+// characters and the entity type it is annotated as. The type is free text
+// naming any world type -- Singular, Plural, PastTense, whatever the user
+// types -- created on demand when the paradigm commits, never an enum.
+struct LexiconForm {
+    std::string text;
+    // One or more type names separated by '|' -- "Plural|Singular" is a
+    // disjunction, rendered as one badge per disjunct with the OR glyph
+    // between. The commit path splits it back into one tag per type on a
+    // single world entity.
+    std::string type;
+    // Set on rows the machine proposed; X on such a row is a rejection --
+    // a negative demonstration -- rather than a character edit.
+    bool proposed = false;
+};
+
 struct LexiconPanel {
-    flecs::entity glyph_row;
+    flecs::entity glyph_row;   // the column the paradigm rows build into
     std::string shown;
+
+    // The paradigm: row 0 is the word from the sentence (surface form, not
+    // editable); further rows are variants, spawned by Down past the end and
+    // shaped by letter edits. Direction of any taught pair comes from the
+    // Number annotations, never from row position.
+    std::vector<LexiconForm> forms;
+
+    // Character-level selection: which row, and which characters within it.
+    bool selecting = false;
+    int row = 0;
+    int sel_start = 0;
+    int sel_end = 0;
+
+    // Tab switches the selected row between its two fields: characters, or
+    // the type annotation being typed.
+    bool typing_type = false;
+
+    // Whether the FST's proposal has pre-filled the paradigm for this word;
+    // reset when the word changes so a stale proposal can't dress up as new.
+    bool prefilled = false;
+
+    bool dirty = false;
+};
+
+// The Transducer panel: the neurosymbolic rule series the morphology server
+// has synthesized from demonstrations -- each rule's rewrite, its evidence,
+// and its confidence after exceptions have testified against it. `shown_sig`
+// is a fingerprint of what is rendered, so the list rebuilds only when the
+// machine actually relearns.
+struct TransducerPanel {
+    flecs::entity list;
+    std::string shown_sig;
 };
 
 // A co-reference arc in the annotated sentence: the same symbol appearing in
@@ -793,6 +841,7 @@ enum class EditorType
     DataFusion,
     Entities,
     Lexicon,
+    Transducer,
     // SystemNavigator,
 
     // Bookshelf,

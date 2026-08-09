@@ -271,6 +271,82 @@ def main():
             socket_rep.send(msgpack.packb(reply))
             continue
 
+        if req.get("type") == "teach_forms":
+            # A committed paradigm: each line is "Type<TAB>text", each becomes
+            # a Form entity of that type -- types created on demand, arbitrary.
+            # If one row is typed Singular, every other row relates to it by
+            # LemmaOf; the lemma convention is the one piece of fixed
+            # vocabulary, because the morphology server pivots on it.
+            entries = []
+            for line in (req.get("forms") or "").split("\n"):
+                if "\t" not in line:
+                    continue
+                kind, text = line.split("\t", 1)
+                if kind.strip() and text.strip():
+                    entries.append((kind.strip(), text.strip()))
+            if not entries:
+                socket_rep.send(msgpack.packb(
+                    {"status": "ERROR", "error": "teach_forms needs Type\\tText lines"}))
+                continue
+            try:
+                # Rows sharing one text are ONE entity wearing several types --
+                # that is what an override like "pants: Plural AND Singular"
+                # means. First occurrence creates; later ones add tags.
+                created = []          # (type, id)
+                id_by_text = {}
+                for kind, text in entries:
+                    if text in id_by_text:
+                        query_world(f"tag {kind} {id_by_text[text]}")
+                        created.append((kind, id_by_text[text]))
+                        continue
+                    result = query_world(f"create {kind} {text}")
+                    if result.get("id"):
+                        id_by_text[text] = result["id"]
+                        created.append((kind, result["id"]))
+                # A form that took more than one type is a disjunction; the
+                # operator it invokes is a first-class named entity, ensured
+                # exactly once however many annotations mention it.
+                from collections import Counter
+                text_counts = Counter(t for _, t in entries)
+                if any(n > 1 for n in text_counts.values()):
+                    query_world("ensure Operator Or")
+
+                singular_id = next((i for k, i in created if k == "Singular"), None)
+                if singular_id:
+                    for kind, ident in created:
+                        if ident != singular_id:
+                            query_world(f"relate LemmaOf {ident} {singular_id}")
+                reply = {"status": "OK", "count": len(created)}
+            except Exception as exc:
+                reply = {"status": "OFFLINE", "error": str(exc)}
+            socket_rep.send(msgpack.packb(reply))
+            continue
+
+        if req.get("type") == "teach_false":
+            # A negative demonstration: the machine derived `variant` from
+            # `word` and the user rejected it. Both become neutral Form
+            # entities and the rejection is a NotLemmaOf relation -- the
+            # negativity lives in the relation, not on the form, because
+            # "pant" is only wrong as the singular OF PANTS, not wrong per se.
+            word = (req.get("word") or "").strip()
+            variant = (req.get("variant") or "").strip()
+            if not word or not variant:
+                socket_rep.send(msgpack.packb(
+                    {"status": "ERROR", "error": "teach_false needs word and variant"}))
+                continue
+            try:
+                r1 = query_world(f"create Form {word}")
+                r2 = query_world(f"create Form {variant}")
+                if r1.get("id") and r2.get("id"):
+                    query_world(f"relate NotLemmaOf {r1['id']} {r2['id']}")
+                    reply = {"status": "OK"}
+                else:
+                    reply = {"status": "ERROR", "error": "create failed"}
+            except Exception as exc:
+                reply = {"status": "OFFLINE", "error": str(exc)}
+            socket_rep.send(msgpack.packb(reply))
+            continue
+
         if req.get("type") != "query":
             socket_rep.send(msgpack.packb({"status": "READY_WAITING"}))
             continue

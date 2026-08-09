@@ -768,6 +768,13 @@ std::vector<SentenceToken> parse_sentence_template(const std::string& sentence) 
                             }
                         } else {
                             bind_str = spec;
+                            // Optional lemma annotation after ':' -- a
+                            // kind-promoted member's canonical form.
+                            size_t colon = bind_str.find(':');
+                            if (colon != std::string::npos) {
+                                reified_str = bind_str.substr(colon + 1);
+                                bind_str = bind_str.substr(0, colon);
+                            }
                             // Convert * to empty string for wildcards
                             if (bind_str == "*") bind_str = "";
                         }
@@ -823,6 +830,11 @@ std::string tokens_to_template(const std::vector<SentenceToken>& tokens) {
                 }
                 default:
                     spec = !tokens[i].binding_symbol.empty() ? tokens[i].binding_symbol : "*";
+                    // A lemma annotation (kind-promoted member) rides after ':'.
+                    if (tokens[i].type == TokenType::Entity
+                        && !tokens[i].reified_symbol.empty()) {
+                        spec += ":" + tokens[i].reified_symbol;
+                    }
                     break;
             }
             result += "{{" + tokens[i].text + ", " + spec + "}}";
@@ -3072,7 +3084,8 @@ std::vector<std::string> editor_types =
     "Scene Graph",
     "Data Fusion",
     "Entities",
-    "Lexicon"
+    "Lexicon",
+    "Transducer"
 };
 
 struct VNCData
@@ -4692,20 +4705,36 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
                 YGJustifyFlexStart, YGAlignFlexStart, 8.0f})
             .set<ZIndex>({10});
 
-        // The character strip. Wraps, because a combined multi-word entity can
-        // be longer than the panel; each glyph stays an individual entity so a
-        // rule layer can later point at, tint, or annotate single characters.
-        auto glyph_row = world->entity()
+        // The sync system owns everything inside the column: the word's
+        // character strip, and beneath it the transducer's derived row when a
+        // suffix rule has been applied.
+        leaf.set<LexiconPanel>({column, ""});
+    }
+    else if (editor_type == EditorType::Transducer)
+    {
+        auto canvas = leaf.target<EditorCanvas>();
+
+        world->entity()
             .is_a(UIElement)
-            .child_of(column)
+            .child_of(canvas)
+            .add<UIYoga>()
+            .set<UIFillParent>({})
+            .set<RectRenderable>({0.0f, 0.0f, false, 0x050505FF})
+            .set<ZIndex>({9});
+
+        auto column = world->entity()
+            .is_a(UIElement)
+            .child_of(canvas)
             .add(flecs::OrderedChildren)
             .add<UIYoga>()
+            .set<UIFillParent>({10.0f, 10.0f, 10.0f, 10.0f})
+            .set<Position, Local>({10.0f, 10.0f})
             .set<UIFlexContainer>({
-                YGFlexDirectionRow, YGWrapWrap,
-                YGJustifyFlexStart, YGAlignCenter, 2.0f})
-            .set<ZIndex>({12});
+                YGFlexDirectionColumn, YGWrapNoWrap,
+                YGJustifyFlexStart, YGAlignFlexStart, 6.0f})
+            .set<ZIndex>({10});
 
-        leaf.set<LexiconPanel>({glyph_row, ""});
+        leaf.set<TransducerPanel>({column, "unrendered"});
     }
     else if (editor_type == EditorType::Bookshelf)
     {
@@ -5109,6 +5138,9 @@ void replace_editor_content(flecs::entity leaf, EditorType editor_type, flecs::e
     }
     if (leaf.has<LexiconPanel>()) {
         leaf.remove<LexiconPanel>();
+    }
+    if (leaf.has<TransducerPanel>()) {
+        leaf.remove<TransducerPanel>();
     }
     leaf.target<EditorHeader>().children([&](flecs::entity child)
     {
@@ -6004,6 +6036,166 @@ static void append_annotation_record(const WordAnnotationSelector& selector)
     log << "}\n";
 }
 
+// The transducer's current proposal for the word under inspection. One slot,
+// not a cache: the panel only ever shows one word, and a stale proposal for a
+// previous word must never dress up as an analysis of the current one.
+static struct {
+    std::string word;      // the word this proposal analyses
+    std::string lemma;
+    std::string suffix;
+    std::string rule;
+    std::string word_type;      // what the inspected word is (e.g. Plural)
+    std::string variant;        // its counterpart form
+    std::string variant_type;   // and what that one is
+    float confidence = 0.0f;
+    int support = 0;
+} g_fst_proposal;
+static std::string g_fst_requested;
+
+// The rule series as last reported by the morphology server's dump: what the
+// Transducer panel renders. Stale after any teach; refreshed through its own
+// client so rule listing never contends with the lexicon's analyze requests.
+static struct {
+    bool valid = false;
+    bool stale = true;
+    int states = 0, arcs = 0, lexicon = 0;
+    struct Rule { std::string in, out; int support; float confidence; };
+    std::vector<Rule> rules;
+    std::string signature;
+} g_transducer;
+
+void transducer_dump_response(std::map<std::string, msgpack::object>& res_map)
+{
+    g_transducer.rules.clear();
+    g_transducer.valid = true;
+    g_transducer.stale = false;
+    g_transducer.states = res_map.count("states") ? (int)res_map["states"].as<int64_t>() : 0;
+    g_transducer.arcs = res_map.count("arcs") ? (int)res_map["arcs"].as<int64_t>() : 0;
+    g_transducer.lexicon = res_map.count("lexicon") ? (int)res_map["lexicon"].as<int64_t>() : 0;
+
+    g_transducer.signature.clear();
+    if (res_map.count("rules")) {
+        try {
+            auto rules = res_map["rules"].as<std::vector<std::map<std::string, msgpack::object>>>();
+            for (auto& rule : rules) {
+                g_transducer.rules.push_back({
+                    rule.count("in") ? rule["in"].as<std::string>() : "",
+                    rule.count("out") ? rule["out"].as<std::string>() : "",
+                    rule.count("support") ? (int)rule["support"].as<int64_t>() : 0,
+                    rule.count("confidence") ? (float)rule["confidence"].as<double>() : 0.0f,
+                });
+                auto& r = g_transducer.rules.back();
+                g_transducer.signature += r.in + ">" + r.out + ":"
+                    + std::to_string(r.support) + ":"
+                    + std::to_string((int)(r.confidence * 1000)) + ";";
+            }
+        } catch (const std::exception&) {}
+    }
+    g_transducer.signature += "L" + std::to_string(g_transducer.lexicon);
+
+    world->query<TransducerPanel>().each([](flecs::entity, TransducerPanel&) {});
+}
+
+// A demonstration waiting to reach the world -- kept until the bridge client
+// is free, so an Enter pressed while a request is mid-flight teaches late
+// rather than never.
+static std::string g_pending_teach;   // "Type\tText\n..." awaiting the bridge
+static std::pair<std::string, std::string> g_pending_false;   // rejected derivation
+
+void teach_number_response(std::map<std::string, msgpack::object>& res_map)
+{
+    g_pending_teach.clear();
+    // The lexicon just changed; the current word deserves a fresh analysis,
+    // and the rule series shown in the Transducer panel is stale.
+    g_fst_requested.clear();
+    g_transducer.stale = true;
+    world->query<LexiconPanel>().each([](flecs::entity, LexiconPanel& panel) {
+        panel.dirty = true;
+    });
+}
+
+static void try_send_false()
+{
+    if (g_pending_false.first.empty()) return;
+    flecs::entity client = world->lookup("EntityCreateClient");
+    if (!client.is_valid() || client.has<AwaitResponse>()) return;
+    client.set<SendMapRequest>({{
+        {"type", "teach_false"},
+        {"word", g_pending_false.first},
+        {"variant", g_pending_false.second},
+    }});
+    client.set<AwaitResponse>({[](std::map<std::string, msgpack::object>&) {
+        g_pending_false = {};
+        g_fst_requested.clear();       // re-analyze: the rejection changed things
+        g_transducer.stale = true;
+        world->query<LexiconPanel>().each([](flecs::entity, LexiconPanel& panel) {
+            panel.dirty = true;
+        });
+    }});
+}
+
+static void try_send_teach()
+{
+    if (g_pending_teach.empty()) return;
+    flecs::entity client = world->lookup("EntityCreateClient");
+    if (!client.is_valid() || client.has<AwaitResponse>()) return;
+    client.set<SendMapRequest>({{
+        {"type", "teach_forms"},
+        {"forms", g_pending_teach},
+    }});
+    client.set<AwaitResponse>({teach_number_response});
+}
+
+void morphology_response(std::map<std::string, msgpack::object>& res_map)
+{
+    g_fst_proposal.word.clear();
+    if (res_map.count("lemma")) {
+        g_fst_proposal.word = g_fst_requested;
+        g_fst_proposal.lemma = res_map["lemma"].as<std::string>();
+        g_fst_proposal.suffix = res_map.count("suffix_in")
+            ? res_map["suffix_in"].as<std::string>() : std::string();
+        g_fst_proposal.support = res_map.count("support")
+            ? (int)res_map["support"].as<int64_t>() : 0;
+        g_fst_proposal.rule = res_map.count("rule")
+            ? res_map["rule"].as<std::string>() : std::string();
+        g_fst_proposal.confidence = res_map.count("confidence")
+            ? (float)res_map["confidence"].as<double>() : 0.0f;
+        g_fst_proposal.word_type = res_map.count("word_type")
+            ? res_map["word_type"].as<std::string>() : std::string("Plural");
+        g_fst_proposal.variant = res_map.count("variant")
+            ? res_map["variant"].as<std::string>() : g_fst_proposal.lemma;
+        g_fst_proposal.variant_type = res_map.count("variant_type")
+            ? res_map["variant_type"].as<std::string>() : std::string("Singular");
+    }
+    // Whether an analysis arrived or an empty OK, the panels re-render.
+    world->query<LexiconPanel>().each([](flecs::entity, LexiconPanel& panel) {
+        panel.dirty = true;
+    });
+}
+
+// One line of plurality supervision: the user segmented a suffix by hand and
+// typed the pair. This is the gold data the plural transducer trains on --
+// surface form, lemma, the exact suffix, and which is which.
+static void append_lexicon_record(const std::string& word, const std::string& lemma,
+                                  const std::string& suffix)
+{
+    std::ofstream log("../lexicon.jsonl", std::ios::app);
+    if (!log) return;
+    auto escape = [](const std::string& in) {
+        std::string out;
+        for (char c : in) {
+            if (c == '"' || c == '\\') out += '\\';
+            out += c;
+        }
+        return out;
+    };
+    log << "{\"ts\": " << (long long)std::time(nullptr)
+        << ", \"plural\": \"" << escape(word) << "\""
+        << ", \"singular\": \"" << escape(lemma) << "\""
+        << ", \"suffix\": \"" << escape(suffix) << "\""
+        << ", \"rule\": \"strip-suffix\"}\n";
+}
+
 void sync_representation_grounding(WordAnnotationSelector& selector, const std::string& template_str)
 {
     // This function destroys UI and immediately reads back the structure it
@@ -6165,8 +6357,18 @@ void sync_representation_grounding(WordAnnotationSelector& selector, const std::
 
         if (token.type == TokenType::Entity) {
             uint32_t color = get_entity_color(token.binding_symbol, token.text);
-            flecs::entity badge = create_badge(insert_parent, UIElement, token.text.c_str(), color, 
-                         false, false, token.binding_symbol, "", 0, color);
+            // A lemma-annotated entity (a kind-promoted member) displays its
+            // canonical form; the surface stays in the template so dissolving
+            // the frame restores the sentence exactly.
+            const std::string& display = token.reified_symbol.empty()
+                ? token.text : token.reified_symbol;
+            // An unbound entity wears the wildcard as its symbol -- the empty
+            // string would suppress the sprite entirely, and a badge without
+            // its glyph reads as a different kind of thing.
+            flecs::entity badge = create_badge(insert_parent, UIElement, display.c_str(), color, 
+                         false, false,
+                         token.binding_symbol.empty() ? "*" : token.binding_symbol,
+                         "", 0, color);
             
             if (!token.binding_symbol.empty()) symbol_anchors[token.binding_symbol] = badge;
             if (insert_parent != container) member_colors.push_back(color);
@@ -6269,6 +6471,305 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                 save_editor_layout(editor_root);
             }
             return;
+        }
+
+        // Lexicon character mode: Down descends from word-level annotation into
+        // the selected word's characters -- altitude, the same axis the panels
+        // split on. Arrows move over the chips (starting at the last character,
+        // since suffixes are the point), S applies the strip-suffix
+        // transduction and types the pair plural/singular, Up returns to the
+        // sentence.
+        {
+            static flecs::query<LexiconPanel> lexicons = world->query<LexiconPanel>();
+            bool char_mode = false;
+            std::string lex_word;
+            lexicons.each([&](flecs::entity, LexiconPanel& panel) {
+                if (panel.selecting) char_mode = true;
+                if (lex_word.empty()) lex_word = panel.shown;
+            });
+            int chip_count = 0;
+            for (char c : lex_word)
+                if (!std::isspace(static_cast<unsigned char>(c))) chip_count++;
+
+            bool annotating_now = false;
+            static flecs::query<WordAnnotationSelector> lex_annotators =
+                world->query<WordAnnotationSelector>();
+            lex_annotators.each([&](flecs::entity, WordAnnotationSelector& sel) {
+                if (sel.active) annotating_now = true;
+            });
+
+            if (!char_mode && annotating_now && key == GLFW_KEY_L
+                && (mods & GLFW_MOD_CONTROL) && chip_count > 0) {
+                lexicons.each([&](flecs::entity, LexiconPanel& panel) {
+                    if (panel.forms.empty() && !panel.shown.empty()) {
+                        std::string chars;
+                        for (char c : panel.shown)
+                            if (!std::isspace(static_cast<unsigned char>(c))) chars += c;
+                        panel.forms.push_back({chars, std::string()});
+                    }
+                    panel.selecting = true;
+                    panel.row = 0;
+                    int len = panel.forms.empty() ? 0 : (int)panel.forms[0].text.size();
+                    panel.sel_start = panel.sel_end = std::max(0, len - 1);
+                    panel.dirty = true;
+                });
+                return;
+            }
+
+            if (char_mode) {
+                bool shift = (mods & GLFW_MOD_SHIFT) != 0;
+                auto row_len = [](LexiconPanel& panel) {
+                    return (panel.row < (int)panel.forms.size())
+                        ? (int)panel.forms[panel.row].text.size() : 0;
+                };
+
+                if (key == GLFW_KEY_ESCAPE
+                    || (key == GLFW_KEY_L && (mods & GLFW_MOD_CONTROL))) {
+                    lexicons.each([&](flecs::entity, LexiconPanel& panel) {
+                        if (key == GLFW_KEY_ESCAPE && panel.typing_type) {
+                            panel.typing_type = false;   // Escape peels one layer
+                        } else {
+                            panel.typing_type = false;
+                            panel.selecting = false;     // L toggles all the way out
+                        }
+                        panel.dirty = true;
+                    });
+                    return;
+                }
+                if (key == GLFW_KEY_UP) {
+                    // Up climbs the paradigm; from the surface row it returns
+                    // to the sentence.
+                    lexicons.each([&](flecs::entity, LexiconPanel& panel) {
+                        panel.typing_type = false;
+                        if (panel.row > 0) {
+                            panel.row--;
+                            int len = row_len(panel);
+                            panel.sel_end = std::clamp(panel.sel_end, 0, std::max(0, len - 1));
+                            panel.sel_start = panel.sel_end;
+                        } else {
+                            panel.selecting = false;
+                        }
+                        panel.dirty = true;
+                    });
+                    return;
+                }
+                if (key == GLFW_KEY_DOWN) {
+                    // Down walks into the variants; past the last row it spawns
+                    // a new one -- a copy of the current form, ready to edit.
+                    lexicons.each([&](flecs::entity, LexiconPanel& panel) {
+                        panel.typing_type = false;
+                        if (panel.row + 1 < (int)panel.forms.size()) {
+                            panel.row++;
+                        } else if (panel.row < (int)panel.forms.size()) {
+                            panel.forms.push_back({panel.forms[panel.row].text, std::string()});
+                            panel.row = (int)panel.forms.size() - 1;
+                        }
+                        int len = row_len(panel);
+                        panel.sel_end = std::clamp(panel.sel_end, 0, std::max(0, len - 1));
+                        panel.sel_start = panel.sel_end;
+                        panel.dirty = true;
+                    });
+                    return;
+                }
+                if (key == GLFW_KEY_LEFT || key == GLFW_KEY_RIGHT) {
+                    // Focus is explicit now (L toggles), so the mode is
+                    // strict: while the lexicon holds focus, arrows are
+                    // chip-local -- plain moves, Shift extends -- and the
+                    // sentence moves only after L out.
+                    int step = (key == GLFW_KEY_RIGHT) ? 1 : -1;
+                    lexicons.each([&](flecs::entity, LexiconPanel& panel) {
+                        int len = row_len(panel);
+                        if (len <= 0) return;
+                        int next = std::clamp(panel.sel_end + step, 0, len - 1);
+                        panel.sel_end = next;
+                        if (!shift) panel.sel_start = next;
+                        panel.dirty = true;
+                    });
+                    return;
+                }
+                if (key == GLFW_KEY_TAB) {
+                    // Field switch on the row: characters <-> type annotation.
+                    lexicons.each([&](flecs::entity, LexiconPanel& panel) {
+                        panel.typing_type = !panel.typing_type;
+                        panel.dirty = true;
+                    });
+                    return;
+                }
+                if (key == GLFW_KEY_X) {
+                    // On a machine-proposed row, X is rejection: the guessed
+                    // derivation is wrong, the row disappears, and the
+                    // rejection is taught to the world as a NotLemmaOf pair
+                    // so this exact derivation never comes back.
+                    bool rejected = false;
+                    lexicons.each([&](flecs::entity, LexiconPanel& panel) {
+                        if (panel.row <= 0 || panel.row >= (int)panel.forms.size()) return;
+                        if (!panel.forms[panel.row].proposed) return;
+                        g_pending_false = {panel.forms[0].text,
+                                           panel.forms[panel.row].text};
+                        panel.forms.erase(panel.forms.begin() + panel.row);
+                        panel.row = std::clamp(panel.row - 1, 0,
+                                               std::max(0, (int)panel.forms.size() - 1));
+                        panel.dirty = true;
+                        rejected = true;
+                    });
+                    if (rejected) { try_send_false(); return; }
+
+                    // On the surface row, X derives: the deletion spawns a new
+                    // variant carrying it -- the edit is the transduction, the
+                    // new row its output -- and the surface stays faithful to
+                    // the sentence. On a variant row, X edits in place.
+                    lexicons.each([&](flecs::entity, LexiconPanel& panel) {
+                        if (panel.row >= (int)panel.forms.size()) return;
+
+                        if (panel.row == 0) {
+                            const std::string& surface = panel.forms[0].text;
+                            int lo = std::clamp(std::min(panel.sel_start, panel.sel_end),
+                                                0, (int)surface.size());
+                            int hi = std::clamp(std::max(panel.sel_start, panel.sel_end),
+                                                0, (int)surface.size() - 1);
+                            if (lo > hi) return;
+                            std::string variant = surface.substr(0, lo) + surface.substr(hi + 1);
+                            panel.forms.push_back({variant, std::string()});
+                            panel.row = (int)panel.forms.size() - 1;
+                            panel.sel_start = panel.sel_end =
+                                std::clamp(lo, 0, std::max(0, (int)variant.size() - 1));
+                            panel.dirty = true;
+                            return;
+                        }
+
+                        std::string& text = panel.forms[panel.row].text;
+                        int lo = std::clamp(std::min(panel.sel_start, panel.sel_end), 0, (int)text.size());
+                        int hi = std::clamp(std::max(panel.sel_start, panel.sel_end), 0, (int)text.size() - 1);
+                        if (lo > hi) return;
+                        text.erase(lo, hi - lo + 1);
+                        panel.sel_start = panel.sel_end =
+                            std::clamp(lo, 0, std::max(0, (int)text.size() - 1));
+                        panel.dirty = true;
+                    });
+                    return;
+                }
+                if ((key >= GLFW_KEY_A && key <= GLFW_KEY_Z)
+                    || (key >= GLFW_KEY_0 && key <= GLFW_KEY_9)
+                    || key == GLFW_KEY_SPACE) {
+                    char inserted;
+                    if (key == GLFW_KEY_SPACE) inserted = ' ';
+                    else if (key <= GLFW_KEY_9) inserted = (char)('0' + (key - GLFW_KEY_0));
+                    else inserted = (char)((shift ? 'A' : 'a') + (key - GLFW_KEY_A));
+                    // In the type field, letters spell the entity type name --
+                    // arbitrary, case as typed. Any row may be typed,
+                    // including the surface row.
+                    bool any_typing = false;
+                    lexicons.each([&](flecs::entity, LexiconPanel& panel) {
+                        if (!panel.typing_type) return;
+                        any_typing = true;
+                        if (panel.row < (int)panel.forms.size()) {
+                            panel.forms[panel.row].type += inserted;
+                            panel.forms[panel.row].proposed = false;   // adopted
+                            panel.dirty = true;
+                        }
+                    });
+                    if (any_typing) return;
+
+                    // Otherwise: insert after the selected character; Shift
+                    // inserts before, which is how a prepend at 0 is reached.
+                    if (inserted == ' ') return;   // spaces belong to types only
+                    inserted = (char)std::tolower(static_cast<unsigned char>(inserted));
+                    lexicons.each([&](flecs::entity, LexiconPanel& panel) {
+                        if (panel.row == 0 || panel.row >= (int)panel.forms.size()) return;
+                        std::string& text = panel.forms[panel.row].text;
+                        int at = shift ? std::min(panel.sel_start, panel.sel_end)
+                                       : panel.sel_end + 1;
+                        at = std::clamp(at, 0, (int)text.size());
+                        text.insert(text.begin() + at, inserted);
+                        panel.forms[panel.row].proposed = false;   // adopted
+                        panel.sel_start = panel.sel_end = at;   // land on the new letter
+                        panel.dirty = true;
+                    });
+                    return;
+                }
+                if (key == GLFW_KEY_DELETE) {
+                    // Delete removes the selected variant row outright. The
+                    // surface row stays -- it is the word from the sentence,
+                    // not ours to remove. Distinct from X, which rejects a
+                    // machine proposal (teaching) or edits characters; Delete
+                    // just discards, teaching nothing.
+                    lexicons.each([&](flecs::entity, LexiconPanel& panel) {
+                        if (panel.row <= 0 || panel.row >= (int)panel.forms.size()) return;
+                        panel.forms.erase(panel.forms.begin() + panel.row);
+                        panel.row = std::clamp(panel.row - 1, 0,
+                                               std::max(0, (int)panel.forms.size() - 1));
+                        int len = (panel.row < (int)panel.forms.size())
+                            ? (int)panel.forms[panel.row].text.size() : 0;
+                        panel.sel_start = panel.sel_end = std::max(0, len - 1);
+                        panel.typing_type = false;
+                        panel.dirty = true;
+                    });
+                    return;
+                }
+                if (key == GLFW_KEY_BACKSPACE) {
+                    bool any_typing = false;
+                    lexicons.each([&](flecs::entity, LexiconPanel& panel) {
+                        if (!panel.typing_type) return;
+                        any_typing = true;
+                        if (panel.row < (int)panel.forms.size()
+                            && !panel.forms[panel.row].type.empty()) {
+                            panel.forms[panel.row].type.pop_back();
+                            panel.dirty = true;
+                        }
+                    });
+                    if (any_typing) return;
+
+                    lexicons.each([&](flecs::entity, LexiconPanel& panel) {
+                        if (panel.row == 0 || panel.row >= (int)panel.forms.size()) return;
+                        std::string& text = panel.forms[panel.row].text;
+                        if (text.empty()) return;
+                        int at = std::clamp(panel.sel_end, 0, (int)text.size() - 1);
+                        text.erase(text.begin() + at);
+                        panel.sel_start = panel.sel_end =
+                            std::clamp(at - 1, 0, std::max(0, (int)text.size() - 1));
+                        panel.dirty = true;
+                    });
+                    return;
+                }
+                if (key == GLFW_KEY_ENTER || key == GLFW_KEY_KP_ENTER) {
+                    // Commit the paradigm: every typed row becomes a Form
+                    // entity of its annotated type in the world. Types are
+                    // whatever was typed -- created on demand at the far end.
+                    lexicons.each([&](flecs::entity, LexiconPanel& panel) {
+                        std::string forms;
+                        for (const LexiconForm& form : panel.forms) {
+                            if (form.text.empty() || form.type.empty()) continue;
+                            // "Plural or Singular" unfolds to one line per
+                            // type; the bridge folds same-text lines back into
+                            // one entity wearing every tag.
+                            std::string current;
+                            std::vector<std::string> tokens;
+                            for (char c : form.type) {
+                                if (c == ' ') {
+                                    if (!current.empty()) tokens.push_back(current);
+                                    current.clear();
+                                } else current += c;
+                            }
+                            if (!current.empty()) tokens.push_back(current);
+                            for (const std::string& token : tokens) {
+                                std::string lower;
+                                for (char c : token)
+                                    lower += (char)std::tolower(static_cast<unsigned char>(c));
+                                if (lower == "or") continue;   // operator, not a type
+                                if (!forms.empty()) forms += "\n";
+                                forms += token + "\t" + form.text;
+                            }
+                        }
+                        if (forms.empty()) return;
+                        g_pending_teach = forms;
+                        try_send_teach();
+                        panel.dirty = true;
+                    });
+                    return;
+                }
+                // Character mode owns the keyboard while focused.
+                return;
+            }
         }
 
         // Word annotation selector - Tab toggles, arrows navigate, shift+arrows expand selection
@@ -6764,6 +7265,64 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                         return;
                     }
 
+                    // The special case that closes the intension circle: a
+                    // plural word denotes a kind, not an instance -- "robots"
+                    // is Q(robot). When the transducer knows the selected word
+                    // is plural, E promotes it to a comprehension frame rather
+                    // than an entity binding. Knowledge comes from the same
+                    // analysis the Lexicon panel requested; no analysis, no
+                    // special case.
+                    if (tokens[token_idx].type == TokenType::PlainText
+                        && selector.start_index == selector.end_index) {
+                        std::string lowered = tokens[token_idx].text;
+                        for (char& c : lowered)
+                            c = (char)std::tolower(static_cast<unsigned char>(c));
+                        if (g_fst_proposal.word == lowered
+                            && g_fst_proposal.word_type == "Plural"
+                            && tokens[token_idx].type == TokenType::PlainText) {
+                            std::set<std::string> used = collect_used_symbols(tokens);
+                            std::string q_sym, e_sym;
+                            for (int d = 0; d <= 9; d++) {
+                                std::string candidate = std::to_string(d);
+                                if (used.count(candidate)) continue;
+                                if (q_sym.empty()) q_sym = candidate;
+                                else { e_sym = candidate; break; }
+                            }
+                            if (!q_sym.empty() && !e_sym.empty()) {
+                                std::vector<SentenceToken> new_tokens;
+                                int new_sel_start = 0;
+                                for (int i = 0; i < token_idx; i++) {
+                                    new_sel_start += token_selection_width(tokens, i);
+                                    new_tokens.push_back(tokens[i]);
+                                }
+                                new_tokens.push_back({"", q_sym, "", "", e_sym,
+                                                      TokenType::Concept});
+                                // Inside the frame sits the SINGULAR as a
+                                // badge -- but the template keeps the SURFACE
+                                // word, with the lemma riding as an annotation
+                                // (in reified_symbol, unused for entities).
+                                // Display shows "robot"; dissolving the frame
+                                // restores "robots". Never destroy surface to
+                                // show canonical.
+                                new_tokens.push_back({tokens[token_idx].text,
+                                                      "", "", "",
+                                                      g_fst_proposal.variant,
+                                                      TokenType::Entity});
+                                new_tokens.push_back({"", "", "", "", "",
+                                                      TokenType::ConceptEnd});
+                                for (int i = token_idx + 1; i < (int)tokens.size(); i++)
+                                    new_tokens.push_back(tokens[i]);
+
+                                selector.sentence_template = tokens_to_template(new_tokens);
+                                selector.dirty = true;
+                                selector.start_index = new_sel_start;
+                                selector.end_index = new_sel_start;
+                                handled = true;
+                                return;
+                            }
+                        }
+                    }
+
                     // Collect all used symbols
                     std::set<std::string> used_symbols;
                     for (const auto& tok : tokens) {
@@ -6878,11 +7437,23 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                         handled = true;
                     }
                     else if (tokens[token_idx].type == TokenType::Concept) {
-                        // Dissolve the frame: remove the marker pair, keep the
-                        // members exactly as they were.
+                        // Dissolve the frame: remove the marker pair. Members
+                        // that only made sense IN the frame revert -- a
+                        // lemma-annotated unbound entity was the kind's mark,
+                        // and without the frame it is just the surface word
+                        // again, plural and all.
                         int close = -1;
                         for (size_t i = token_idx + 1; i < tokens.size(); i++) {
                             if (tokens[i].type == TokenType::ConceptEnd) { close = (int)i; break; }
+                        }
+                        int limit = close >= 0 ? close : (int)tokens.size();
+                        for (int i = token_idx + 1; i < limit; i++) {
+                            if (tokens[i].type == TokenType::Entity
+                                && tokens[i].binding_symbol.empty()
+                                && !tokens[i].reified_symbol.empty()) {
+                                tokens[i].type = TokenType::PlainText;
+                                tokens[i].reified_symbol = "";
+                            }
                         }
                         if (close >= 0) tokens.erase(tokens.begin() + close);
                         tokens.erase(tokens.begin() + token_idx);
@@ -7298,6 +7869,15 @@ int main(int, char *[]) {
     flecs::entity entity_semantics_client = world->entity("EntitySemanticsClient")
         .set<ZMQClient>({ "ipc:///tmp/thornfield_entity_semantics_socket", zmq::socket_type::req });
 
+    // OpenFst plural transducer, induced live from lexicon.jsonl -- the S
+    // gesture in the Lexicon panel teaches it.
+    flecs::entity morphology_server = world->entity("MorphologyServer")
+        .set<SpawnRequest>({"python3", {"../scripts/morphology.py"}});
+    flecs::entity morphology_client = world->entity("MorphologyClient")
+        .set<ZMQClient>({ "ipc:///tmp/thornfield_morphology_socket", zmq::socket_type::req });
+    flecs::entity morphology_rules_client = world->entity("MorphologyRulesClient")
+        .set<ZMQClient>({ "ipc:///tmp/thornfield_morphology_socket", zmq::socket_type::req });
+
     // Bridge to a separate headless flecs world; the Entities panel's rows come
     // from whatever that world answers with.
     flecs::entity entity_query_server = world->entity("EntityQueryServer")
@@ -7542,6 +8122,7 @@ int main(int, char *[]) {
     world->component<BadgeContent>();
     world->component<CorefArc>();
     world->component<LexiconPanel>();
+    world->component<TransducerPanel>();
     world->component<FocusEntityQuery>();
     world->component<VirtualList>();
 
@@ -8262,6 +8843,104 @@ int main(int, char *[]) {
     // template. Every handler sets dirty; before this system existed only the
     // R handler called the rebuild directly, so binding a symbol to a slot
     // updated the template invisibly -- the sentence on screen never changed.
+    // Keeps Transducer panels current with the morphology server's rule
+    // series: requests a dump when stale, rebuilds the display when the
+    // series actually changed. Rules render in the badge language -- the
+    // rewrite as letter chips, evidence and confidence beside it.
+    world->system<TransducerPanel>("TransducerSyncSystem")
+        .kind(flecs::PreFrame)
+        .immediate()
+        .run([](flecs::iter& it) {
+            std::vector<flecs::entity> panels;
+            while (it.next()) {
+                for (auto i : it) panels.push_back(it.entity(i));
+            }
+            if (panels.empty()) return;
+
+            if (g_transducer.stale) {
+                flecs::entity client = world->lookup("MorphologyRulesClient");
+                if (client.is_valid() && !client.has<AwaitResponse>()) {
+                    g_transducer.stale = false;   // one request per staleness
+                    client.set<SendMapRequest>({{{"type", "dump"}}});
+                    client.set<AwaitResponse>({transducer_dump_response});
+                }
+            }
+            if (!g_transducer.valid) return;
+
+            auto UIElement = world->lookup("UIElement");
+            for (flecs::entity e : panels) {
+                TransducerPanel& panel = e.ensure<TransducerPanel>();
+                if (panel.shown_sig == g_transducer.signature) continue;
+                if (!panel.list.is_valid() || !panel.list.is_alive()) continue;
+
+                std::vector<flecs::entity> stale_children;
+                panel.list.children([&](flecs::entity c) { stale_children.push_back(c); });
+                for (flecs::entity c : stale_children) c.destruct();
+
+                // The machine itself, in one line: what was learned, from how
+                // much, compiled to what.
+                world->entity()
+                    .is_a(UIElement)
+                    .child_of(panel.list)
+                    .add<UIYoga>()
+                    .set<TextRenderable>({
+                        std::to_string(g_transducer.rules.size()) + " rules from "
+                        + std::to_string(g_transducer.lexicon) + " demonstrations   "
+                        + "OpenFst " + std::to_string(g_transducer.states) + " states / "
+                        + std::to_string(g_transducer.arcs) + " arcs",
+                        "JetBrainsMono", 12.0f, 0x9c9c9cFF})
+                    .set<ZIndex>({12});
+
+                for (const auto& rule : g_transducer.rules) {
+                    auto row = world->entity()
+                        .is_a(UIElement)
+                        .child_of(panel.list)
+                        .add(flecs::OrderedChildren)
+                        .add<UIYoga>()
+                        .set<UIFlexContainer>({YGFlexDirectionRow, YGWrapNoWrap,
+                                               YGJustifyFlexStart, YGAlignCenter, 3.0f})
+                        .set<ZIndex>({12});
+
+                    // The rewrite, in letter chips: consumed suffix, arrow,
+                    // produced suffix (or the deletion mark when it produces
+                    // nothing).
+                    for (char c : rule.in)
+                        create_letter_chip(row, std::string(1, c), letter_color(c));
+                    world->entity()
+                        .is_a(UIElement)
+                        .child_of(row)
+                        .add<UIYoga>()
+                        .set<UIMargin>({0.0f, 2.0f, 0.0f, 2.0f})
+                        .set<TextRenderable>({"\u2192", "CharisSIL", 16.0f, 0x9c9c9cFF})
+                        .set<ZIndex>({13});
+                    if (rule.out.empty()) {
+                        world->entity()
+                            .is_a(UIElement)
+                            .child_of(row)
+                            .add<UIYoga>()
+                            .set<TextRenderable>({"\u2205", "CharisSIL", 16.0f, 0x6a6a6aFF})
+                            .set<ZIndex>({13});
+                    } else {
+                        for (char c : rule.out)
+                            create_letter_chip(row, std::string(1, c), letter_color(c));
+                    }
+
+                    world->entity()
+                        .is_a(UIElement)
+                        .child_of(row)
+                        .add<UIYoga>()
+                        .set<UIMargin>({0.0f, 0.0f, 0.0f, 10.0f})
+                        .set<TextRenderable>({
+                            std::to_string((int)(rule.confidence * 100.0f)) + "%   \u00d7"
+                            + std::to_string(rule.support),
+                            "JetBrainsMono", 12.0f, 0x4d6d8aFF})
+                        .set<ZIndex>({13});
+                }
+
+                panel.shown_sig = g_transducer.signature;
+            }
+        });
+
     // Mirrors the annotator's current selection into any open Lexicon panels:
     // the selected word, one character glyph per entity, tinted with the
     // word's bound entity colour when it has one. immediate() because it
@@ -8284,7 +8963,6 @@ int main(int, char *[]) {
             selectors.each([&](flecs::entity, WordAnnotationSelector& selector) {
                 if (!selector.active || selector.sentence_template.empty()) return;
                 auto tokens = parse_sentence_template(selector.sentence_template);
-
                 int expanded_pos = 0;
                 for (size_t ti = 0; ti < tokens.size(); ti++) {
                     int width = token_selection_width(tokens, ti);
@@ -8297,25 +8975,205 @@ int main(int, char *[]) {
                 }
             });
 
+            try_send_teach();
+            try_send_false();
+
+            // Ask the transducer about a word it hasn't been asked about.
+            // One request in flight (REQ/REP); LOADING never happens here --
+            // the FST compiles in milliseconds -- so no retry machinery.
+            if (!word.empty() && word != g_fst_requested) {
+                flecs::entity client = world->lookup("MorphologyClient");
+                if (client.is_valid() && !client.has<AwaitResponse>()) {
+                    g_fst_requested = word;
+                    client.set<SendMapRequest>({{{"type", "analyze"}, {"word", word}}});
+                    client.set<AwaitResponse>({morphology_response});
+                }
+            }
+
+            auto UIElement = world->lookup("UIElement");
+
+            // Builds one character row; chips in [ring_lo, ring_hi] get the
+            // selection ring. Each glyph stays its own entity -- rule layers
+            // point at characters, not strings.
+            auto build_row = [&](flecs::entity parent, const std::string& text,
+                                 int ring_lo, int ring_hi, const char* type_label,
+                                 const std::vector<uint8_t>* disabled = nullptr) {
+                auto row = world->entity()
+                    .is_a(UIElement)
+                    .child_of(parent)
+                    .add(flecs::OrderedChildren)
+                    .add<UIYoga>()
+                    .set<UIFlexContainer>({YGFlexDirectionRow, YGWrapWrap,
+                                           YGJustifyFlexStart, YGAlignCenter, 2.0f})
+                    .set<ZIndex>({12});
+                int idx = 0;
+                for (char c : text) {
+                    if (std::isspace(static_cast<unsigned char>(c))) continue;
+                    bool off = disabled && idx < (int)disabled->size() && (*disabled)[idx];
+                    flecs::entity chip = create_letter_chip(row, std::string(1, c),
+                                                            off ? 0x2e2e2eFF : letter_color(c));
+                    if (idx >= ring_lo && idx <= ring_hi) {
+                        world->entity()
+                            .is_a(UIElement)
+                            .child_of(chip)
+                            .add<UIYoga>()
+                            .set<UIAbsoluteEdges>({-2.0f, -2.0f, -2.0f, -2.0f})
+                            .set<RoundedRectRenderable>({0.0f, 0.0f, 5.0f, true, 0xFFFFFFE0})
+                            .set<ZIndex>({14});
+                    }
+                    idx++;
+                }
+                if (type_label) {
+                    world->entity()
+                        .is_a(UIElement)
+                        .child_of(row)
+                        .add<UIYoga>()
+                        .set<UIMargin>({0.0f, 0.0f, 0.0f, 8.0f})
+                        .set<TextRenderable>({type_label, "JetBrainsMono", 12.0f, 0x9c9c9cFF})
+                        .set<ZIndex>({13});
+                }
+                return row;
+            };
+
             for (flecs::entity e : panels) {
                 LexiconPanel& panel = e.ensure<LexiconPanel>();
-                if (panel.shown == word) continue;
+                if (panel.shown == word && !panel.dirty) continue;
                 if (!panel.glyph_row.is_valid() || !panel.glyph_row.is_alive()) continue;
+
+                // A new word resets the paradigm to its surface row. Char
+                // mode survives the move -- arrowing the sentence while
+                // descended sweeps word to word with the cursor landing on
+                // each word's last character, ready for suffix work.
+                if (panel.shown != word) {
+                    panel.row = 0;
+                    panel.typing_type = false;
+                    panel.prefilled = false;
+                    panel.forms.clear();
+                    if (!word.empty()) {
+                        std::string chars;
+                        for (char c : word)
+                            if (!std::isspace(static_cast<unsigned char>(c))) chars += c;
+                        panel.forms.push_back({chars, std::string()});
+                        panel.sel_start = panel.sel_end =
+                            std::max(0, (int)chars.size() - 1);
+                    } else {
+                        panel.selecting = false;
+                    }
+                }
+
+                // The transducer's proposal pre-fills the paradigm once per
+                // word -- but ONLY while the paradigm is untouched. The reply
+                // is asynchronous and can land seconds late; a proposal must
+                // never overwrite an annotation the user has already made.
+                // The empty type on the surface row is the untouched test.
+                if (!panel.prefilled && panel.forms.size() == 1
+                    && panel.forms[0].type.empty()) {
+                    std::string lowered = panel.forms[0].text;
+                    for (char& c : lowered) c = std::tolower(static_cast<unsigned char>(c));
+                    if (!lowered.empty() && g_fst_proposal.word == lowered) {
+                        // An ambiguous form (pants) is ONE node with an OR
+                        // of types; a paired form gets its variant as a
+                        // proposed second row; a typed-but-unpaired form gets
+                        // its type and nothing else.
+                        if (g_fst_proposal.variant == panel.forms[0].text) {
+                            panel.forms[0].type = g_fst_proposal.word_type + " or "
+                                                + g_fst_proposal.variant_type;
+                        } else {
+                            panel.forms[0].type = g_fst_proposal.word_type;
+                            if (!g_fst_proposal.variant.empty()) {
+                                LexiconForm variant;
+                                variant.text = g_fst_proposal.variant;
+                                variant.type = g_fst_proposal.variant_type;
+                                variant.proposed = true;
+                                panel.forms.push_back(variant);
+                            }
+                        }
+                        panel.prefilled = true;
+                    }
+                }
 
                 std::vector<flecs::entity> stale;
                 panel.glyph_row.children([&stale](flecs::entity c) { stale.push_back(c); });
                 for (flecs::entity c : stale) c.destruct();
 
-                // One glyph per character, each tinted with the letter's own
-                // identity colour -- both 'o's in "robots" match, and 'o' is
-                // that colour in every word. The word-level entity tint is
-                // dropped here on purpose: this panel is about the characters
-                // as entities, not the word's referent.
-                for (char c : word) {
-                    if (std::isspace(static_cast<unsigned char>(c))) continue;
-                    create_letter_chip(panel.glyph_row, std::string(1, c), letter_color(c));
+                for (int fi = 0; fi < (int)panel.forms.size(); fi++) {
+                    const LexiconForm& form = panel.forms[fi];
+                    bool selected_row = panel.selecting && fi == panel.row;
+                    int lo = selected_row ? std::min(panel.sel_start, panel.sel_end) : -1;
+                    int hi = selected_row ? std::max(panel.sel_start, panel.sel_end) : -1;
+                    flecs::entity row_entity =
+                        build_row(panel.glyph_row, form.text, lo, hi, nullptr);
+
+                    // The annotation is a badge, because the type is an entity
+                    // -- same visual grammar as every other entity in the
+                    // system, identity colour included. While the type is
+                    // being typed, the badge grows with a cursor.
+                    bool typing_here = panel.typing_type && selected_row;
+                    if (!form.type.empty() || typing_here) {
+                        // Typed naturally: "Plural or Singular". Space-separated
+                        // tokens; the word "or" between type names renders as
+                        // the OR glyph, every other token as a type badge.
+                        std::vector<std::string> tokens;
+                        std::string current;
+                        for (char c : form.type) {
+                            if (c == ' ') {
+                                if (!current.empty()) tokens.push_back(current);
+                                current.clear();
+                            } else current += c;
+                        }
+                        if (!current.empty()) tokens.push_back(current);
+
+                        auto is_operator = [](const std::string& token) {
+                            std::string lower;
+                            for (char c : token)
+                                lower += (char)std::tolower(static_cast<unsigned char>(c));
+                            return lower == "or";   // surface word -> Or entity
+                        };
+                        bool first = true;
+                        for (const std::string& token : tokens) {
+                            if (is_operator(token)) {
+                                // The operator is an entity like everything
+                                // else, so it renders as its badge: outlined
+                                // (an operator is structure), in the Or
+                                // entity's own identity colour.
+                                create_badge_impl(row_entity, UIElement, "or",
+                                                  entity_type_color("Or"),
+                                                  false, false, {}, {}, {}, {},
+                                                  nullptr, BadgeStyle::String)
+                                    .set<UIMargin>({0.0f, 0.0f, 0.0f, 4.0f});
+                                continue;
+                            }
+                            create_badge(row_entity, UIElement, token.c_str(),
+                                         entity_type_color(token))
+                                .set<UIMargin>({0.0f, 0.0f, 0.0f, first ? 8.0f : 4.0f});
+                            first = false;
+                        }
+                        if (typing_here) {
+                            world->entity()
+                                .is_a(UIElement)
+                                .child_of(row_entity)
+                                .add<UIYoga>()
+                                .set<UIMargin>({0.0f, 0.0f, 0.0f, 2.0f})
+                                .set<TextRenderable>({"|", "JetBrainsMono",
+                                                      16.0f, 0xFFFFFFFF})
+                                .set<ZIndex>({14});
+                        }
+                    }
                 }
+                if (panel.prefilled) {
+                    world->entity()
+                        .is_a(UIElement)
+                        .child_of(panel.glyph_row)
+                        .add<UIYoga>()
+                        .set<TextRenderable>({"FST  " + g_fst_proposal.rule + "  "
+                                              + std::to_string((int)(g_fst_proposal.confidence * 100.0f))
+                                              + "%",
+                                              "JetBrainsMono", 11.0f, 0x4d6d8aFF})
+                        .set<ZIndex>({13});
+                }
+
                 panel.shown = word;
+                panel.dirty = false;
             }
         });
 
