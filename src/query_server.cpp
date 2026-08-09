@@ -13,6 +13,7 @@
 #include <signal.h>
 #include <setjmp.h>
 #include <vector>
+#include <ctime>
 #include <algorithm>
 #include <unordered_map>
 #include <cfloat>
@@ -51,6 +52,14 @@ struct EntityText {
     std::string value;
 };
 
+// When an entity was created, as seconds since the epoch. Stored as a number
+// because that is what it is -- an instant, comparable and sortable. Turning it
+// into something a person wants to read is the display layer's job, not this
+// one's, so nothing here formats it.
+struct EntityCreatedAt {
+    double time;
+};
+
 // create <Type> <text...>
 //
 // Everything after the type name is the text, spaces included, so no quoting or
@@ -87,6 +96,7 @@ static bool handle_create(int client_socket, const char* request) {
     flecs::entity created = g_world->entity();
     created.add(type);
     created.set<EntityText>({std::string(text)});
+    created.set<EntityCreatedAt>({(double)std::time(nullptr)});
 
     snprintf(response, sizeof(response),
              "{\"status\": \"OK\", \"id\": %llu}\n",
@@ -178,6 +188,7 @@ void initialize(flecs::world* world, spatial::SpatialIndexManager* spatial_index
     // Reflection metadata, so a created entity's text round-trips through
     // to_json() like any component the host declared itself.
     world->component<EntityText>("Text").member<std::string>("value");
+    world->component<EntityCreatedAt>("CreatedAt").member<double>("time");
 }
 
 // Register component serializer

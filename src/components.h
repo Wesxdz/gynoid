@@ -431,6 +431,31 @@ struct SendChatMessage {};
 // each other. The badge entity itself is the block; this is its slot.
 struct BadgeContent {
     flecs::entity row;
+    // The label inside that row. Carried rather than searched for: code that
+    // re-cuts a badge needs to measure the label, and scanning the row for "the
+    // first child with text" silently finds nothing the moment the internals
+    // change shape.
+    flecs::entity label;
+};
+
+// The Lexicon panel: shows the word currently selected in the annotator as a
+// strip of character glyphs -- the subword representation the neurosymbolic
+// rule layers will operate over. `shown` is what the strip currently renders,
+// so the panel only rebuilds when the selection actually moves to a new word.
+struct LexiconPanel {
+    flecs::entity glyph_row;
+    std::string shown;
+};
+
+// A co-reference arc in the annotated sentence: the same symbol appearing in
+// two places -- an entity badge and a relationship slot bound to it -- drawn as
+// a curve between them, the way dependency parses draw them. The arc stores
+// which two UI entities it connects; a system re-derives the curve geometry
+// from their bounds every frame, so the arc follows layout instead of being
+// baked to positions that a wrap or resize would orphan.
+struct CorefArc {
+    flecs::entity from;   // the anchor: entity badge or reified block
+    flecs::entity to;     // the referring slot glyph
 };
 
 // Backs one row of the Entities panel. The badge entity is a presentation
@@ -767,6 +792,7 @@ enum class EditorType
     SceneGraph,
     DataFusion,
     Entities,
+    Lexicon,
     // SystemNavigator,
 
     // Bookshelf,

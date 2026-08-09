@@ -482,7 +482,9 @@ struct KnownEntity {
 enum class TokenType {
     PlainText,       // Regular word
     Entity,          // {{text, n}} - entity binding
-    Relationship     // {{text, R:src:tgt}} - relationship with source/target digits
+    Relationship,    // {{text, R:src:tgt}} - relationship with source/target digits
+    Concept,         // [[Qn - opens a comprehension frame; members follow unchanged
+    ConceptEnd       // ]] - closes the frame
 };
 
 // Binding type for relationship slots
@@ -508,6 +510,67 @@ struct SentenceToken {
         return type == TokenType::Relationship ? 3 : 1;
     }
 };
+
+// A relationship "joins" an adjacent entity whose symbol matches one of its
+// slots: the entity's badge renders inside the block, and -- because badge and
+// slot are then the same thing -- they collapse to a single selection stop.
+// One definition, consumed by rendering and by every key handler, because the
+// selection index space is derived from these widths; two opinions about what
+// joined means would desynchronise the arrow keys from the screen.
+static bool relationship_src_joined(const std::vector<SentenceToken>& tokens, size_t rel) {
+    return rel > 0
+        && tokens[rel].type == TokenType::Relationship
+        && tokens[rel - 1].type == TokenType::Entity
+        && !tokens[rel - 1].binding_symbol.empty()
+        && tokens[rel].source_symbol == tokens[rel - 1].binding_symbol;
+}
+
+static bool relationship_tgt_joined(const std::vector<SentenceToken>& tokens, size_t rel) {
+    return rel + 1 < tokens.size()
+        && tokens[rel].type == TokenType::Relationship
+        && tokens[rel + 1].type == TokenType::Entity
+        && !tokens[rel + 1].binding_symbol.empty()
+        && tokens[rel].target_symbol == tokens[rel + 1].binding_symbol;
+}
+
+// Selection stops this token contributes: a relationship loses one stop per
+// joined side, since the joined badge is counted by its own entity token.
+// Every symbol in use across the sentence: entity bindings, relationship
+// slots, reified triples, and concept frames. One pool, one collector --
+// entities, reified particulars and concepts share the digit space so any of
+// them can be bound into a relationship slot or referenced by symbol, and
+// split scans would hand two of them the same digit.
+static std::set<std::string> collect_used_symbols(const std::vector<SentenceToken>& tokens) {
+    std::set<std::string> used;
+    for (const auto& tok : tokens) {
+        if (!tok.binding_symbol.empty()) used.insert(tok.binding_symbol);
+        if (!tok.source_symbol.empty()) used.insert(tok.source_symbol);
+        if (!tok.target_symbol.empty()) used.insert(tok.target_symbol);
+        if (!tok.reified_symbol.empty()) used.insert(tok.reified_symbol);
+    }
+    return used;
+}
+
+static int token_selection_width(const std::vector<SentenceToken>& tokens, size_t i) {
+    if (tokens[i].type == TokenType::ConceptEnd) return 0;
+    int width = tokens[i].selection_width();
+    if (tokens[i].type == TokenType::Relationship) {
+        if (relationship_src_joined(tokens, i)) width--;
+        if (relationship_tgt_joined(tokens, i)) width--;
+    }
+    return width;
+}
+
+// Which roles (0=source, 1=whole triple, 2=target) a relationship's remaining
+// stops map to, in order. Handlers translate a sub-part index through this
+// rather than assuming the un-joined 0/1/2 layout.
+static std::vector<int> relationship_slot_roles(const std::vector<SentenceToken>& tokens, size_t rel) {
+    std::vector<int> roles;
+    if (!relationship_src_joined(tokens, rel)) roles.push_back(0);
+    roles.push_back(1);
+    if (!relationship_tgt_joined(tokens, rel)) roles.push_back(2);
+    return roles;
+}
 
 // TODO: Automatically register from create badge?
 // Cache for entity colors (binding_symbol -> color)
@@ -615,6 +678,32 @@ std::vector<SentenceToken> parse_sentence_template(const std::string& sentence) 
         while (i < sentence.size() && std::isspace(sentence[i])) i++;
         if (i >= sentence.size()) break;
 
+        // Comprehension frame markers travel as bare words in the template:
+        // "[[Q0" opens a frame, "]]" closes it. Members between them are
+        // ordinary tokens, bindings intact -- the frame contains, never absorbs.
+        if (sentence.compare(i, 3, "[[Q") == 0) {
+            size_t end = i + 3;
+            while (end < sentence.size() && !std::isspace(sentence[end])) end++;
+            std::string spec = sentence.substr(i + 3, end - i - 3);
+            // "Qi:e" -- i is the intension's id, e the extension set's. Both are
+            // entities; the extension id lives in reified_symbol, which is
+            // semantically exact: the output set is the reified query result.
+            std::string intension = spec, extension = "";
+            size_t colon = spec.find(':');
+            if (colon != std::string::npos) {
+                intension = spec.substr(0, colon);
+                extension = spec.substr(colon + 1);
+            }
+            tokens.push_back({"", intension, "", "", extension, TokenType::Concept});
+            i = end;
+            continue;
+        }
+        if (sentence.compare(i, 2, "]]") == 0) {
+            tokens.push_back({"", "", "", "", "", TokenType::ConceptEnd});
+            i += 2;
+            continue;
+        }
+
         // Check for binding {{text, spec}}
         if (i + 1 < sentence.size() && sentence[i] == '{' && sentence[i+1] == '{') {
             size_t start = i + 2;
@@ -641,7 +730,11 @@ std::vector<SentenceToken> parse_sentence_template(const std::string& sentence) 
 
                     if (!spec.empty()) {
                         char prefix = spec[0];
-                        if (prefix == 'R' || prefix == 'r') {
+                        if (prefix == 'Q' && spec.size() >= 2) {
+                            type = TokenType::Concept;
+                            bind_str = spec.substr(1);
+                        }
+                        else if (prefix == 'R' || prefix == 'r') {
                             type = TokenType::Relationship;
                             // Check for reified format: R (src:tgt)reified
                             size_t paren_open = spec.find('(');
@@ -704,6 +797,15 @@ std::string tokens_to_template(const std::vector<SentenceToken>& tokens) {
     std::string result;
     for (size_t i = 0; i < tokens.size(); i++) {
         if (i > 0) result += " ";
+        if (tokens[i].type == TokenType::Concept) {
+            result += "[[Q" + tokens[i].binding_symbol;
+            if (!tokens[i].reified_symbol.empty()) result += ":" + tokens[i].reified_symbol;
+            continue;
+        }
+        if (tokens[i].type == TokenType::ConceptEnd) {
+            result += "]]";
+            continue;
+        }
         if (tokens[i].is_binding()) {
             std::string spec;
             switch (tokens[i].type) {
@@ -1910,10 +2012,31 @@ static std::string ellipsize_text(const std::string& text, const char* font_face
 // top and bottom, so the inner block reads as contained rather than as exactly
 // filling its parent.
 static constexpr float BADGE_HEIGHT = 25.0f;
+
+// Alpha for badge sprites. The sprite's black ground should read as a
+// semitransparent darkening of the badge fill underneath -- the surface
+// showing through is what makes the glyph look inset rather than pasted.
+// Full alpha lands it as a harsh opaque black square.
+static constexpr unsigned char BADGE_SPRITE_ALPHA = 0xC6;
+
+// Extra opacity for sprites on bright badges, scaled by the tint's luminance.
+// A fixed alpha reads weaker on light fills -- the brighter the surface, the
+// more visible the bleed-through -- so Wesley's cyan and Heonae's pink need a
+// darker ground than a navy badge to look equally inset.
+static constexpr float BADGE_SPRITE_ALPHA_BOOST = 0x32;
 static constexpr float BADGE_NEST_PAD = 4.0f;
 
 // Space between a relation's label and the block nested beside it.
 static constexpr float BADGE_NEST_GAP = 6.0f;
+
+// The reification marker rides above the predicate, so it is drawn smaller
+// than the source and target glyphs flanking it.
+static constexpr float TRIPLE_REIFIED_SCALE = 0.6f;
+
+// Height the reified node used to occupy in-flow. Kept as top padding when the
+// node moves out of flow to straddle the border, so the block's size increase
+// on reification is unchanged.
+static constexpr float TRIPLE_NODE_HEIGHT = 15.0f;
 
 // Horizontal padding a badge's content row reserves (xPad on each side).
 static constexpr float BADGE_LONGFORM_INSET = 12.0f;
@@ -1926,6 +2049,47 @@ static constexpr float BADGE_ARROW_TIP = 12.0f;
 // Ceiling on a badge label's rendered width. Past this the label is ellipsized,
 // so no badge can grow without bound and shove its neighbours off the panel.
 static constexpr float BADGE_MAX_TEXT_WIDTH = 190.0f;
+
+// The comprehension frame's shape: a trapezoid, top edge inset so the sides
+// slope outward -- a pedestal the members stand in, star hovering above the
+// narrow top. Sharp corners on purpose: every other container is rounded, so
+// the silhouette alone says "query". Stroke mode runs the member gradient
+// horizontally, first member's colour to last's; fill mode is the dark ground.
+static constexpr float CONCEPT_TRAPEZOID_INSET = 12.0f;
+
+// How far the star+id stack rises above the frame's top edge (39px star +
+// ~25px digit, less the overlap that keeps its foot on the border).
+static constexpr float CONCEPT_MARKER_RISE = 29.0f;
+
+void draw_concept_trapezoid(NVGcontext* vg, const RenderCommand* cmd, const CustomRenderable& data)
+{
+    const float x = cmd->pos.x;
+    const float y = cmd->pos.y;
+    const float w = data.width;
+    const float h = data.height;
+    if (w <= 0.0f || h <= 0.0f) return;
+
+    const float inset = std::min(CONCEPT_TRAPEZOID_INSET, w * 0.25f);
+
+    nvgBeginPath(vg);
+    nvgMoveTo(vg, x + inset, y);
+    nvgLineTo(vg, x + w - inset, y);
+    nvgLineTo(vg, x + w, y + h);
+    nvgLineTo(vg, x, y + h);
+    nvgClosePath(vg);
+
+    if (data.stroke) {
+        uint32_t start = data.gradient_start ? data.gradient_start : data.color;
+        uint32_t end   = data.gradient_end   ? data.gradient_end   : data.color;
+        nvgStrokePaint(vg, nvgLinearGradient(vg, x, y, x + w, y,
+                                             uintToNvgColor(start), uintToNvgColor(end)));
+        nvgStrokeWidth(vg, 1.5f);
+        nvgStroke(vg);
+    } else {
+        nvgFillColor(vg, uintToNvgColor(data.color));
+        nvgFill(vg);
+    }
+}
 
 void draw_double_arrow(NVGcontext* vg, const RenderCommand* cmd, const CustomRenderable& data)
 {
@@ -1998,17 +2162,28 @@ void draw_double_arrow(NVGcontext* vg, const RenderCommand* cmd, const CustomRen
 // `preserve_case` keeps a lowercase glyph lowercase. Off by default because
 // binding symbols are written lowercase but have always drawn as capitals; the
 // sprite-font path turns it on, since there a string's own casing is the point.
-flecs::entity create_slot_image(flecs::entity parent_entity, const std::string& symbol, uint32_t tint, bool yoga = false, bool preserve_case = false) {
+flecs::entity create_slot_image(flecs::entity parent_entity, const std::string& symbol, uint32_t tint, bool yoga = false, bool preserve_case = false, float scale = 0.9f) {
     auto UIElement = world->lookup("UIElement");
     uint32_t tint_color = scale_color(tint, 1.3f);
     unsigned char r = (tint_color >> 24) & 0xFF;
     unsigned char g = (tint_color >> 16) & 0xFF;
     unsigned char b = (tint_color >> 8) & 0xFF;
-    unsigned char a = (tint_color) & 0xFF;
+    // The alpha multiplies the whole sprite in the image pattern, ground
+    // included -- this is where the overlay stops being opaque black. Scaled
+    // up with the tint's luminance so light badges get an equally dark inset.
+    float lum = (0.299f * ((tint >> 24) & 0xFF)
+               + 0.587f * ((tint >> 16) & 0xFF)
+               + 0.114f * ((tint >> 8) & 0xFF)) / 255.0f;
+    unsigned char a = (unsigned char)std::min(248.0f,
+        BADGE_SPRITE_ALPHA + lum * BADGE_SPRITE_ALPHA_BOOST);
 
     std::string image_path;
-    if (symbol == "*") {
-        // Wildcard - use wildcard.png
+    if (symbol.empty() || symbol == "*") {
+        // Unbound, or explicitly a wildcard -- both mean "any entity", and an
+        // unbound slot is the normal state of a relationship the moment it is
+        // created. Without this the path becomes "letter_sets/set_01/.png",
+        // which fails to load and leaves the slot invisible rather than showing
+        // that there is something here to bind.
         image_path = "wildcard.png";
     }
     else if (symbol == "checkbox")
@@ -2031,7 +2206,7 @@ flecs::entity create_slot_image(flecs::entity parent_entity, const std::string& 
     flecs::entity slot = world->entity()
         .is_a(UIElement)
         .child_of(parent_entity)
-        .set<ImageCreator>({image_path, 0.9f, 0.9f, nvgRGBA(r, g, b, a)})
+        .set<ImageCreator>({image_path, scale, scale, nvgRGBA(r, g, b, a)})
         .set<ZIndex>({25});
 
     if (yoga) {
@@ -2043,6 +2218,83 @@ flecs::entity create_slot_image(flecs::entity parent_entity, const std::string& 
 
     return slot;
 };
+
+// A single character as a chip: the badge recipe at glyph scale. Vertical
+// gradient in the given colour with the sprite on top, so the sprite's own
+// black ground reads as a darker inset region of the chip -- the depth the
+// entity badges get for free -- instead of vanishing into a dark panel.
+flecs::entity create_letter_chip(flecs::entity parent, const std::string& symbol, uint32_t color)
+{
+    auto UIElement = world->lookup("UIElement");
+    auto chip = world->entity()
+        .is_a(UIElement)
+        .child_of(parent)
+        .add(flecs::OrderedChildren)
+        .add<UIYoga>()
+        .set<UIFlexContainer>({YGFlexDirectionRow, YGWrapNoWrap,
+                               YGJustifyCenter, YGAlignCenter, 0.0f})
+        .set<UIPadding>({2.0f, 2.0f, 2.0f, 2.0f})
+        .set<RoundedRectRenderable>({0.0f, 0.0f, 4.0f, false, 0x000000FF})
+        .set<RenderGradient>({color, scale_color(color, 0.2f)})
+        .set<ZIndex>({11});
+
+    // EMNIST has no punctuation classes, so those glyphs are hand-drawn --
+    // assets/punctuation, made with scripts/draw_punctuation.py against the
+    // family's own sprites as reference. The name table is the contract with
+    // that script: filenames are names because '?' cannot be one. Marks
+    // without a sprite fall back to a typeset glyph rather than vanishing --
+    // the apostrophe in a genitive is a morpheme, and losing it is data loss.
+    if (!symbol.empty() && !std::isalnum(static_cast<unsigned char>(symbol[0]))) {
+        static const std::unordered_map<char, const char*> punct_names = {
+            {'\'', "apostrophe"}, {'-', "hyphen"},    {'.', "period"},
+            {',', "comma"},       {'?', "question"},  {'!', "exclaim"},
+            {':', "colon"},       {';', "semicolon"}, {'"', "quote"},
+            {'(', "lparen"},      {')', "rparen"},    {'&', "ampersand"},
+            {'/', "slash"},       {'@', "at"},        {'#', "hash"},
+            {'%', "percent"},     {'+', "plus"},      {'=', "equals"},
+            {'_', "underscore"},  {'~', "tilde"},
+        };
+        auto named = punct_names.find(symbol[0]);
+        if (named != punct_names.end()) {
+            std::string rel = std::string("punctuation/set_01/") + named->second + ".png";
+            // Checked once per mark: a missing sprite means the set is
+            // incomplete, and the typeset fallback below covers it.
+            static std::unordered_map<char, bool> sprite_exists;
+            auto cached = sprite_exists.find(symbol[0]);
+            bool exists = (cached != sprite_exists.end())
+                ? cached->second
+                : (sprite_exists[symbol[0]] =
+                       std::filesystem::exists("../assets/" + rel));
+            if (exists) {
+                uint32_t tinted = scale_color(color, 1.3f);
+                world->entity()
+                    .is_a(UIElement)
+                    .child_of(chip)
+                    .add<UIYoga>()
+                    .add<UINativeImageSize>()
+                    .set<ImageCreator>({rel, 0.9f, 0.9f,
+                                        nvgRGBA((tinted >> 24) & 0xFF,
+                                                (tinted >> 16) & 0xFF,
+                                                (tinted >> 8) & 0xFF,
+                                                BADGE_SPRITE_ALPHA)})
+                    .set<ZIndex>({25});
+                return chip;
+            }
+        }
+
+        world->entity()
+            .is_a(UIElement)
+            .child_of(chip)
+            .add<UIYoga>()
+            .set<UISize>({14.0f, YGUndefined})
+            .set<TextRenderable>({symbol, "CharisSIL", 18.0f, 0xFFFFFFFF})
+            .set<ZIndex>({25});
+        return chip;
+    }
+
+    create_slot_image(chip, symbol, color, true, true);
+    return chip;
+}
 
 // Renders a string as a run of sprite-sheet glyphs -- a sprite font, one image
 // entity per character, flowed by whatever row the caller passes as parent.
@@ -2056,47 +2308,11 @@ void create_sprite_text(flecs::entity parent, const std::string& text, uint32_t 
 {
     for (char c : text) {
         unsigned char uc = static_cast<unsigned char>(c);
-        if (!std::isalnum(uc)) continue;
-        create_slot_image(parent, std::string(1, c), tint, yoga, true);
+        if (std::isspace(uc)) continue;
+        create_letter_chip(parent, std::string(1, c), tint);
     }
 }
 
-void create_triple_block(flecs::entity parent, const SentenceToken& token) {
-    auto UIElement = world->lookup("UIElement");
-    
-    // 1. Create the outer bridge (The Double-Arrow container)
-    // We average the colors of the source and target for the outline
-    uint32_t src_color = get_entity_color(token.source_symbol, ""); 
-    uint32_t tgt_color = get_entity_color(token.target_symbol, "");
-    uint32_t bridge_color = (scale_color(src_color, 0.5f) & 0xFFFFFF00) | (scale_color(tgt_color, 0.5f) & 0xFFFFFF00) | 0xFF;
-
-    // UIYoga + UIYogaLegacyLeaf: the internals below stay on the calibrated
-    // legacy layout; Yoga only positions the bridge within its parent row.
-    flecs::entity bridge = world->entity()
-        .is_a(UIElement)
-        .child_of(parent)
-        .add<UIYoga>()
-        .add<UIYogaLegacyLeaf>()
-        .set<CustomRenderable>({100.0f, 25.0f, true, bridge_color, 0, 0, draw_double_arrow})
-        .set<UIContainer>({12, 0}) // Space for the arrow tips
-        .set<ZIndex>({20});
-
-    // 2. Create the internal horizontal layout
-    auto content = world->entity()
-        .is_a(UIElement)
-        .child_of(bridge)
-        .set<LayoutBox>({LayoutBox::Horizontal, 2.0f})
-        .add(flecs::OrderedChildren);
-
-    // 3. Add the three parts of the triple
-    create_slot_image(content, token.source_symbol, src_color); // Subject
-
-    world->entity().is_a(UIElement).child_of(content) // Predicate Text
-        .set<TextRenderable>({token.text, "CharisSIL", 16.0f, 0xFFFFFFFF})
-        .set<ZIndex>({25});
-
-    create_slot_image(content, token.target_symbol, tgt_color); // Object
-}
 
 // What a badge is standing for, which decides how it is drawn.
 //
@@ -2159,6 +2375,296 @@ flecs::entity create_badge_impl(flecs::entity parent, flecs::entity UIElement,
                            const std::vector<uint32_t>& postfix_tints,
                            flecs::entity* out_content = nullptr,
                            BadgeStyle style = BadgeStyle::Symbol);
+
+// A relationship token: source glyph, predicate, target glyph inside one arrow
+// block -- and, when the relationship is reified, a 3d-node marker and the
+// reified entity's own glyph stacked above the predicate.
+//
+// Rebuilt on the badge path rather than the legacy LayoutBox/UIContainer
+// pipeline it used to use. That pipeline runs at PostLoad, a phase *after*
+// Yoga's, so the block was placed from a size computed on the previous frame --
+// and on the frame it first appeared there was no previous size at all, leaving
+// it at its 100x25 placeholder wherever stale layout had put it.
+//
+// The reification marker is the point of the widget: it is how a relationship
+// becomes an entity in its own right, so it has to be visible on the
+// relationship rather than hidden behind a selection.
+// `joined_src` / `joined_tgt` are entity tokens adjacent to this relationship
+// in the sentence whose symbols match its slots. Their full badges render
+// *inside* the block -- the entity visually joins the relationship -- instead
+// of a standalone badge next to a sprite repeating the same symbol.
+flecs::entity create_triple_block(flecs::entity parent, const SentenceToken& token,
+                                  flecs::entity* out_content = nullptr,
+                                  const SentenceToken* joined_src = nullptr,
+                                  const SentenceToken* joined_tgt = nullptr) {
+    auto UIElement = world->lookup("UIElement");
+
+    // The bridge takes a colour from both ends, since it belongs to neither.
+    uint32_t src_color = get_entity_color(token.source_symbol, "");
+    uint32_t tgt_color = get_entity_color(token.target_symbol, "");
+    uint32_t bridge_color = (scale_color(src_color, 0.5f) & 0xFFFFFF00)
+                          | (scale_color(tgt_color, 0.5f) & 0xFFFFFF00) | 0xFF;
+
+    // Outlined: a relationship frames the two things it relates, and a filled
+    // gradient would compete with the glyphs sitting inside it.
+    flecs::entity content = flecs::entity::null();
+    flecs::entity block = create_badge_impl(parent, UIElement, "", bridge_color,
+                                            false, true, {}, {}, {}, {},
+                                            &content, BadgeStyle::String);
+    if (!content.is_valid()) return block;
+
+    // create_badge_impl seeds the row with its own label; this widget lays out
+    // its three parts itself, so the placeholder goes.
+    std::vector<flecs::entity> seeded;
+    content.children([&seeded](flecs::entity child) { seeded.push_back(child); });
+    for (flecs::entity child : seeded) child.destruct();
+
+    // A full set, not ensure-and-mutate. Under deferral, ensure() on a
+    // component whose own set is still queued hands back a default-constructed
+    // payload -- and UIFlexContainer's default direction is Column, which is
+    // how a relationship block ends up stacking its parts vertically. A
+    // complete set states every field, so whichever order commands land in,
+    // the final value is this one.
+    content.set<UIFlexContainer>({YGFlexDirectionRow, YGWrapNoWrap,
+                                  YGJustifyFlexStart, YGAlignCenter, 2.0f});
+
+    if (joined_src) {
+        create_badge_impl(content, UIElement, joined_src->text.c_str(), src_color,
+                          false, false, {}, {},
+                          {joined_src->binding_symbol}, {src_color});
+    } else {
+        create_slot_image(content, token.source_symbol, src_color, true);
+    }
+
+    // A reified block has two storeys -- the marker row above the predicate --
+    // so its height must come from the content rather than the calibrated
+    // single-line 25px, or the marker draws outside the arrow. The vertical
+    // padding keeps the top storey off the arrow's edge.
+    if (!token.reified_symbol.empty()) {
+        block.ensure<UISize>().h = YGUndefined;
+        // The node no longer sits in the centre column's flow, so its height
+        // is held open as padding -- same total growth as before, with the
+        // upper storey now empty space the straddling node overlaps.
+        block.set<UIPadding>({BADGE_NEST_PAD + TRIPLE_NODE_HEIGHT, 0.0f,
+                              BADGE_NEST_PAD, 0.0f});
+
+        // The src/tgt sprites keep the digit-and-predicate row's baseline
+        // rather than centring against both storeys -- only the 3d-node lives
+        // on the upper storey, so centring would float the sprites between
+        // lines that don't exist.
+        content.set<UIFlexContainer>({YGFlexDirectionRow, YGWrapNoWrap,
+                                      YGJustifyFlexStart, YGAlignFlexEnd, 2.0f});
+    }
+
+    // The centre is always a column, reified or not. Collapsing to a plain row
+    // when there is no marker would move the predicate every time reification
+    // is toggled, and the slot the marker occupies has to already be there for
+    // the block's geometry to stay put.
+    flecs::entity centre = world->entity()
+        .is_a(UIElement)
+        .child_of(content)
+        .add(flecs::OrderedChildren)
+        .add<UIYoga>()
+        .set<UIFlexContainer>({YGFlexDirectionColumn, YGWrapNoWrap,
+                               YGJustifyCenter, YGAlignCenter, 0.0f});
+
+    // Reified: the 3d-node rides alone above, and the assigned MNIST digit sits
+    // inline in front of the predicate -- the digit reads as part of naming the
+    // relationship, the node as the mark that it has become a thing.
+    flecs::entity label_parent = centre;
+    if (!token.reified_symbol.empty()) {
+        // Tinted with the reified entity's own colour when it has one, so the
+        // marker reads as that entity rather than as decoration.
+        uint32_t reified_color = 0xFFFFFFFF;
+        auto cached = entity_color_cache.find(token.reified_symbol);
+        if (cached != entity_color_cache.end()) reified_color = cached->second;
+
+        // Straddles the block's upper line at its horizontal midpoint: an
+        // absolute strip pinned across the top edge, shifted up by half the
+        // node's height, centring the node within it. Absolute, so the block's
+        // measured size never includes it -- the growth is all padding.
+        auto node_strip = world->entity()
+            .is_a(UIElement)
+            .child_of(block)
+            .add(flecs::OrderedChildren)
+            .add<UIYoga>()
+            .set<UIAbsoluteEdges>({0.0f, -TRIPLE_NODE_HEIGHT * 0.5f, 0.0f, YGUndefined})
+            .set<UIFlexContainer>({YGFlexDirectionRow, YGWrapNoWrap,
+                                   YGJustifyCenter, YGAlignFlexStart, 0.0f});
+
+        world->entity()
+            .is_a(UIElement)
+            .child_of(node_strip)
+            .add<UIYoga>()
+            .add<UINativeImageSize>()
+            .set<ImageCreator>({"3d_node.png", TRIPLE_REIFIED_SCALE, TRIPLE_REIFIED_SCALE,
+                                uintToNvgColor(reified_color)})
+            .set<ZIndex>({26});
+
+        label_parent = world->entity()
+            .is_a(UIElement)
+            .child_of(centre)
+            .add(flecs::OrderedChildren)
+            .add<UIYoga>()
+            .set<UIFlexContainer>({YGFlexDirectionRow, YGWrapNoWrap,
+                                   YGJustifyCenter, YGAlignCenter, 2.0f});
+
+        // Full size, unlike the node above it: the digit is the entity's
+        // glyph, the same rank as the src/tgt sprites beside it.
+        create_slot_image(label_parent, token.reified_symbol, reified_color, true);
+    }
+
+    // Same treatment a badge gives its own label: the 1.2 y-scale and the
+    // white-to-tint gradient. The predicate is a label like any other, and
+    // without these it reads as flatter, smaller text sitting inside a badge
+    // rather than as the badge's own word.
+    flecs::entity label = world->entity()
+        .is_a(UIElement)
+        .child_of(label_parent)
+        .add<UIYoga>()
+        .set<TextRenderable>({token.text, "CharisSIL", 16.0f, 0xFFFFFFFF, 1.2f})
+        .set<RenderGradient>({0xFFFFFFFF, scale_color(bridge_color, 1.3f)})
+        .set<ZIndex>({25});
+
+    if (joined_tgt) {
+        create_badge_impl(content, UIElement, joined_tgt->text.c_str(), tgt_color,
+                          false, false, {}, {},
+                          {joined_tgt->binding_symbol}, {tgt_color});
+    } else {
+        create_slot_image(content, token.target_symbol, tgt_color, true);
+    }
+
+    block.set<BadgeContent>({content, label});
+
+    // The whole reason the caller passes this in: the selection map is built
+    // from the content row's children. create_badge_impl wrote the *seeded* row
+    // into it earlier in this function, but the row has been rebuilt since --
+    // handing back anything less than the final row leaves the caller's
+    // selection slots falling back to the block, which outlines the full
+    // triple at every index.
+    if (out_content) *out_content = content;
+    return block;
+}
+
+uint32_t entity_type_color(const std::string& name);
+static void badge_becomes_container(flecs::entity block, flecs::entity slot, bool stacked);
+
+// Opens a comprehension frame: an outlined block whose slot the member badges
+// and relationship blocks render into, prefixed by the mag-2 star at native
+// size. The frame contains its members Scratch-style -- they keep their own
+// bindings and renderings; only their parent changes.
+flecs::entity create_concept_frame(flecs::entity parent, const std::string& symbol,
+                                   const std::string& ext_symbol,
+                                   flecs::entity* out_slot,
+                                   flecs::entity* out_outline,
+                                   flecs::entity* out_ext_node)
+{
+    auto UIElement = world->lookup("UIElement");
+    // The symbol's own colour, same lookup the slot glyphs use -- a relationship
+    // slot bound to this concept's digit tints identically to the frame, so the
+    // reference reads by colour before the arc is even drawn.
+    uint32_t color = get_entity_color(symbol, "");
+
+    flecs::entity slot = flecs::entity::null();
+    flecs::entity frame = create_badge_impl(parent, UIElement, "", color,
+                                            false, false, {}, {}, {}, {},
+                                            &slot, BadgeStyle::String);
+    if (!slot.is_valid()) { if (out_slot) *out_slot = slot; return frame; }
+
+    std::vector<flecs::entity> seeded;
+    slot.children([&seeded](flecs::entity child) { seeded.push_back(child); });
+    for (flecs::entity child : seeded) child.destruct();
+
+    // Members can be taller than a single badge line (a reified triple), so
+    // the frame derives its height from what it holds.
+    badge_becomes_container(frame, slot, false);
+
+    // The rounded fill the badge factory supplied doesn't match a trapezoid
+    // outline; the body becomes the trapezoid's own fill.
+    frame.remove<RoundedRectRenderable>();
+    frame.set<CustomRenderable>({0.0f, 0.0f, false, 0x141414E0, 0, 0,
+                                 draw_concept_trapezoid});
+
+    // Star and id stacked above the narrow top, centred at the midpoint, the
+    // stack's foot overlapping the top edge -- same straddle convention as the
+    // reified node. Absolute, so the members' layout never accounts for it.
+    auto marker = world->entity()
+        .is_a(UIElement)
+        .child_of(frame)
+        .add(flecs::OrderedChildren)
+        .add<UIYoga>()
+        .set<UIAbsoluteEdges>({0.0f, -CONCEPT_MARKER_RISE, 0.0f, YGUndefined})
+        // One line, reading order: the intension pair first, the extension
+        // pair to its right -- sense before reference.
+        .set<UIFlexContainer>({YGFlexDirectionRow, YGWrapNoWrap,
+                               YGJustifyCenter, YGAlignCenter, 8.0f});
+
+    // Intension pair, leftmost: the 3d-node marks entity-hood -- the query
+    // itself as a thing, same mark reification gives a triple -- tinted with
+    // the concept's identity colour, beside the intension's id.
+    auto intension_row = world->entity()
+        .is_a(UIElement)
+        .child_of(marker)
+        .add(flecs::OrderedChildren)
+        .add<UIYoga>()
+        .set<UIFlexContainer>({YGFlexDirectionRow, YGWrapNoWrap,
+                               YGJustifyCenter, YGAlignCenter, 2.0f});
+
+    world->entity()
+        .is_a(UIElement)
+        .child_of(intension_row)
+        .add<UIYoga>()
+        .add<UINativeImageSize>()
+        .set<ImageCreator>({"3d_node.png", TRIPLE_REIFIED_SCALE, TRIPLE_REIFIED_SCALE,
+                            uintToNvgColor(scale_color(color, 1.3f))})
+        .set<ZIndex>({26});
+
+    create_slot_image(intension_row, symbol, color, true);
+
+    // Extension pair, to its right: the star is the reference -- it shines
+    // with what falls under the concept in the world. Tint arrives at the
+    // closing marker as the composite of the member colours (the set is made
+    // of what matches them), and magnitude can later carry cardinality.
+    if (!ext_symbol.empty()) {
+        auto extension_row = world->entity()
+            .is_a(UIElement)
+            .child_of(marker)
+            .add(flecs::OrderedChildren)
+            .add<UIYoga>()
+            .set<UIFlexContainer>({YGFlexDirectionRow, YGWrapNoWrap,
+                                   YGJustifyCenter, YGAlignCenter, 2.0f});
+
+        // Star and id share the extension's own colour -- they are one
+        // referent, and matching them is what lets a slot bound to this digit
+        // read back to this star by colour alone.
+        uint32_t ext_color = get_entity_color(ext_symbol, "");
+        flecs::entity star = world->entity()
+            .is_a(UIElement)
+            .child_of(extension_row)
+            .add<UIYoga>()
+            .add<UINativeImageSize>()
+            .set<ImageCreator>({"stellar/mag_2.PNG", 1.0f, 1.0f,
+                                uintToNvgColor(scale_color(ext_color, 1.3f))})
+            .set<ZIndex>({26});
+        if (out_ext_node) *out_ext_node = star;
+
+        create_slot_image(extension_row, ext_symbol, ext_color, true);
+    }
+
+    // Swap the stock flat outline for the gradient stroke. The member colours
+    // aren't known yet -- the span renders after this returns -- so the caller
+    // fills in the gradient stops at the closing marker.
+    frame.children([&](flecs::entity child) {
+        if (!child.has<UIAbsoluteEdges>() || !child.has<RoundedRectRenderable>()) return;
+        uint32_t base = (scale_color(color, 1.3f) & 0xFFFFFF00) | 0xC0;
+        child.remove<RoundedRectRenderable>();
+        child.set<CustomRenderable>({0.0f, 0.0f, true, base, 0, 0, draw_concept_trapezoid});
+        if (out_outline) *out_outline = child;
+    });
+
+    if (out_slot) *out_slot = slot;
+    return frame;
+}
 
 // Backward-compatible overload with single prefix/postfix
 flecs::entity create_badge(flecs::entity parent, flecs::entity UIElement,
@@ -2275,7 +2781,7 @@ flecs::entity create_badge_impl(flecs::entity parent, flecs::entity UIElement,
         // whatever is behind it, but no gradient -- the colour lives in the
         // border instead.
         badge.set<RoundedRectRenderable>({100.0f, badge_height, corner_radius, false,
-                                          outlined ? 0x141414E0 : 0x000000FF});
+                                          outlined ? 0x141414E0u : 0x000000FFu});
 
         // Outline overlay: out of flow, so it tracks the badge's auto width
         // without being measured as content the way the old Expand fill was.
@@ -2383,7 +2889,6 @@ flecs::entity create_badge_impl(flecs::entity parent, flecs::entity UIElement,
 
     // Published for later lookups, and handed straight back for callers nesting
     // something right now.
-    badge.set<BadgeContent>({content});
     if (out_content) *out_content = content;
 
     // Render prefix IDs (sources)
@@ -2403,6 +2908,9 @@ flecs::entity create_badge_impl(flecs::entity parent, flecs::entity UIElement,
     if (!outlined) {
         label.set<RenderGradient>({white, light});
     }
+
+    // Published for later lookups now that both parts exist.
+    badge.set<BadgeContent>({content, label});
 
     // Render postfix IDs (targets)
     render_id_set(content, postfix_ids, postfix_tints);
@@ -2563,7 +3071,8 @@ std::vector<std::string> editor_types =
     "Ontology",
     "Scene Graph",
     "Data Fusion",
-    "Entities"
+    "Entities",
+    "Lexicon"
 };
 
 struct VNCData
@@ -3031,6 +3540,13 @@ flecs::entity create_longform_badge(flecs::entity parent, flecs::entity UIElemen
 // centred against each other with a real gap, and the label's top offset
 // cleared -- that offset is calibrated for a badge that top-aligns its
 // contents, and a container centres them.
+// Re-cuts a container's silhouette so its label sits in a tab across the top.
+//
+// The plain rounded rect is replaced by a tab-shaped path, and the absolutely
+// positioned outline child is re-cut to match, so fill and border stay the same
+// shape. Colours are read back off the badge rather than passed in: they were
+// derived from the base colour inside create_badge_impl, and re-deriving them
+// here would be a second place to keep in step.
 static void badge_becomes_container(flecs::entity block, flecs::entity slot,
                                     bool stacked)
 {
@@ -3061,6 +3577,21 @@ static void badge_becomes_container(flecs::entity block, flecs::entity slot,
 // colouring each differently would imply a distinction that is not there.
 static constexpr uint32_t BADGE_VALUE_COLOR = 0x3f6d8aff;
 
+// Prose gets one neutral grey rather than a per-entity hue. A symbol's colour
+// identifies the thing it names -- Person is always the same colour, which is
+// what makes it recognisable at a glance. A message names nothing, so a unique
+// colour per message would be noise dressed as meaning, and a wall of messages
+// in twenty different hues is harder to read than a wall in one.
+// Note this is the *base*: a string badge's visible border is scale_color(base,
+// 1.3), so the drawn outline lands a step lighter than the value here.
+static constexpr uint32_t BADGE_STRING_COLOR = 0x5c5c5cff;
+
+// A parameter's own box is structure, not identity. Hashing its name to a hue
+// gave every member of every component a different colour, which reads as though
+// the colours mean something -- they don't, and the resulting confetti competes
+// with the component around it and the value inside it. One mid grey instead.
+static constexpr uint32_t BADGE_PARAM_COLOR = 0x707070ff;
+
 // A component rendered as a block holding one block per member, each holding
 // its value: Salary ( amount ( 100000 ) ).
 //
@@ -3072,10 +3603,16 @@ flecs::entity create_component_badge(flecs::entity parent, flecs::entity UIEleme
                                      const std::string& type_name,
                                      const std::vector<std::pair<std::string, std::string>>& members)
 {
+    uint32_t type_color = entity_type_color(type_name);
+
+    // Outlined, not filled: a component with parameters is a frame around its
+    // members, and a gradient fill behind them competes with the badges it
+    // contains. The type's colour moves to a bar along the top instead.
     flecs::entity slot = flecs::entity::null();
     flecs::entity block = create_badge_impl(parent, UIElement, type_name.c_str(),
-                                            entity_type_color(type_name), false, false,
-                                            {}, {}, {}, {}, &slot);
+                                            type_color, false, false,
+                                            {}, {}, {}, {}, &slot,
+                                            BadgeStyle::String);
 
     if (members.empty() || !slot.is_valid()) return block;
 
@@ -3095,10 +3632,12 @@ flecs::entity create_component_badge(flecs::entity parent, flecs::entity UIEleme
             continue;
         }
 
+        uint32_t member_color = BADGE_PARAM_COLOR;
         flecs::entity value_slot = flecs::entity::null();
         flecs::entity member_block = create_badge_impl(slot, UIElement, name.c_str(),
-                                                       entity_type_color(name), false, false,
-                                                       {}, {}, {}, {}, &value_slot);
+                                                       member_color, false, false,
+                                                       {}, {}, {}, {}, &value_slot,
+                                                       BadgeStyle::String);
 
         // The value is a string, not a symbol naming something -- outlined, so a
         // glance separates "this is data" from "this is a type".
@@ -3147,6 +3686,21 @@ flecs::entity create_relation_badge(flecs::entity parent, flecs::entity UIElemen
 
     badge_becomes_container(block, slot, badge_text_exceeds(target, BADGE_MAX_TEXT_WIDTH));
     return block;
+}
+
+// The colour a character carries as an entity in its own right: 'a' is the
+// same colour in every word, in every panel. Index-stepped rather than hashed
+// because the alphabet is small and closed -- golden-ratio spacing over 36
+// indices keeps every letter maximally far from its neighbours, where a hash
+// would waste separation on a space it never fills.
+uint32_t letter_color(char c)
+{
+    unsigned char lower = std::tolower(static_cast<unsigned char>(c));
+    size_t index;
+    if (lower >= 'a' && lower <= 'z')      index = lower - 'a';
+    else if (lower >= '0' && lower <= '9') index = 26 + (lower - '0');
+    else return 0xAAAAAAFF;
+    return entity_badge_color(index);
 }
 
 void consume_ui_click();
@@ -3437,6 +3991,7 @@ void update_entity_inspector(flecs::entity leaf, EntitySelection& selection)
     if (selection.selected < set.names.size()) {
         const std::string& name = set.names[selection.selected];
         uint32_t color = entity_badge_color(selection.selected);
+        if (entity_is_prose(set, selection.selected)) color = BADGE_STRING_COLOR;
 
         // A Chat entity's identity is its message, which is prose -- spelling a
         // paragraph out in letter sprites would be unreadable, so it gets the
@@ -3739,7 +4294,7 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         
         // create_badge(badges, UIElement, "Heonae", 0xc72783ff);
         // create_badge(badges, UIElement, "Kahlo", 0x782910ff);
-        create_badge(badges, UIElement, "Heonae", 0xff75baff, false, false, {}, {0}, {"H"}, {0xff75baff});
+        create_badge(badges, UIElement, "Landaree", 0xebda59, false, false, {}, {0}, {"L"}, {0xebda59});
         create_badge(badges, UIElement, "Virtual", 0x619393ff);
         // create_badge(badges, UIElement, "Physical", 0x619393ff);
         
@@ -4059,7 +4614,8 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
             if (index >= set.names.size()) return;
 
             const std::string& name = set.names[index];
-            uint32_t color = entity_badge_color(index);
+            bool prose = entity_is_prose(set, index);
+            uint32_t color = prose ? BADGE_STRING_COLOR : entity_badge_color(index);
 
             const EntitySelection* selection = leaf.try_get<EntitySelection>();
             bool is_selected = selection && selection->selected == index;
@@ -4089,7 +4645,6 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
             // A message is not named by its first letter, so the symbol sprite
             // is dropped for prose -- it would be labelling content as if it
             // were an identifier.
-            bool prose = entity_is_prose(set, index);
             std::vector<std::string> postfix_ids;
             std::vector<uint32_t> postfix_tints;
             if (!prose) {
@@ -4112,6 +4667,45 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         };
 
         entity_list.set<VirtualList>(list);
+    }
+    else if (editor_type == EditorType::Lexicon)
+    {
+        auto canvas = leaf.target<EditorCanvas>();
+
+        world->entity()
+            .is_a(UIElement)
+            .child_of(canvas)
+            .add<UIYoga>()
+            .set<UIFillParent>({})
+            .set<RectRenderable>({0.0f, 0.0f, false, 0x050505FF})
+            .set<ZIndex>({9});
+
+        auto column = world->entity()
+            .is_a(UIElement)
+            .child_of(canvas)
+            .add(flecs::OrderedChildren)
+            .add<UIYoga>()
+            .set<UIFillParent>({10.0f, 10.0f, 10.0f, 10.0f})
+            .set<Position, Local>({10.0f, 10.0f})
+            .set<UIFlexContainer>({
+                YGFlexDirectionColumn, YGWrapNoWrap,
+                YGJustifyFlexStart, YGAlignFlexStart, 8.0f})
+            .set<ZIndex>({10});
+
+        // The character strip. Wraps, because a combined multi-word entity can
+        // be longer than the panel; each glyph stays an individual entity so a
+        // rule layer can later point at, tint, or annotate single characters.
+        auto glyph_row = world->entity()
+            .is_a(UIElement)
+            .child_of(column)
+            .add(flecs::OrderedChildren)
+            .add<UIYoga>()
+            .set<UIFlexContainer>({
+                YGFlexDirectionRow, YGWrapWrap,
+                YGJustifyFlexStart, YGAlignCenter, 2.0f})
+            .set<ZIndex>({12});
+
+        leaf.set<LexiconPanel>({glyph_row, ""});
     }
     else if (editor_type == EditorType::Bookshelf)
     {
@@ -4512,6 +5106,9 @@ void replace_editor_content(flecs::entity leaf, EditorType editor_type, flecs::e
     // the panel-level set has to be cleared here.
     if (leaf.has<EntitySet>()) {
         leaf.remove<EntitySet>();
+    }
+    if (leaf.has<LexiconPanel>()) {
+        leaf.remove<LexiconPanel>();
     }
     leaf.target<EditorHeader>().children([&](flecs::entity child)
     {
@@ -4996,6 +5593,20 @@ static void char_callback(GLFWwindow* window, unsigned int codepoint)
 {
     if (codepoint < 32 || codepoint >= 127) return;
 
+    // While annotation is active it owns the keyboard outright. Binding keys
+    // (digits, letters) are handled in key_callback; without this, a chat draft
+    // that quietly kept focus turns every binding keystroke into typed text --
+    // the same key both fails to bind and appears in the Interlocutor input.
+    {
+        static flecs::query<WordAnnotationSelector> annotators =
+            world->query<WordAnnotationSelector>();
+        bool annotating = false;
+        annotators.each([&](flecs::entity, WordAnnotationSelector& selector) {
+            if (selector.active) annotating = true;
+        });
+        if (annotating) return;
+    }
+
     // Checked ahead of the chat draft: focus is exclusive between the two, and
     // whichever field the user last clicked owns the keystroke.
     if (flecs::entity leaf = focused_entity_query())
@@ -5332,45 +5943,237 @@ void interlocutor_response(std::map<std::string, msgpack::object>& res_map)
         });
 }
 
-void sync_representation_grounding(WordAnnotationSelector& selector, const std::string& template_str) 
+// Appends the current annotation state to the training log.
+//
+// One JSONL line per template *state*, so the file captures edit trajectories
+// -- the sequence of corrections is supervision for the binding model, not
+// noise. Context rides along because the template alone is unlearnable: "I"
+// binding to Wesley needs the speaker, "her" binding to 0 needs the discourse
+// entity table, and both need the sentences that came before.
+static void append_annotation_record(const WordAnnotationSelector& selector)
 {
+    if (selector.sentence_template.empty()) return;
+
+    // Only log actual changes; navigation re-syncs would duplicate lines.
+    static std::string last_logged;
+    if (selector.sentence_template == last_logged) return;
+    last_logged = selector.sentence_template;
+
+    auto escape = [](const std::string& in) {
+        std::string out;
+        out.reserve(in.size() + 8);
+        for (char c : in) {
+            switch (c) {
+                case '"':  out += "\\\""; break;
+                case '\\': out += "\\\\"; break;
+                case '\n': out += "\\n"; break;
+                case '\t': out += "\\t"; break;
+                default: out += c;
+            }
+        }
+        return out;
+    };
+
+    // Runs from build/, so the log lands at the repo root.
+    std::ofstream log("../annotations.jsonl", std::ios::app);
+    if (!log) return;
+
+    log << "{\"ts\": " << (long long)std::time(nullptr)
+        << ", \"speaker\": \"Wesley\""
+        << ", \"template\": \"" << escape(selector.sentence_template) << "\"";
+
+    {
+        std::lock_guard<std::mutex> lock(known_entities_mutex);
+        log << ", \"entities\": [";
+        for (size_t i = 0; i < known_entities.size(); ++i) {
+            if (i) log << ", ";
+            log << "{\"name\": \"" << escape(known_entities[i].label)
+                << "\", \"symbol\": \"" << escape(known_entities[i].display_symbol) << "\"}";
+        }
+        log << "]";
+    }
+    {
+        std::lock_guard<std::mutex> lock(previous_sentences_mutex);
+        log << ", \"prior\": [";
+        for (size_t i = 0; i < previous_sentences.size(); ++i) {
+            if (i) log << ", ";
+            log << "\"" << escape(previous_sentences[i]) << "\"";
+        }
+        log << "]";
+    }
+    log << "}\n";
+}
+
+void sync_representation_grounding(WordAnnotationSelector& selector, const std::string& template_str)
+{
+    // This function destroys UI and immediately reads back the structure it
+    // rebuilds -- content rows are walked to fill the selection map. Under
+    // command deferral (key callbacks run inside world->progress()), those
+    // reads see nothing: child_of pairs are still queued, ensure() hands out
+    // default-constructed components (UIFlexContainer defaults to Column --
+    // the "relationship suddenly lays out vertically" bug), and the selection
+    // map falls back to whole-block slots. The R handler happened to suspend
+    // deferral at its call site; the entity-tagging handlers did not, which is
+    // why annotating an entity broke every relationship in the sentence.
+    // Suspending here makes every caller safe.
     flecs::entity container = selector.parent_entity;
-    container.children([](flecs::entity child) { child.destruct(); });
+    if (!container.is_valid() || !container.is_alive()) return;
+
+    // Suspend only genuine manual deferral (defer_begin, GLFW callbacks fired
+    // mid-progress). Readonly staging also reports as deferred, but suspending
+    // there is illegal -- the world cannot be written at all, and the attempt
+    // asserts. Callers in that state must use immediate() systems instead.
+    const bool was_deferred = world->is_deferred() && !world->is_readonly();
+    if (was_deferred) world->defer_suspend();
+
+    // Collected before destroying. Mutating the child list while iterating it
+    // can leave entities behind, and with OrderedChildren the survivors keep
+    // their slots -- so the rebuilt tokens append *after* the wreckage and the
+    // sentence comes out reordered.
+    std::vector<flecs::entity> stale;
+    container.children([&stale](flecs::entity child) { stale.push_back(child); });
+    for (flecs::entity child : stale) child.destruct();
 
     selector.selection_entities.clear(); 
 
     auto tokens = parse_sentence_template(template_str);
     auto UIElement = world->lookup("UIElement");
 
-    for (const auto& token : tokens)
-    {
-        if (token.type == TokenType::Relationship)
-        {
-            // Triple Blocks have 3 selectable slots: Source, Badge, Target
-            // We need to capture the entities created inside create_triple_block
-            create_triple_block(container, token);
+    // Slots for tokens rendered ahead of their turn. An entity that joins the
+    // relationship next to it is drawn *inside* that block, so by the time the
+    // loop reaches the relationship (or the joined target after it), its UI
+    // already exists -- only the selection slots remain to be pushed, in token
+    // order so the arrow-key indices stay aligned with the sentence.
+    std::map<size_t, std::vector<flecs::entity>> preslots;
 
-            // Get the children we just created to fill the selection map
-            // Note: Order matters here! Should match: [Source, Bridge, Target]
-            container.children([&](flecs::entity child) {
-                // The last child added was the 'bridge'
-                // We need to reach into the bridge's 'content' layout to find the 3 parts
-                child.children([&](flecs::entity layout) {
-                    layout.children([&](flecs::entity slot) {
-                        selector.selection_entities.push_back(slot);
-                    });
-                });
-            });
+    // Where tokens currently render: the sentence container, or the open
+    // comprehension frame's slot between [[Q and ]].
+    flecs::entity insert_parent = container;
+    flecs::entity open_outline = flecs::entity::null();
+    flecs::entity open_ext_node = flecs::entity::null();
+    std::vector<uint32_t> member_colors;
+
+    // Where each symbol lives on screen (entity badges, joined sidecars,
+    // reified blocks), and which slots refer to a symbol from afar. Joined
+    // slots are excluded -- fusion already shows their co-reference.
+    std::map<std::string, flecs::entity> symbol_anchors;
+    std::vector<std::pair<std::string, flecs::entity>> referring_slots;
+
+    for (size_t token_idx = 0; token_idx < tokens.size(); ++token_idx)
+    {
+        const auto& token = tokens[token_idx];
+
+        auto pre = preslots.find(token_idx);
+        if (pre != preslots.end()) {
+            for (flecs::entity slot : pre->second) selector.selection_entities.push_back(slot);
+            continue;
         }
-        else if (token.type == TokenType::Entity) {
+
+        // A relationship group can begin one token early: an entity whose
+        // symbol matches the next relationship's source joins that block
+        // directly instead of standing beside a sprite repeating its symbol.
+        size_t rel_idx = SIZE_MAX;
+        bool src_joined = false;
+        if (token.type == TokenType::Relationship) {
+            rel_idx = token_idx;
+        } else if (token.type == TokenType::Entity
+                   && token_idx + 1 < tokens.size()
+                   && relationship_src_joined(tokens, token_idx + 1)) {
+            rel_idx = token_idx + 1;
+            src_joined = true;
+        }
+
+        if (rel_idx != SIZE_MAX)
+        {
+            const auto& rel = tokens[rel_idx];
+            bool tgt_joined = relationship_tgt_joined(tokens, rel_idx);
+            const SentenceToken* joined_tgt = tgt_joined ? &tokens[rel_idx + 1] : nullptr;
+
+            flecs::entity content = flecs::entity::null();
+            flecs::entity block = create_triple_block(insert_parent, rel, &content,
+                                                      src_joined ? &token : nullptr,
+                                                      joined_tgt);
+
+            std::vector<flecs::entity> parts;
+            if (content.is_valid()) {
+                content.children([&parts](flecs::entity slot) { parts.push_back(slot); });
+            }
+            flecs::entity src_slot = parts.size() > 0 ? parts[0] : block;
+            flecs::entity tgt_slot = parts.size() > 2 ? parts[2] : block;
+
+            if (insert_parent != container) {
+                if (!rel.source_symbol.empty()) member_colors.push_back(get_entity_color(rel.source_symbol, ""));
+                if (!rel.target_symbol.empty()) member_colors.push_back(get_entity_color(rel.target_symbol, ""));
+            }
+
+            if (src_joined) symbol_anchors[rel.source_symbol] = src_slot;
+            else if (!rel.source_symbol.empty()) referring_slots.push_back({rel.source_symbol, src_slot});
+            if (tgt_joined) symbol_anchors[rel.target_symbol] = tgt_slot;
+            else if (!rel.target_symbol.empty()) referring_slots.push_back({rel.target_symbol, tgt_slot});
+            // A reified triple is itself referable -- an arc from it to a slot
+            // bound to its digit is the love->eat wiring made visible.
+            if (!rel.reified_symbol.empty()) symbol_anchors[rel.reified_symbol] = block;
+
+            // Slot layout mirrors token_selection_width exactly: a joined badge
+            // is counted once, by its own entity token, and the relationship
+            // sheds that stop. Any disagreement here desynchronises the arrow
+            // keys from the sentence.
+            if (src_joined) {
+                selector.selection_entities.push_back(src_slot);   // entity's stop
+                std::vector<flecs::entity> rel_slots = {block};
+                if (!tgt_joined) rel_slots.push_back(tgt_slot);
+                preslots[rel_idx] = rel_slots;
+            } else {
+                selector.selection_entities.push_back(src_slot);
+                selector.selection_entities.push_back(block);
+                if (!tgt_joined) selector.selection_entities.push_back(tgt_slot);
+            }
+            if (tgt_joined) {
+                preslots[rel_idx + 1] = {tgt_slot};                // entity's stop
+            }
+            continue;
+        }
+
+        if (token.type == TokenType::Concept) {
+            flecs::entity slot = flecs::entity::null();
+            flecs::entity frame = create_concept_frame(container, token.binding_symbol,
+                                                       token.reified_symbol,
+                                                       &slot, &open_outline, &open_ext_node);
+            member_colors.clear();
+            selector.selection_entities.push_back(frame);
+            // Both ids are referable: the intension's and the extension's arcs
+            // and slot bindings land on the same frame.
+            if (!token.binding_symbol.empty()) symbol_anchors[token.binding_symbol] = frame;
+            if (!token.reified_symbol.empty()) symbol_anchors[token.reified_symbol] = frame;
+            if (slot.is_valid()) insert_parent = slot;
+            continue;
+        }
+        if (token.type == TokenType::ConceptEnd) {
+            // The frame's outline runs first member's colour -> last member's,
+            // matching their left-to-right order inside it.
+            if (open_outline.is_valid() && !member_colors.empty()) {
+                if (CustomRenderable* stroke = open_outline.try_get_mut<CustomRenderable>()) {
+                    stroke->gradient_start = (scale_color(member_colors.front(), 1.3f) & 0xFFFFFF00) | 0xC0;
+                    stroke->gradient_end   = (scale_color(member_colors.back(),  1.3f) & 0xFFFFFF00) | 0xC0;
+                }
+            }
+            open_outline = flecs::entity::null();
+            open_ext_node = flecs::entity::null();
+            insert_parent = container;   // zero-width: no selection stop
+            continue;
+        }
+
+        if (token.type == TokenType::Entity) {
             uint32_t color = get_entity_color(token.binding_symbol, token.text);
-            flecs::entity badge = create_badge(container, UIElement, token.text.c_str(), color, 
+            flecs::entity badge = create_badge(insert_parent, UIElement, token.text.c_str(), color, 
                          false, false, token.binding_symbol, "", 0, color);
             
+            if (!token.binding_symbol.empty()) symbol_anchors[token.binding_symbol] = badge;
+            if (insert_parent != container) member_colors.push_back(color);
             selector.selection_entities.push_back(badge);
         } else {
             // Plain text
-            flecs::entity text_ent = world->entity().is_a(UIElement).child_of(container)
+            flecs::entity text_ent = world->entity().is_a(UIElement).child_of(insert_parent)
                 .add<UIYoga>()
                 .add<UIYogaLegacyLeaf>()
                 .set<TextRenderable>({token.text.c_str(), "CharisSIL", 16.0f, 0x777777FF})
@@ -5380,13 +6183,74 @@ void sync_representation_grounding(WordAnnotationSelector& selector, const std::
         }
     }
     
+    // Same symbol, two places, not fused: draw the identity as an arc.
+    for (const auto& referring : referring_slots) {
+        auto anchor = symbol_anchors.find(referring.first);
+        if (anchor == symbol_anchors.end()) continue;
+
+        world->entity()
+            .is_a(UIElement)
+            .child_of(container)
+            .set<CorefArc>({anchor->second, referring.second})
+            .set<QuadraticBezierRenderable>({0, 0, 0, 0, 0, 0, 1.5f,
+                                             get_entity_color(referring.first, "")})
+            .set<ZIndex>({28});
+    }
+
     selector.token_count = selector.selection_entities.size();
-    selector.dirty = true; // Force bounds recalculation
+    // Deliberately NOT set dirty here: the rebuild system consumes dirty by
+    // calling this function, so re-raising it would rebuild every frame.
+    selector.dirty = false;
+
+    // Every template state is a training example -- this is where the dataset
+    // accrues as a side effect of use.
+    append_annotation_record(selector);
+
+    if (was_deferred) world->defer_resume();
 }
 
 // TODO: The key callback needs to be refactored to callback functions or observers with semantic description
+// Toggles real fullscreen, remembering the windowed geometry to restore to.
+//
+// The window is created at monitor size but windowed (monitor argument NULL),
+// so this is what actually hands the display over and drops the decorations.
+static void toggle_fullscreen(GLFWwindow* window)
+{
+    static bool fullscreen = false;
+    static int windowed_x = 0, windowed_y = 0, windowed_w = 0, windowed_h = 0;
+
+    if (!fullscreen) {
+        glfwGetWindowPos(window, &windowed_x, &windowed_y);
+        glfwGetWindowSize(window, &windowed_w, &windowed_h);
+
+        GLFWmonitor* monitor = glfwGetPrimaryMonitor();
+        if (!monitor) return;
+        const GLFWvidmode* mode = glfwGetVideoMode(monitor);
+        if (!mode) return;
+
+        glfwSetWindowMonitor(window, monitor, 0, 0,
+                             mode->width, mode->height, mode->refreshRate);
+    } else {
+        // Falling back to the monitor's size rather than zero, in case the
+        // window went fullscreen before it had ever been given a size.
+        int w = windowed_w > 0 ? windowed_w : 1280;
+        int h = windowed_h > 0 ? windowed_h : 720;
+        glfwSetWindowMonitor(window, nullptr, windowed_x, windowed_y, w, h, 0);
+    }
+
+    fullscreen = !fullscreen;
+}
+
 static void key_callback(GLFWwindow* window, int key, int scancode, int action, int mods)
 {
+    // Before anything else, so it works regardless of which text field or panel
+    // currently owns the keyboard.
+    if (key == GLFW_KEY_F11 && action == GLFW_PRESS)
+    {
+        toggle_fullscreen(window);
+        return;
+    }
+
     // Blender-style numpad views for the Droid panel's 3D scene. Consumed only
     // while the pointer is over that panel, so the numpad still reaches text
     // fields and the VNC passthrough everywhere else. Repeats are honoured so
@@ -5544,7 +6408,7 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                     int token_idx = -1;
                     int sub_part = 0;  // 0=source, 1=rel, 2=target (for relationships)
                     for (size_t ti = 0; ti < tokens.size(); ti++) {
-                        int width = tokens[ti].selection_width();
+                        int width = token_selection_width(tokens, ti);
                         if (selector.start_index >= expanded_pos && selector.start_index < expanded_pos + width) {
                             token_idx = (int)ti;
                             sub_part = selector.start_index - expanded_pos;
@@ -5559,7 +6423,7 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                     int end_token_idx = -1;
                     expanded_pos = 0;
                     for (size_t ti = 0; ti < tokens.size(); ti++) {
-                        int width = tokens[ti].selection_width();
+                        int width = token_selection_width(tokens, ti);
                         if (selector.end_index >= expanded_pos && selector.end_index < expanded_pos + width) {
                             end_token_idx = (int)ti;
                             break;
@@ -5580,7 +6444,7 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                         std::vector<SentenceToken> new_tokens;
                         int new_sel_start = 0;
                         for (int i = 0; i < start_tok; i++) {
-                            new_sel_start += tokens[i].selection_width();
+                            new_sel_start += token_selection_width(tokens, i);
                             new_tokens.push_back(tokens[i]);
                         }
                         new_tokens.push_back({combined_text, std::to_string(digit), "", "", "", TokenType::Entity});
@@ -5594,14 +6458,19 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                         selector.end_index = new_sel_start;
                         // recreate_annotation_entities(selector);
                     } else if (tokens[token_idx].type == TokenType::Relationship) {
-                        // Assign digit to relationship part
-                        // 0=source, 1=badge, 2=target
-                        if (sub_part == 0) {
+                        // sub_part indexes the *remaining* stops, so it has to
+                        // be translated through the roles a joined relationship
+                        // still exposes -- with a joined source, stop 0 is the
+                        // whole triple, not the source.
+                        std::vector<int> roles = relationship_slot_roles(tokens, token_idx);
+                        int role = (sub_part >= 0 && sub_part < (int)roles.size())
+                                 ? roles[sub_part] : 1;
+                        if (role == 0) {
                             tokens[token_idx].source_symbol = std::to_string(digit);
-                        } else if (sub_part == 2) {
+                        } else if (role == 2) {
                             tokens[token_idx].target_symbol = std::to_string(digit);
                         }
-                        // badge part (1) doesn't accept digit assignment
+                        // the whole-triple stop doesn't accept digit assignment
                         selector.sentence_template = tokens_to_template(tokens);
                         selector.dirty = true;
                         // recreate_annotation_entities(selector);
@@ -5619,10 +6488,79 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
             if (handled) return;
         }
 
+        // Q - Comprehension: wraps the selected span in a frame. The members --
+        // words, entity badges, whole relationships -- keep their bindings and
+        // renderings; only a [[Qn ... ]] pair is inserted around them.
+        if (key == GLFW_KEY_Q)
+        {
+            bool handled = false;
+            annotation_query.each([&](flecs::entity e, WordAnnotationSelector& selector) {
+                if (!selector.active || selector.sentence_template.empty()) return;
+                auto tokens = parse_sentence_template(selector.sentence_template);
+                if (tokens.empty()) return;
+
+                int expanded_pos = 0;
+                int start_tok = -1, end_tok = -1;
+                for (size_t ti = 0; ti < tokens.size(); ti++) {
+                    int width = token_selection_width(tokens, ti);
+                    if (start_tok < 0 && selector.start_index >= expanded_pos
+                        && selector.start_index < expanded_pos + width) {
+                        start_tok = (int)ti;
+                    }
+                    if (selector.end_index >= expanded_pos
+                        && selector.end_index < expanded_pos + width) {
+                        end_tok = (int)ti;
+                    }
+                    expanded_pos += width;
+                }
+                if (start_tok < 0) return;
+                if (end_tok < start_tok) end_tok = start_tok;
+
+                // No nesting or overlap in v1: a marker anywhere in the span
+                // means this comprehension would cross another's boundary.
+                for (int i = start_tok; i <= end_tok; i++) {
+                    if (tokens[i].type == TokenType::Concept
+                        || tokens[i].type == TokenType::ConceptEnd) return;
+                }
+
+                // Two ids per comprehension: the intension (query) and the
+                // extension (its output set) are both entities.
+                std::set<std::string> used = collect_used_symbols(tokens);
+                std::string symbol, ext_symbol;
+                for (int d = 0; d <= 9; d++) {
+                    std::string candidate = std::to_string(d);
+                    if (used.count(candidate)) continue;
+                    if (symbol.empty()) symbol = candidate;
+                    else { ext_symbol = candidate; break; }
+                }
+                if (symbol.empty() || ext_symbol.empty()) return;
+
+                std::vector<SentenceToken> new_tokens;
+                int new_sel_start = 0;
+                for (int i = 0; i < start_tok; i++) {
+                    new_sel_start += token_selection_width(tokens, i);
+                    new_tokens.push_back(tokens[i]);
+                }
+                new_tokens.push_back({"", symbol, "", "", ext_symbol, TokenType::Concept});
+                for (int i = start_tok; i <= end_tok; i++) new_tokens.push_back(tokens[i]);
+                new_tokens.push_back({"", "", "", "", "", TokenType::ConceptEnd});
+                for (int i = end_tok + 1; i < (int)tokens.size(); i++) new_tokens.push_back(tokens[i]);
+
+                selector.sentence_template = tokens_to_template(new_tokens);
+                selector.dirty = true;
+                // Land on the frame's own stop.
+                selector.start_index = new_sel_start;
+                selector.end_index = new_sel_start;
+                handled = true;
+            });
+            if (handled) return;
+        }
+
         // Letter keys (A-Z) - assign letter as binding symbol to selected token/part
         // Exclude E, X, R which have special annotation functions
         if (key >= GLFW_KEY_A && key <= GLFW_KEY_Z &&
-            key != GLFW_KEY_E && key != GLFW_KEY_X && key != GLFW_KEY_R)
+            key != GLFW_KEY_E && key != GLFW_KEY_X && key != GLFW_KEY_R &&
+            key != GLFW_KEY_Q)
         {
             char letter = 'a' + (key - GLFW_KEY_A);  // lowercase letter
             std::string symbol(1, letter);
@@ -5637,7 +6575,7 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                     int token_idx = -1;
                     int sub_part = 0;
                     for (size_t ti = 0; ti < tokens.size(); ti++) {
-                        int width = tokens[ti].selection_width();
+                        int width = token_selection_width(tokens, ti);
                         if (selector.start_index >= expanded_pos && selector.start_index < expanded_pos + width) {
                             token_idx = (int)ti;
                             sub_part = selector.start_index - expanded_pos;
@@ -5651,7 +6589,7 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                     int end_token_idx = -1;
                     expanded_pos = 0;
                     for (size_t ti = 0; ti < tokens.size(); ti++) {
-                        int width = tokens[ti].selection_width();
+                        int width = token_selection_width(tokens, ti);
                         if (selector.end_index >= expanded_pos && selector.end_index < expanded_pos + width) {
                             end_token_idx = (int)ti;
                             break;
@@ -5672,7 +6610,7 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                         std::vector<SentenceToken> new_tokens;
                         int new_sel_start = 0;
                         for (int i = 0; i < start_tok; i++) {
-                            new_sel_start += tokens[i].selection_width();
+                            new_sel_start += token_selection_width(tokens, i);
                             new_tokens.push_back(tokens[i]);
                         }
                         new_tokens.push_back({combined_text, symbol, "", "", "", TokenType::Entity});
@@ -5687,11 +6625,15 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                         sync_representation_grounding(selector, selector.sentence_template);
                         // recreate_annotation_entities(selector);
                     } else if (tokens[token_idx].type == TokenType::Relationship) {
-                        // Assign symbol to relationship part
-                        // 0=source, 1=badge, 2=target
-                        if (sub_part == 0) {
+                        // Same translation as the digit handler: sub_part
+                        // indexes the remaining stops, and with a joined side
+                        // the raw 0/1/2 layout no longer holds.
+                        std::vector<int> roles = relationship_slot_roles(tokens, token_idx);
+                        int role = (sub_part >= 0 && sub_part < (int)roles.size())
+                                 ? roles[sub_part] : 1;
+                        if (role == 0) {
                             tokens[token_idx].source_symbol = symbol;
-                        } else if (sub_part == 2) {
+                        } else if (role == 2) {
                             tokens[token_idx].target_symbol = symbol;
                         }
                         // badge part (1) doesn't accept symbol assignment
@@ -5727,7 +6669,7 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                     int token_idx = -1;
                     int sub_part = 0;
                     for (size_t ti = 0; ti < tokens.size(); ti++) {
-                        int width = tokens[ti].selection_width();
+                        int width = token_selection_width(tokens, ti);
                         if (selector.start_index >= expanded_pos && selector.start_index < expanded_pos + width) {
                             token_idx = (int)ti;
                             sub_part = selector.start_index - expanded_pos;
@@ -5772,7 +6714,7 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                     int expanded_pos = 0;
                     int token_idx = -1;
                     for (size_t ti = 0; ti < tokens.size(); ti++) {
-                        int width = tokens[ti].selection_width();
+                        int width = token_selection_width(tokens, ti);
                         if (selector.start_index >= expanded_pos && selector.start_index < expanded_pos + width) {
                             token_idx = (int)ti;
                             break;
@@ -5847,7 +6789,7 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                     int end_token_idx = -1;
                     expanded_pos = 0;
                     for (size_t ti = 0; ti < tokens.size(); ti++) {
-                        int width = tokens[ti].selection_width();
+                        int width = token_selection_width(tokens, ti);
                         if (selector.end_index >= expanded_pos && selector.end_index < expanded_pos + width) {
                             end_token_idx = (int)ti;
                             break;
@@ -5867,7 +6809,7 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                     std::vector<SentenceToken> new_tokens;
                     int new_sel_start = 0;
                     for (int i = 0; i < start_tok; i++) {
-                        new_sel_start += tokens[i].selection_width();
+                        new_sel_start += token_selection_width(tokens, i);
                         new_tokens.push_back(tokens[i]);
                     }
                     new_tokens.push_back({combined_text, std::to_string(available_digit), "", "", "", TokenType::Entity});
@@ -5902,7 +6844,7 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                     int expanded_pos = 0;
                     int token_idx = -1;
                     for (size_t ti = 0; ti < tokens.size(); ti++) {
-                        int width = tokens[ti].selection_width();
+                        int width = token_selection_width(tokens, ti);
                         if (selector.start_index >= expanded_pos && selector.start_index < expanded_pos + width) {
                             token_idx = (int)ti;
                             break;
@@ -5911,17 +6853,64 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                     }
                     if (token_idx < 0) return;
 
-                    if (tokens[token_idx].type == TokenType::Entity ||
-                        tokens[token_idx].type == TokenType::Relationship) {
-                        tokens[token_idx].type = TokenType::PlainText;
-                        tokens[token_idx].binding_symbol = "";
-                        tokens[token_idx].source_symbol = "";
-                        tokens[token_idx].target_symbol = "";
+                    if (tokens[token_idx].type == TokenType::Relationship) {
+                        // On a bound slot, X releases the binding back to a
+                        // wildcard. Only on the whole-triple stop does it
+                        // dissolve the relationship itself -- clearing one end
+                        // should never cost the whole annotation.
+                        int sub_part = selector.start_index - expanded_pos;
+                        std::vector<int> roles = relationship_slot_roles(tokens, token_idx);
+                        int role = (sub_part >= 0 && sub_part < (int)roles.size())
+                                 ? roles[sub_part] : 1;
+
+                        if (role == 0 && !tokens[token_idx].source_symbol.empty()) {
+                            tokens[token_idx].source_symbol = "";
+                        } else if (role == 2 && !tokens[token_idx].target_symbol.empty()) {
+                            tokens[token_idx].target_symbol = "";
+                        } else {
+                            tokens[token_idx].type = TokenType::PlainText;
+                            tokens[token_idx].binding_symbol = "";
+                            tokens[token_idx].source_symbol = "";
+                            tokens[token_idx].target_symbol = "";
+                        }
                         selector.sentence_template = tokens_to_template(tokens);
                         selector.dirty = true;
-
-                        sync_representation_grounding(selector, selector.sentence_template);
-                        // recreate_annotation_entities(selector);
+                        handled = true;
+                    }
+                    else if (tokens[token_idx].type == TokenType::Concept) {
+                        // Dissolve the frame: remove the marker pair, keep the
+                        // members exactly as they were.
+                        int close = -1;
+                        for (size_t i = token_idx + 1; i < tokens.size(); i++) {
+                            if (tokens[i].type == TokenType::ConceptEnd) { close = (int)i; break; }
+                        }
+                        if (close >= 0) tokens.erase(tokens.begin() + close);
+                        tokens.erase(tokens.begin() + token_idx);
+                        selector.sentence_template = tokens_to_template(tokens);
+                        selector.dirty = true;
+                        handled = true;
+                    }
+                    else if (tokens[token_idx].type == TokenType::Entity) {
+                        // A joined sidecar un-joins first: clearing the
+                        // relationship's matching symbol moves the badge back
+                        // out to stand alone and returns the slot it occupied
+                        // to a wildcard. The entity itself is only dissolved
+                        // when it isn't part of a join -- X peels one layer at
+                        // a time.
+                        if (token_idx + 1 < tokens.size()
+                            && relationship_src_joined(tokens, token_idx + 1)) {
+                            tokens[token_idx + 1].source_symbol = "";
+                        } else if (token_idx > 0
+                            && relationship_tgt_joined(tokens, token_idx - 1)) {
+                            tokens[token_idx - 1].target_symbol = "";
+                        } else {
+                            tokens[token_idx].type = TokenType::PlainText;
+                            tokens[token_idx].binding_symbol = "";
+                            tokens[token_idx].source_symbol = "";
+                            tokens[token_idx].target_symbol = "";
+                        }
+                        selector.sentence_template = tokens_to_template(tokens);
+                        selector.dirty = true;
                         handled = true;
                     }
                 }
@@ -5943,7 +6932,7 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                     int expanded_pos = 0;
                     int token_idx = -1;
                     for (size_t ti = 0; ti < tokens.size(); ti++) {
-                        int width = tokens[ti].selection_width();
+                        int width = token_selection_width(tokens, ti);
                         if (selector.start_index >= expanded_pos && selector.start_index < expanded_pos + width) {
                             token_idx = (int)ti;
                             break;
@@ -5951,8 +6940,28 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                         expanded_pos += width;
                     }
 
-                    // If on existing relationship, do nothing
+                    // R on an existing relationship reifies it: the triple
+                    // itself becomes an entity, marked by the 3d-node and a
+                    // freshly assigned MNIST digit above the predicate.
+                    // Pressed again, it un-reifies -- same toggle as Shift+7.
                     if (token_idx >= 0 && tokens[token_idx].type == TokenType::Relationship) {
+                        if (!tokens[token_idx].reified_symbol.empty()) {
+                            tokens[token_idx].reified_symbol = "";
+                        } else {
+                            // The next digit no other binding in the sentence
+                            // is using; derived per press, so un-reifying
+                            // returns the digit to the pool.
+                            std::set<std::string> used_symbols = collect_used_symbols(tokens);
+                            for (int d = 0; d <= 9; d++) {
+                                if (used_symbols.find(std::to_string(d)) == used_symbols.end()) {
+                                    tokens[token_idx].reified_symbol = std::to_string(d);
+                                    break;
+                                }
+                            }
+                        }
+                        selector.sentence_template = tokens_to_template(tokens);
+                        selector.dirty = true;
+                        handled = true;
                         return;
                     }
 
@@ -5960,7 +6969,7 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                     expanded_pos = 0;
                     int token_start = -1, token_end = -1;
                     for (size_t ti = 0; ti < tokens.size(); ti++) {
-                        int width = tokens[ti].selection_width();
+                        int width = token_selection_width(tokens, ti);
                         if (token_start < 0 && expanded_pos + width > selector.start_index) {
                             token_start = (int)ti;
                         }
@@ -5983,7 +6992,7 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                     std::vector<SentenceToken> new_tokens;
                     int new_sel_start = 0;
                     for (int i = 0; i < token_start; i++) {
-                        new_sel_start += tokens[i].selection_width();
+                        new_sel_start += token_selection_width(tokens, i);
                         new_tokens.push_back(tokens[i]);
                     }
 
@@ -6024,7 +7033,7 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                     int expanded_pos = 0;
                     int token_idx = -1;
                     for (size_t ti = 0; ti < tokens.size(); ti++) {
-                        int width = tokens[ti].selection_width();
+                        int width = token_selection_width(tokens, ti);
                         if (selector.start_index >= expanded_pos && selector.start_index < expanded_pos + width) {
                             token_idx = (int)ti;
                             break;
@@ -6040,17 +7049,7 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                             tokens[token_idx].reified_symbol = "";
                         } else {
                             // Reify: find first available symbol
-                            std::set<std::string> used_symbols;
-                            for (const auto& tok : tokens) {
-                                if (tok.type == TokenType::Entity && !tok.binding_symbol.empty()) {
-                                    used_symbols.insert(tok.binding_symbol);
-                                }
-                                if (tok.type == TokenType::Relationship) {
-                                    if (!tok.source_symbol.empty()) used_symbols.insert(tok.source_symbol);
-                                    if (!tok.target_symbol.empty()) used_symbols.insert(tok.target_symbol);
-                                    if (!tok.reified_symbol.empty()) used_symbols.insert(tok.reified_symbol);
-                                }
-                            }
+                            std::set<std::string> used_symbols = collect_used_symbols(tokens);
                             // Find first available digit
                             for (int d = 0; d <= 9; d++) {
                                 if (used_symbols.find(std::to_string(d)) == used_symbols.end()) {
@@ -6100,6 +7099,19 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
             query.focused = false;
             return;
         }
+    }
+
+    // While the annotation outline is up, every keystroke belongs to
+    // annotation. Keys its handlers claim have already returned above; keys
+    // they don't claim must die here rather than leak into the chat draft --
+    // a stray Backspace eating the draft or Enter sending a half-typed message
+    // from inside annotation mode is worse than the key doing nothing.
+    {
+        bool annotating = false;
+        annotation_query.each([&](flecs::entity, WordAnnotationSelector& selector) {
+            if (selector.active) annotating = true;
+        });
+        if (annotating) return;
     }
 
     // Retrieve the singleton ChatState
@@ -6528,6 +7540,8 @@ int main(int, char *[]) {
     world->component<EntityQuery>();
     world->component<EntitySet>();
     world->component<BadgeContent>();
+    world->component<CorefArc>();
+    world->component<LexiconPanel>();
     world->component<FocusEntityQuery>();
     world->component<VirtualList>();
 
@@ -7241,6 +8255,129 @@ int main(int, char *[]) {
             }
             for (flecs::entity list : lists) {
                 update_virtual_list(list, list.ensure<VirtualList>());
+            }
+        });
+
+    // Rebuilds the annotation UI whenever a key handler has rewritten the
+    // template. Every handler sets dirty; before this system existed only the
+    // R handler called the rebuild directly, so binding a symbol to a slot
+    // updated the template invisibly -- the sentence on screen never changed.
+    // Mirrors the annotator's current selection into any open Lexicon panels:
+    // the selected word, one character glyph per entity, tinted with the
+    // word's bound entity colour when it has one. immediate() because it
+    // rebuilds UI. Each glyph is its own entity deliberately -- the rule
+    // layers this panel exists for will attach to individual characters.
+    world->system<LexiconPanel>("LexiconSyncSystem")
+        .kind(flecs::PreFrame)
+        .immediate()
+        .run([](flecs::iter& it) {
+            std::vector<flecs::entity> panels;
+            while (it.next()) {
+                for (auto i : it) panels.push_back(it.entity(i));
+            }
+            if (panels.empty()) return;
+
+            // The word under the annotation cursor, from the active selector.
+            std::string word;
+            static flecs::query<WordAnnotationSelector> selectors =
+                world->query<WordAnnotationSelector>();
+            selectors.each([&](flecs::entity, WordAnnotationSelector& selector) {
+                if (!selector.active || selector.sentence_template.empty()) return;
+                auto tokens = parse_sentence_template(selector.sentence_template);
+
+                int expanded_pos = 0;
+                for (size_t ti = 0; ti < tokens.size(); ti++) {
+                    int width = token_selection_width(tokens, ti);
+                    if (selector.start_index >= expanded_pos
+                        && selector.start_index < expanded_pos + width) {
+                        word = tokens[ti].text;
+                        return;
+                    }
+                    expanded_pos += width;
+                }
+            });
+
+            for (flecs::entity e : panels) {
+                LexiconPanel& panel = e.ensure<LexiconPanel>();
+                if (panel.shown == word) continue;
+                if (!panel.glyph_row.is_valid() || !panel.glyph_row.is_alive()) continue;
+
+                std::vector<flecs::entity> stale;
+                panel.glyph_row.children([&stale](flecs::entity c) { stale.push_back(c); });
+                for (flecs::entity c : stale) c.destruct();
+
+                // One glyph per character, each tinted with the letter's own
+                // identity colour -- both 'o's in "robots" match, and 'o' is
+                // that colour in every word. The word-level entity tint is
+                // dropped here on purpose: this panel is about the characters
+                // as entities, not the word's referent.
+                for (char c : word) {
+                    if (std::isspace(static_cast<unsigned char>(c))) continue;
+                    create_letter_chip(panel.glyph_row, std::string(1, c), letter_color(c));
+                }
+                panel.shown = word;
+            }
+        });
+
+    // Re-derives each co-reference arc's curve from the current bounds of the
+    // two things it connects. Geometry lives here, not at creation: the badges
+    // move whenever layout runs -- a wrap, a join, a reified block growing --
+    // and an arc baked to yesterday's positions would point at empty space.
+    world->system<CorefArc, QuadraticBezierRenderable>("CorefArcSystem")
+        .kind(flecs::PreUpdate)
+        .each([](flecs::entity e, CorefArc& arc, QuadraticBezierRenderable& curve) {
+            // Top-centre of a connected element, from its bounds.
+            auto anchor_top = [](flecs::entity ent, float& x, float& y) {
+                if (!ent.is_valid() || !ent.is_alive()) return false;
+                const UIElementBounds* b = ent.try_get<UIElementBounds>();
+                if (!b || b->xmax <= b->xmin) return false;
+                x = (b->xmin + b->xmax) * 0.5f;
+                y = b->ymin;
+                return true;
+            };
+
+            float fx, fy, tx, ty;
+            if (!anchor_top(arc.from, fx, fy) || !anchor_top(arc.to, tx, ty)) {
+                curve.thickness = 0.0f;   // nothing sane to draw yet
+                return;
+            }
+            if (curve.thickness <= 0.0f) curve.thickness = 1.5f;
+
+            // Rise with distance, capped: long arcs stay shallow enough to
+            // read as connection rather than as a dome over the sentence.
+            float span = std::fabs(tx - fx);
+            float rise = std::clamp(span * 0.25f, 12.0f, 42.0f);
+
+            // Curve coords are relative to the entity's world position.
+            const Position* origin = e.try_get<Position, World>();
+            float ox = origin ? origin->x : 0.0f;
+            float oy = origin ? origin->y : 0.0f;
+
+            curve.x1 = fx - ox;  curve.y1 = fy - oy;
+            curve.cx = (fx + tx) * 0.5f - ox;
+            curve.cy = std::min(fy, ty) - rise - oy;
+            curve.x2 = tx - ox;  curve.y2 = ty - oy;
+        });
+
+    // immediate(), like VirtualListSystem: the rebuild creates and destroys UI
+    // entities, which cannot happen inside the pipeline's readonly staging --
+    // suspending deferral there is illegal and asserts EcsWorldReadonly the
+    // moment anything structural runs. Handles are collected before any
+    // rebuild, since rebuilding moves tables under a live iterator.
+    world->system<WordAnnotationSelector>("AnnotationRebuildSystem")
+        .kind(flecs::PreFrame)
+        .immediate()
+        .run([](flecs::iter& it) {
+            std::vector<flecs::entity> dirty;
+            while (it.next()) {
+                auto selectors = it.field<WordAnnotationSelector>(0);
+                for (auto i : it) {
+                    if (selectors[i].dirty) dirty.push_back(it.entity(i));
+                }
+            }
+            for (flecs::entity e : dirty) {
+                WordAnnotationSelector& selector = e.ensure<WordAnnotationSelector>();
+                sync_representation_grounding(selector, selector.sentence_template);
             }
         });
 

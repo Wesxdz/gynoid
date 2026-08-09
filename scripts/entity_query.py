@@ -20,6 +20,7 @@
 # components and relations stay apart rather than being flattened into one
 # caption because the editor draws each as a different kind of badge, and a
 # relation in particular needs its relation and target separable.
+import datetime
 import json
 import os
 import socket
@@ -91,6 +92,29 @@ def format_value(value):
     return json.dumps(value, separators=(",", ":"))
 
 
+# Components whose numeric members are instants rather than quantities. Held as
+# a set rather than tested by name suffix, so a member called "time" on some
+# unrelated component is not silently reinterpreted as a date.
+TIMESTAMP_COMPONENTS = {"CreatedAt"}
+
+
+def format_timestamp(value):
+    """An epoch seconds value as a date a person would want to read.
+
+    The world stores the instant, not this string -- keeping the number as the
+    representation is what lets it be compared and sorted; this is only how it
+    is shown.
+    """
+    try:
+        moment = datetime.datetime.fromtimestamp(float(value))
+    except (TypeError, ValueError, OSError, OverflowError):
+        return format_value(value)
+
+    # Day-first without a leading zero, and 24h: unambiguous, and short enough
+    # to sit in a badge.
+    return moment.strftime("%-d %b %Y, %H:%M")
+
+
 def component_entry(type_name, value):
     """One component flattened to "Type<TAB>member<TAB>value<TAB>member<TAB>value".
 
@@ -100,10 +124,13 @@ def component_entry(type_name, value):
     """
     fields = [str(type_name)]
 
+    is_timestamp = str(type_name) in TIMESTAMP_COMPONENTS
+
     if isinstance(value, dict):
         for member, member_value in value.items():
             fields.append(str(member))
-            fields.append(format_value(member_value))
+            fields.append(format_timestamp(member_value) if is_timestamp
+                          else format_value(member_value))
     elif value is not None:
         # A component with no reflected members still has a value worth showing
         # (an opaque string, say); give it one unnamed field.
