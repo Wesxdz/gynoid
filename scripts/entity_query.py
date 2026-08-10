@@ -316,7 +316,48 @@ def main():
                     for kind, ident in created:
                         if ident != singular_id:
                             query_world(f"relate LemmaOf {ident} {singular_id}")
+                # Second pivot, same shape: a Contraction row relates to its
+                # Expansion row. "Here's" -ExpansionOf-> "Here is".
+                contraction_id = next((i for k, i in created if k == "Contraction"), None)
+                expansion_id = next((i for k, i in created if k == "Expansion"), None)
+                if contraction_id and expansion_id and contraction_id != expansion_id:
+                    query_world(f"relate ExpansionOf {contraction_id} {expansion_id}")
                 reply = {"status": "OK", "count": len(created)}
+            except Exception as exc:
+                reply = {"status": "OFFLINE", "error": str(exc)}
+            socket_rep.send(msgpack.packb(reply))
+            continue
+
+        if req.get("type") == "branch":
+            # A committed paraphrase branch: the annotator re-worded a span of
+            # a chat message into a more explicit form ("my life" -> "life of
+            # Wesley"). The paraphrase is a first-class entity related
+            # ExplicationOf to the Chat entity it explicates, so the
+            # said/implied distinction is browsable graph structure -- and
+            # accruing training data for a future nominalization layer.
+            message = " ".join((req.get("message") or "").split())
+            span = (req.get("span") or "").strip()
+            paraphrase = (req.get("paraphrase") or "").strip()
+            if not message or not paraphrase:
+                socket_rep.send(msgpack.packb(
+                    {"status": "ERROR", "error": "branch needs message and paraphrase"}))
+                continue
+            try:
+                result = query_world(f"create Paraphrase {paraphrase}")
+                pid = result.get("id")
+                # The chat entity is found by its text; expansion may have
+                # rewritten the annotated surface, so an exact miss falls
+                # back to leaving the Paraphrase unanchored rather than
+                # anchoring it to the wrong message.
+                chat_id = None
+                for entity in query_world("Chat").get("results", []):
+                    text = ((entity.get("components") or {}).get("Text") or {}).get("value")
+                    if text and " ".join(text.split()) == message:
+                        chat_id = entity.get("id")
+                        break
+                if pid and chat_id:
+                    query_world(f"relate ExplicationOf {pid} {chat_id}")
+                reply = {"status": "OK", "id": pid, "chat": chat_id, "span": span}
             except Exception as exc:
                 reply = {"status": "OFFLINE", "error": str(exc)}
             socket_rep.send(msgpack.packb(reply))
@@ -334,11 +375,14 @@ def main():
                 socket_rep.send(msgpack.packb(
                     {"status": "ERROR", "error": "teach_false needs word and variant"}))
                 continue
+            relation = (req.get("relation") or "NotLemmaOf").strip()
+            if relation not in ("NotLemmaOf", "NotExpansionOf"):
+                relation = "NotLemmaOf"
             try:
                 r1 = query_world(f"create Form {word}")
                 r2 = query_world(f"create Form {variant}")
                 if r1.get("id") and r2.get("id"):
-                    query_world(f"relate NotLemmaOf {r1['id']} {r2['id']}")
+                    query_world(f"relate {relation} {r1['id']} {r2['id']}")
                     reply = {"status": "OK"}
                 else:
                     reply = {"status": "ERROR", "error": "create failed"}

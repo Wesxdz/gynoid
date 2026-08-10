@@ -1024,9 +1024,11 @@ void initialize3DRendering(Graphics& graphics, int width, int height) {
     generateTriangularGrid(gridVertices, gridIndices, planeWidth, planeHeight, 80, 80);
 
     graphics.gridVertexCount = gridIndices.size();
-    graphics.useGridMode = true; // Start with grid mode to show particle animation
+    // Straight to plane mode: the triangle spawn animation is skipped at
+    // startup. Set true to bring the intro effect back.
+    graphics.useGridMode = false;
     graphics.gridModeTransitionTimer = 0.0f;
-    graphics.allParticlesLocked = false;
+    graphics.allParticlesLocked = true;
 
     glGenVertexArrays(1, &graphics.gridVAO);
     glGenBuffers(1, &graphics.gridVBO);

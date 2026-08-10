@@ -310,6 +310,11 @@ struct TextRenderable {
     uint32_t color;
     float scaleY = 1.0f;
     float wrapWidth = 0.0f;  // 0 = no wrapping, >0 = wrap at this width
+    // True when wrapWidth was derived from Yoga's offered layout bound rather
+    // than authored (badge_apply_wrap, input fields). Authored widths are
+    // never touched; a derived one is re-derived when the bound moves, so a
+    // widening panel un-wraps text that no longer needs it.
+    bool autoWrapped = false;
 };
 
 struct ImageCreator
@@ -494,6 +499,10 @@ struct TransducerPanel {
     flecs::entity list;
     std::string shown_sig;
 };
+
+// Marks a sentence's POS tier strip, so a late tag reply can find and replace
+// the tier without tearing down the sentence it floats above.
+struct PosTier {};
 
 // A co-reference arc in the annotated sentence: the same symbol appearing in
 // two places -- an entity badge and a relationship slot bound to it -- drawn as

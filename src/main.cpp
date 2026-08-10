@@ -1309,12 +1309,31 @@ static YGSize yoga_measure_text(YGNodeConstRef node,
     nvgFontSize(g_yoga_vg, text->fontSize);
     nvgFontFace(g_yoga_vg, text->fontFace.c_str());
 
-    // Honour an explicit wrapWidth; otherwise wrap to the width Yoga is
-    // offering, when it gives us a bound to work with.
-    float wrap = text->wrapWidth;
-    if (wrap <= 0.0f && widthMode != YGMeasureModeUndefined && width > 0.0f
-        && !std::isnan(width)) {
-        wrap = width;
+    // Honour an authored wrapWidth; otherwise wrap to the width Yoga is
+    // offering, when it gives us a bound to work with. The chosen width is
+    // then written BACK to the renderable: measuring wrapped is not enough,
+    // because the renderer only draws wrapped when wrapWidth is set -- without
+    // the write-back, Yoga reserves multi-line height while the text draws as
+    // one long line off the panel edge. autoWrapped marks the width as
+    // derived, so it follows the bound instead of freezing at its first value.
+    float wrap = text->autoWrapped ? 0.0f : text->wrapWidth;
+    bool bounded = widthMode != YGMeasureModeUndefined && width > 0.0f
+        && !std::isnan(width);
+    if (wrap <= 0.0f) {
+        TextRenderable* mut = e.try_get_mut<TextRenderable>();
+        if (bounded) {
+            float natural = measureText(g_yoga_vg, text->text, 0.0f).w;
+            if (natural > width + 0.5f) {
+                wrap = width;
+                if (mut) { mut->wrapWidth = width; mut->autoWrapped = true; }
+            } else if (mut && mut->autoWrapped) {
+                mut->wrapWidth = 0.0f; mut->autoWrapped = false;
+            }
+        } else if (text->autoWrapped) {
+            // No bound this pass: keep the previously derived width rather
+            // than measuring one long line into an unbounded parent.
+            wrap = text->wrapWidth;
+        }
     }
 
     TextSize ts = measureText(g_yoga_vg, text->text, wrap);
@@ -3508,6 +3527,31 @@ uint32_t entity_type_color(const std::string& name)
     return entity_badge_color(std::hash<std::string>{}(name) % 977);
 }
 
+// Part-of-speech colors sampled from language_2 (polylm): the endesga
+// palette walked with pos_read.py's jump of 13 for contrast, but bound to a
+// FIXED tag order -- English class frequency -- instead of first-encounter
+// order, so the assignment is stable across sessions and sentences. NOUN
+// wears the dark maroon that dominates language_2's frames. Tags outside
+// the table fall back to the hash palette like any other type name.
+uint32_t pos_type_color(const std::string& tag)
+{
+    // Hue families kept from the straight palette walk, but the colliding
+    // members moved to distant endesga entries: the walk had handed NOUN,
+    // PRON and X three near-identical maroons, PUNCT, AUX and DET three
+    // golds, VERB and ADV two cyans. Worst pairwise (perceptual) distance
+    // nearly doubles, and what remains close is only the rare classes.
+    static const std::unordered_map<std::string, uint32_t> colors = {
+        {"NOUN",  0x5d2c28FF}, {"PUNCT", 0xffc825FF}, {"VERB",  0x0cf1ffFF},
+        {"ADP",   0xc85086FF}, {"DET",   0xe07438FF}, {"PROPN", 0x1e6f50FF},
+        {"ADJ",   0x3003d9FF}, {"PRON",  0x5ac54fFF}, {"AUX",   0x93388fFF},
+        {"ADV",   0x0098dcFF}, {"CCONJ", 0xca52c9FF}, {"PART",  0xf9e6cfFF},
+        {"NUM",   0xd3fc7eFF}, {"SCONJ", 0x7a09faFF}, {"X",     0xc42430FF},
+        {"INTJ",  0xfdd2edFF}, {"SYM",   0x8a4836FF},
+    };
+    auto hit = colors.find(tag);
+    return hit != colors.end() ? hit->second : entity_type_color(tag);
+}
+
 
 // Width a longform badge wraps to. Fixed rather than derived: the text has no
 // natural width, so something has to choose one, and a column of messages that
@@ -5297,6 +5341,227 @@ bool point_in_bounds(float x, float y, UIElementBounds bounds)
     return (x >= bounds.xmin && x <= bounds.xmax && y >= bounds.ymin && y <= bounds.ymax);
 }
 
+static std::string surface_words(const std::string& template_str);
+
+// Height reserved above a sentence row for its POS tier: the tile's cell
+// height (line 1 + space 2 + box 10 + space 2 + line 1 = 16) plus breathing
+// room. Sentence rows carry this as top margin; the tier floats in it as an
+// absolute strip.
+static constexpr float POS_TIER_HEIGHT = 20.0f;
+
+// The live paraphrase branch, at most one: a span of the annotated sentence
+// being re-worded into a more explicit form than was said ("my life" ->
+// "life of Wesley"). The surface is never touched -- the branch is a second
+// line below the sentence, seeded with the span's words and reshaped from
+// there. While it is open it owns the keyboard outright, the same
+// exclusivity the annotator itself claims from the chat draft.
+static struct {
+    bool editing = false;
+    bool swallow_char = false;  // the opening B's own char event
+    std::string text;           // the paraphrase being typed
+    std::string span;           // the surface words it explicates
+    std::string message;        // surface of the message it belongs to
+    flecs::entity row;          // the line below the sentence
+    flecs::entity slot;         // where its words live -- and, once
+                                // committed, where the annotator builds
+    flecs::entity outline;      // the edit-in-progress ring
+    flecs::entity label;        // the text being typed, cursor included
+    flecs::entity arc;          // curve from the span to the row
+} g_branch;
+
+// A committed branch waiting for the bridge, same pattern as g_pending_teach:
+// Enter pressed while the client is busy teaches late rather than never.
+static struct BranchCommit {
+    std::string message, span, paraphrase;
+} g_pending_branch;
+
+static void try_send_branch()
+{
+    if (g_pending_branch.paraphrase.empty()) return;
+    flecs::entity client = world->lookup("EntityCreateClient");
+    if (!client.is_valid() || client.has<AwaitResponse>()) return;
+    client.set<SendMapRequest>({{
+        {"type", "branch"},
+        {"message", g_pending_branch.message},
+        {"span", g_pending_branch.span},
+        {"paraphrase", g_pending_branch.paraphrase},
+    }});
+    client.set<AwaitResponse>({[](std::map<std::string, msgpack::object>&) {
+        g_pending_branch = {};
+    }});
+}
+
+// Every committed branch is one line of nominalization supervision: what was
+// said, which words of it were re-worded, and what they became.
+static void append_branch_record(const std::string& message,
+                                 const std::string& span,
+                                 const std::string& paraphrase)
+{
+    std::ofstream log("../branches.jsonl", std::ios::app);
+    if (!log) return;
+    auto escape = [](const std::string& in) {
+        std::string out;
+        for (char c : in) {
+            if (c == '"' || c == '\\') out += '\\';
+            out += c;
+        }
+        return out;
+    };
+    log << "{\"ts\": " << (long long)std::time(nullptr)
+        << ", \"message\": \"" << escape(message) << "\""
+        << ", \"span\": \"" << escape(span) << "\""
+        << ", \"paraphrase\": \"" << escape(paraphrase) << "\"}\n";
+}
+
+static void branch_update_label()
+{
+    if (!g_branch.label.is_valid() || !g_branch.label.is_alive()) return;
+    if (TextRenderable* text = g_branch.label.try_get_mut<TextRenderable>())
+        text->text = g_branch.text + "|";
+}
+
+static void close_branch(bool commit)
+{
+    if (commit && !g_branch.text.empty()) {
+        g_pending_branch = {g_branch.message, g_branch.span, g_branch.text};
+        append_branch_record(g_branch.message, g_branch.span, g_branch.text);
+
+        // The row STAYS: a committed branch is a full annotatable line, not
+        // a transient edit. Its text becomes a sentence template, the line
+        // registers in the message ring (Up/Down reaches it, all badge
+        // gestures work, its annotations ground like any sentence's), and
+        // the selector moves onto it ready to annotate.
+        if (g_branch.label.is_valid() && g_branch.label.is_alive())
+            g_branch.label.destruct();   // the annotator renders the words now
+        if (g_branch.outline.is_valid() && g_branch.outline.is_alive()) {
+            // The ring dims: no longer an edit, now a line of the record.
+            if (RoundedRectRenderable* ring =
+                    g_branch.outline.try_get_mut<RoundedRectRenderable>())
+                ring->color = 0x333333FF;
+        }
+        if (g_branch.slot.is_valid() && g_branch.slot.is_alive())
+            g_branch.slot.ensure<UIMargin>().top = POS_TIER_HEIGHT;
+
+        world->query<WordAnnotationSelector>().each(
+            [](flecs::entity, WordAnnotationSelector& selector) {
+                if (!selector.active) return;
+                if (g_current_message_idx >= 0
+                    && g_current_message_idx < (int)g_annotatable_messages.size()) {
+                    auto& msg = g_annotatable_messages[g_current_message_idx];
+                    msg.sentence_template = selector.sentence_template;
+                    msg.ui_entities = selector.ui_entities;
+                    msg.selection_entities = selector.selection_entities;
+                    msg.token_count = selector.token_count;
+                }
+                g_annotatable_messages.push_back({g_branch.text, g_branch.slot});
+                g_current_message_idx = (int)g_annotatable_messages.size() - 1;
+                selector.sentence_template = g_branch.text;
+                selector.parent_entity = g_branch.slot;
+                selector.ui_entities.clear();
+                selector.selection_entities.clear();
+                selector.token_count = 0;
+                selector.start_index = 0;
+                selector.end_index = 0;
+                selector.dirty = true;
+            });
+    } else {
+        if (g_branch.row.is_valid() && g_branch.row.is_alive()) g_branch.row.destruct();
+        if (g_branch.arc.is_valid() && g_branch.arc.is_alive()) g_branch.arc.destruct();
+    }
+    g_branch = {};
+}
+
+static void open_branch(WordAnnotationSelector& selector)
+{
+    auto tokens = parse_sentence_template(selector.sentence_template);
+
+    // The selected span's surface words, gathered across every token whose
+    // selection stops intersect the range -- joined badges and triple blocks
+    // contribute their whole surface, which is what branching wants.
+    int expanded_pos = 0;
+    std::string span;
+    for (size_t ti = 0; ti < tokens.size(); ti++) {
+        int width = token_selection_width(tokens, ti);
+        int lo = expanded_pos, hi = expanded_pos + width - 1;
+        if (width > 0 && hi >= selector.start_index && lo <= selector.end_index
+            && !tokens[ti].text.empty()) {
+            if (!span.empty()) span += ' ';
+            span += tokens[ti].text;
+        }
+        expanded_pos += width;
+    }
+    if (span.empty()) return;
+
+    flecs::entity container = selector.parent_entity;
+    if (!container.is_valid() || !container.is_alive()) return;
+    // The row lives in the message's stack, BESIDE the sentence container,
+    // never inside it: a rebuild of the sentence destroys the sentence
+    // container's children, and a committed branch must survive that.
+    flecs::entity stack = container.parent();
+    if (!stack.is_valid() || !stack.is_alive()) return;
+
+    g_branch.editing = true;
+    g_branch.swallow_char = true;   // the B keystroke's own char event
+    g_branch.text = span;           // seeded with what was said
+    g_branch.span = span;
+    g_branch.message = surface_words(selector.sentence_template);
+
+    auto UIElement = world->lookup("UIElement");
+    auto row = world->entity()
+        .is_a(UIElement)
+        .child_of(stack)
+        .add(flecs::OrderedChildren)
+        .add<UIYoga>()
+        .set<UIFlexContainer>({YGFlexDirectionRow, YGWrapNoWrap,
+                               YGJustifyFlexStart, YGAlignCenter, 6.0f})
+        .set<UIPadding>({2.0f, 8.0f, 2.0f, 8.0f})
+        .set<RoundedRectRenderable>({0.0f, 0.0f, 2.0f, false, 0x121212FF})
+        .set<ZIndex>({14});
+    // Outlined in the selection blue: this row is an edit in progress. The
+    // ring dims when the branch commits and becomes a line of the record.
+    g_branch.outline = world->entity()
+        .is_a(UIElement).child_of(row).add<UIYoga>()
+        .set<UIAbsoluteEdges>({0.0f, 0.0f, 0.0f, 0.0f})
+        .set<RoundedRectRenderable>({0.0f, 0.0f, 2.0f, true, 0x4488FFAA})
+        .set<ZIndex>({15});
+    world->entity()
+        .is_a(UIElement).child_of(row).add<UIYoga>()
+        .set<TextRenderable>({"↳", "CharisSIL", 16.0f, 0x4488FFFF})
+        .set<ZIndex>({20});
+    // The slot the words live in -- and, after commit, the container the
+    // annotator rebuilds into, exactly like a sentence row. It takes the
+    // remaining width so annotation badges can wrap within the panel.
+    g_branch.slot = world->entity()
+        .is_a(UIElement).child_of(row)
+        .add(flecs::OrderedChildren)
+        .add<UIYoga>()
+        .set<UIFlexItem>({1.0f, 1.0f, YGAlignAuto})
+        .set<UIFlexContainer>({YGFlexDirectionRow, YGWrapWrap,
+                               YGJustifyFlexStart, YGAlignCenter, 2.0f});
+    g_branch.label = world->entity()
+        .is_a(UIElement).child_of(g_branch.slot).add<UIYoga>()
+        .set<TextRenderable>({g_branch.text + "|", "JetBrainsMono", 14.0f, 0xFFFFFFFF})
+        .set<ZIndex>({20});
+    g_branch.row = row;
+
+    // The identity between what was said and its explication, as an arc.
+    flecs::entity anchor = (selector.start_index >= 0
+        && selector.start_index < (int)selector.selection_entities.size())
+        ? selector.selection_entities[selector.start_index]
+        : flecs::entity::null();
+    if (anchor.is_valid() && anchor.is_alive()) {
+        // In the stack, not the sentence container: the arc outlives sentence
+        // rebuilds alongside the row. If a rebuild destroys the anchor, the
+        // arc system hides the curve rather than drawing to a ghost.
+        g_branch.arc = world->entity()
+            .is_a(UIElement)
+            .child_of(stack)
+            .set<CorefArc>({anchor, row})
+            .set<QuadraticBezierRenderable>({0, 0, 0, 0, 0, 0, 1.5f, 0x4488FFFF})
+            .set<ZIndex>({28});
+    }
+}
+
 // The rect a renderable is clipped to: its own ScissorContainer target if it
 // carries one, otherwise the nearest ancestor's.
 //
@@ -5624,6 +5889,17 @@ static flecs::entity focused_entity_query()
 static void char_callback(GLFWwindow* window, unsigned int codepoint)
 {
     if (codepoint < 32 || codepoint >= 127) return;
+
+    // An open branch takes every printable character, ahead of everything --
+    // it is a text field that exists precisely because the words being typed
+    // are NOT the sentence's words. The opening B's own char event is
+    // swallowed so the gesture key doesn't type itself into the row.
+    if (g_branch.editing) {
+        if (g_branch.swallow_char) { g_branch.swallow_char = false; return; }
+        g_branch.text.push_back(static_cast<char>(codepoint));
+        branch_update_label();
+        return;
+    }
 
     // While annotation is active it owns the keyboard outright. Binding keys
     // (digits, letters) are handled in key_callback; without this, a chat draft
@@ -6059,7 +6335,7 @@ static struct {
     bool valid = false;
     bool stale = true;
     int states = 0, arcs = 0, lexicon = 0;
-    struct Rule { std::string in, out; int support; float confidence; };
+    struct Rule { std::string in, out, layer; int support; float confidence; };
     std::vector<Rule> rules;
     std::string signature;
 } g_transducer;
@@ -6081,11 +6357,12 @@ void transducer_dump_response(std::map<std::string, msgpack::object>& res_map)
                 g_transducer.rules.push_back({
                     rule.count("in") ? rule["in"].as<std::string>() : "",
                     rule.count("out") ? rule["out"].as<std::string>() : "",
+                    rule.count("layer") ? rule["layer"].as<std::string>() : "",
                     rule.count("support") ? (int)rule["support"].as<int64_t>() : 0,
                     rule.count("confidence") ? (float)rule["confidence"].as<double>() : 0.0f,
                 });
                 auto& r = g_transducer.rules.back();
-                g_transducer.signature += r.in + ">" + r.out + ":"
+                g_transducer.signature += r.layer + ":" + r.in + ">" + r.out + ":"
                     + std::to_string(r.support) + ":"
                     + std::to_string((int)(r.confidence * 1000)) + ";";
             }
@@ -6101,6 +6378,7 @@ void transducer_dump_response(std::map<std::string, msgpack::object>& res_map)
 // rather than never.
 static std::string g_pending_teach;   // "Type\tText\n..." awaiting the bridge
 static std::pair<std::string, std::string> g_pending_false;   // rejected derivation
+static std::string g_pending_false_relation = "NotLemmaOf";
 
 void teach_number_response(std::map<std::string, msgpack::object>& res_map)
 {
@@ -6123,6 +6401,7 @@ static void try_send_false()
         {"type", "teach_false"},
         {"word", g_pending_false.first},
         {"variant", g_pending_false.second},
+        {"relation", g_pending_false_relation},
     }});
     client.set<AwaitResponse>({[](std::map<std::string, msgpack::object>&) {
         g_pending_false = {};
@@ -6144,6 +6423,215 @@ static void try_send_teach()
         {"forms", g_pending_teach},
     }});
     client.set<AwaitResponse>({teach_number_response});
+}
+
+// What the preprocessing pass sent, so its async reply can verify nothing
+// changed underneath it before rewriting the template.
+static std::string g_expand_sent;
+
+void expand_text_response(std::map<std::string, msgpack::object>& res_map)
+{
+    bool changed = res_map.count("changed") && res_map["changed"].as<bool>();
+    if (!changed) { g_expand_sent.clear(); return; }
+    std::string expanded = res_map.count("text")
+        ? res_map["text"].as<std::string>() : std::string();
+    if (expanded.empty()) { g_expand_sent.clear(); return; }
+
+    // Compare-and-set: only rewrite a template that is still exactly the text
+    // we preprocessed. If annotation began in the gap, the user's state wins.
+    world->query<WordAnnotationSelector>().each(
+        [&](flecs::entity, WordAnnotationSelector& selector) {
+            if (selector.sentence_template == g_expand_sent) {
+                selector.sentence_template = expanded;
+                selector.dirty = true;
+            }
+        });
+    g_expand_sent.clear();
+}
+
+// Default part-of-speech tags from the spaCy server: one tag per whitespace
+// word, keyed by the sentence's surface text. A cache rather than a single
+// slot because the annotator moves across messages and each keeps its tier
+// without re-asking. Values are (word, tag) pairs, index-parallel with the
+// surface words.
+static std::map<std::string, std::vector<std::pair<std::string, std::string>>> g_pos_cache;
+static std::string g_pos_requested;
+
+
+// The sentence as typed: every token's surface text, space-joined. This is
+// the POS cache key AND the text sent for tagging, so annotating a word
+// (which rewrites the template but not the surface) never invalidates its
+// sentence's tags.
+static std::string surface_words(const std::string& template_str)
+{
+    std::string joined;
+    for (const auto& token : parse_sentence_template(template_str)) {
+        if (token.text.empty()) continue;
+        if (!joined.empty()) joined += ' ';
+        joined += token.text;
+    }
+    return joined;
+}
+
+// The default POS tier, above the sentence: the language_2 tile grammar,
+// one tile for the whole sentence. Each word is a box colored by its
+// part-of-speech type, its width proportional to the word's character
+// count, boxes butted into one continuous bar. The frame is NOT one
+// enclosure in one color: every box carries its own top and bottom 1px
+// line segment in its own POS color, EXACTLY two pixels of empty black
+// between box and line, and the two end boxes close the bar with [ and ]
+// shaped edges -- so the frame alone shows the sentence's class structure,
+// and the bar's length its wordwise shape. Absolute, floating in the
+// margin the sentence row reserves above itself, so it never disturbs the
+// token layout. Defaults only: the tags come from the spaCy server and
+// annotate nothing in the world until adopted.
+//
+// A separate builder, not part of the sentence rebuild, so a tag reply
+// landing after the sentence is on screen can grow the tier IN PLACE --
+// tearing the whole sentence down for a strip is a visible stutter.
+static void build_pos_tier(flecs::entity container,
+                           const std::vector<std::pair<std::string, std::string>>& tags)
+{
+    if (tags.empty() || !container.is_valid() || !container.is_alive()) return;
+
+    // Idempotent: one tier per sentence, the newest tags win.
+    std::vector<flecs::entity> stale;
+    container.children([&stale](flecs::entity child) {
+        if (child.has<PosTier>()) stale.push_back(child);
+    });
+    for (flecs::entity child : stale) child.destruct();
+
+    auto UIElement = world->lookup("UIElement");
+    auto strip = world->entity()
+        .is_a(UIElement)
+        .child_of(container)
+        .add<PosTier>()
+        .add(flecs::OrderedChildren)
+        .add<UIYoga>()
+        .set<UIAbsoluteEdges>({0.0f, -POS_TIER_HEIGHT, YGUndefined, YGUndefined})
+        .set<UIFlexContainer>({YGFlexDirectionRow, YGWrapNoWrap,
+                               YGJustifyFlexStart, YGAlignCenter, 6.0f})
+        .set<ZIndex>({18});
+    constexpr float POS_BOX_H = 10.0f;            // box height
+    constexpr float POS_CHAR_W = 4.0f;            // width per character
+    constexpr float POS_CELL_H = POS_BOX_H + 6.0f;// line, 2px, box, 2px, line
+    auto tile = world->entity()
+        .is_a(UIElement)
+        .child_of(strip)
+        .add(flecs::OrderedChildren)
+        .add<UIYoga>()
+        .set<UIFlexContainer>({YGFlexDirectionRow, YGWrapNoWrap,
+                               YGJustifyFlexStart, YGAlignCenter, 0.0f})
+        .set<ZIndex>({18});
+    const size_t pos_last = tags.size() - 1;
+    for (size_t wi = 0; wi < tags.size(); wi++) {
+        // The tag names a type; the type is an entity; the entity has its
+        // identity color -- same rule as every badge in the system.
+        uint32_t sq_color = pos_type_color(tags[wi].second);
+        bool cap_left = (wi == 0), cap_right = (wi == pos_last);
+        float box_w = POS_CHAR_W
+            * (float)std::max<size_t>(1, tags[wi].first.size());
+        // The caps sit outside the fill: bracket (1) plus the 2px of
+        // space, so the fill width stays strictly proportional.
+        float cell_w = box_w + (cap_left ? 3.0f : 0.0f)
+                             + (cap_right ? 3.0f : 0.0f);
+        auto cell = world->entity()
+            .is_a(UIElement)
+            .child_of(tile)
+            .add<UIYoga>()
+            .set<UISize>({cell_w, POS_CELL_H})
+            .set<ZIndex>({18});
+        // This box's own top and bottom segments, full cell width, so
+        // adjacent segments butt into one continuous multi-colored line.
+        world->entity().is_a(UIElement).child_of(cell).add<UIYoga>()
+            .set<UIAbsoluteEdges>({0.0f, 0.0f, 0.0f, YGUndefined})
+            .set<UISize>({YGUndefined, 1.0f})
+            .set<RectRenderable>({0.0f, 0.0f, false, sq_color})
+            .set<ZIndex>({19});
+        world->entity().is_a(UIElement).child_of(cell).add<UIYoga>()
+            .set<UIAbsoluteEdges>({0.0f, YGUndefined, 0.0f, 0.0f})
+            .set<UISize>({YGUndefined, 1.0f})
+            .set<RectRenderable>({0.0f, 0.0f, false, sq_color})
+            .set<ZIndex>({19});
+        // End caps: a full-height vertical joining the top and bottom
+        // segments -- [ on the first box, ] on the last.
+        if (cap_left) {
+            world->entity().is_a(UIElement).child_of(cell).add<UIYoga>()
+                .set<UIAbsoluteEdges>({0.0f, 0.0f, YGUndefined, 0.0f})
+                .set<UISize>({1.0f, YGUndefined})
+                .set<RectRenderable>({0.0f, 0.0f, false, sq_color})
+                .set<ZIndex>({19});
+        }
+        if (cap_right) {
+            world->entity().is_a(UIElement).child_of(cell).add<UIYoga>()
+                .set<UIAbsoluteEdges>({YGUndefined, 0.0f, 0.0f, 0.0f})
+                .set<UISize>({1.0f, YGUndefined})
+                .set<RectRenderable>({0.0f, 0.0f, false, sq_color})
+                .set<ZIndex>({19});
+        }
+        world->entity().is_a(UIElement).child_of(cell).add<UIYoga>()
+            .set<UIAbsoluteEdges>({cap_left ? 3.0f : 0.0f, 3.0f,
+                                   YGUndefined, YGUndefined})
+            .set<UISize>({box_w, POS_BOX_H})
+            .set<RectRenderable>({0.0f, 0.0f, false, sq_color})
+            .set<ZIndex>({20});
+    }
+}
+
+// A tag reply for a sentence already on screen: recolor its words and grow
+// its tier in place. No teardown -- rebuilding the sentence for this is
+// what made submitting a message visibly jerk.
+static void apply_pos_to_selector(WordAnnotationSelector& selector,
+                                  const std::vector<std::pair<std::string, std::string>>& tags)
+{
+    auto tokens = parse_sentence_template(selector.sentence_template);
+    size_t word_idx = 0;
+    int sel_pos = 0;
+    for (size_t ti = 0; ti < tokens.size(); ti++) {
+        size_t word_start = word_idx;
+        bool in_word = false;
+        for (char c : tokens[ti].text) {
+            if (c == ' ') in_word = false;
+            else if (!in_word) { in_word = true; word_idx++; }
+        }
+        int width = token_selection_width(tokens, ti);
+        if (tokens[ti].type == TokenType::PlainText
+            && sel_pos < (int)selector.selection_entities.size()
+            && word_start < tags.size()) {
+            flecs::entity ent = selector.selection_entities[sel_pos];
+            if (ent.is_valid() && ent.is_alive()) {
+                if (TextRenderable* text = ent.try_get_mut<TextRenderable>())
+                    text->color = scale_color(
+                        pos_type_color(tags[word_start].second), 1.5f);
+            }
+        }
+        sel_pos += width;
+    }
+    build_pos_tier(selector.parent_entity, tags);
+}
+
+void pos_tags_response(std::map<std::string, msgpack::object>& res_map)
+{
+    if (!g_pos_requested.empty() && res_map.count("words") && res_map.count("tags")) {
+        try {
+            auto words = res_map["words"].as<std::vector<std::string>>();
+            auto tags = res_map["tags"].as<std::vector<std::string>>();
+            if (words.size() == tags.size() && !words.empty()) {
+                auto& entry = g_pos_cache[g_pos_requested];
+                entry.clear();
+                for (size_t i = 0; i < words.size(); i++)
+                    entry.push_back({words[i], tags[i]});
+                // Sentences showing this surface take the tags in place --
+                // recolored words and a fresh tier, never a rebuild.
+                world->query<WordAnnotationSelector>().each(
+                    [&entry](flecs::entity, WordAnnotationSelector& selector) {
+                        if (surface_words(selector.sentence_template) == g_pos_requested)
+                            apply_pos_to_selector(selector, entry);
+                    });
+            }
+        } catch (const std::exception&) {}
+    }
+    g_pos_requested.clear();
 }
 
 void morphology_response(std::map<std::string, msgpack::object>& res_map)
@@ -6230,6 +6718,32 @@ void sync_representation_grounding(WordAnnotationSelector& selector, const std::
 
     auto tokens = parse_sentence_template(template_str);
     auto UIElement = world->lookup("UIElement");
+
+    // Phase one of the annotator: the POS transformer. The pipeline idea is
+    // that phases each re-render the same annotatable text transformed --
+    // and this first one applies the part-of-speech colors to the words
+    // themselves. Tags are index-parallel with the sentence's whitespace
+    // words, so each token's word position is precomputed here; the render
+    // loop below exits early down several paths, and counting inline would
+    // desynchronise the tags from the words.
+    const std::vector<std::pair<std::string, std::string>>* pos_tags = nullptr;
+    {
+        auto pos_hit = g_pos_cache.find(surface_words(template_str));
+        if (pos_hit != g_pos_cache.end() && !pos_hit->second.empty())
+            pos_tags = &pos_hit->second;
+    }
+    std::vector<size_t> token_word_start(tokens.size(), 0);
+    {
+        size_t acc = 0;
+        for (size_t i = 0; i < tokens.size(); i++) {
+            token_word_start[i] = acc;
+            bool in_word = false;
+            for (char c : tokens[i].text) {
+                if (c == ' ') in_word = false;
+                else if (!in_word) { in_word = true; acc++; }
+            }
+        }
+    }
 
     // Slots for tokens rendered ahead of their turn. An entity that joins the
     // relationship next to it is drawn *inside* that block, so by the time the
@@ -6374,17 +6888,31 @@ void sync_representation_grounding(WordAnnotationSelector& selector, const std::
             if (insert_parent != container) member_colors.push_back(color);
             selector.selection_entities.push_back(badge);
         } else {
-            // Plain text
+            // Plain text: not yet annotated, so the POS transformer's color
+            // is the default rendering -- the word wears its class. Falls
+            // back to the neutral gray until the tags arrive. Annotated
+            // tokens are untouched: user work always outranks a default.
+            // Lifted from the sampled color, not the color itself: the dark
+            // classes (NOUN's maroon) frame beautifully but vanish as thin
+            // glyphs on black. Same hue, badge-light treatment.
+            uint32_t word_color = 0x777777FF;
+            if (pos_tags && token_word_start[token_idx] < pos_tags->size())
+                word_color = scale_color(pos_type_color(
+                    (*pos_tags)[token_word_start[token_idx]].second), 1.5f);
             flecs::entity text_ent = world->entity().is_a(UIElement).child_of(insert_parent)
                 .add<UIYoga>()
                 .add<UIYogaLegacyLeaf>()
-                .set<TextRenderable>({token.text.c_str(), "CharisSIL", 16.0f, 0x777777FF})
+                .set<TextRenderable>({token.text.c_str(), "CharisSIL", 16.0f, word_color})
                 .set<ZIndex>({17});
-                
+
             selector.selection_entities.push_back(text_ent);
         }
     }
     
+    // The default POS tier, above the sentence -- built by the shared
+    // builder so a late tag reply can add it in place without this rebuild.
+    if (pos_tags) build_pos_tier(container, *pos_tags);
+
     // Same symbol, two places, not fused: draw the identity as an arc.
     for (const auto& referring : referring_slots) {
         auto anchor = symbol_anchors.find(referring.first);
@@ -6453,6 +6981,27 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
         return;
     }
 
+    // An open paraphrase branch owns the keyboard: printable characters
+    // arrive through char_callback; here only the frame keys act, and every
+    // other key is swallowed so arrows and gesture letters can't reach the
+    // annotator and rewrite the sentence mid-edit. Backspace on an already
+    // empty row cancels the branch (Escape quits the whole app, so it can't
+    // be the cancel gesture).
+    if (g_branch.editing && (action == GLFW_PRESS || action == GLFW_REPEAT))
+    {
+        if (key == GLFW_KEY_BACKSPACE) {
+            if (!g_branch.text.empty()) {
+                g_branch.text.pop_back();
+                branch_update_label();
+            } else {
+                close_branch(false);
+            }
+        } else if (key == GLFW_KEY_ENTER || key == GLFW_KEY_KP_ENTER) {
+            close_branch(true);
+        }
+        return;
+    }
+
     // Blender-style numpad views for the Droid panel's 3D scene. Consumed only
     // while the pointer is over that panel, so the numpad still reaches text
     // fields and the VNC passthrough everywhere else. Repeats are honoured so
@@ -6487,9 +7036,7 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                 if (panel.selecting) char_mode = true;
                 if (lex_word.empty()) lex_word = panel.shown;
             });
-            int chip_count = 0;
-            for (char c : lex_word)
-                if (!std::isspace(static_cast<unsigned char>(c))) chip_count++;
+            int chip_count = (int)lex_word.size();
 
             bool annotating_now = false;
             static flecs::query<WordAnnotationSelector> lex_annotators =
@@ -6502,10 +7049,7 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                 && (mods & GLFW_MOD_CONTROL) && chip_count > 0) {
                 lexicons.each([&](flecs::entity, LexiconPanel& panel) {
                     if (panel.forms.empty() && !panel.shown.empty()) {
-                        std::string chars;
-                        for (char c : panel.shown)
-                            if (!std::isspace(static_cast<unsigned char>(c))) chars += c;
-                        panel.forms.push_back({chars, std::string()});
+                        panel.forms.push_back({panel.shown, std::string()});
                     }
                     panel.selecting = true;
                     panel.row = 0;
@@ -6518,6 +7062,13 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
 
             if (char_mode) {
                 bool shift = (mods & GLFW_MOD_SHIFT) != 0;
+                // While the type field is active, letters are letters --
+                // X included ("Expansion" contains one). Gesture keys only
+                // mean gestures over the character rows.
+                bool typing_field = false;
+                lexicons.each([&](flecs::entity, LexiconPanel& panel) {
+                    if (panel.typing_type) typing_field = true;
+                });
                 auto row_len = [](LexiconPanel& panel) {
                     return (panel.row < (int)panel.forms.size())
                         ? (int)panel.forms[panel.row].text.size() : 0;
@@ -6595,7 +7146,7 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                     });
                     return;
                 }
-                if (key == GLFW_KEY_X) {
+                if (key == GLFW_KEY_X && !typing_field) {
                     // On a machine-proposed row, X is rejection: the guessed
                     // derivation is wrong, the row disappears, and the
                     // rejection is taught to the world as a NotLemmaOf pair
@@ -6606,6 +7157,11 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                         if (!panel.forms[panel.row].proposed) return;
                         g_pending_false = {panel.forms[0].text,
                                            panel.forms[panel.row].text};
+                        // The layer that proposed the row decides which
+                        // negative relation the rejection teaches.
+                        g_pending_false_relation =
+                            (panel.forms[panel.row].type == "Expansion")
+                                ? "NotExpansionOf" : "NotLemmaOf";
                         panel.forms.erase(panel.forms.begin() + panel.row);
                         panel.row = std::clamp(panel.row - 1, 0,
                                                std::max(0, (int)panel.forms.size() - 1));
@@ -6672,8 +7228,10 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
 
                     // Otherwise: insert after the selected character; Shift
                     // inserts before, which is how a prepend at 0 is reached.
-                    if (inserted == ' ') return;   // spaces belong to types only
-                    inserted = (char)std::tolower(static_cast<unsigned char>(inserted));
+                    // Spaces are legal in variants -- "Here is" is a variant
+                    // of "Here's".
+                    if (inserted != ' ')
+                        inserted = (char)std::tolower(static_cast<unsigned char>(inserted));
                     lexicons.each([&](flecs::entity, LexiconPanel& panel) {
                         if (panel.row == 0 || panel.row >= (int)panel.forms.size()) return;
                         std::string& text = panel.forms[panel.row].text;
@@ -6687,7 +7245,7 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                     });
                     return;
                 }
-                if (key == GLFW_KEY_DELETE) {
+                if (key == GLFW_KEY_DELETE && !typing_field) {
                     // Delete removes the selected variant row outright. The
                     // surface row stays -- it is the word from the sentence,
                     // not ours to remove. Distinct from X, which rejects a
@@ -6879,14 +7437,17 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                     selector.start_index = 0;
                     selector.end_index = 0;
 
-                    // If no UI entities yet for this message, create them
-                    if (selector.ui_entities.empty() && !selector.sentence_template.empty()) {
+                    // Rebuild only when this message's UI genuinely doesn't
+                    // exist. The old test read ui_entities, which nothing
+                    // ever populates, so EVERY jump tore the sentence down
+                    // and rebuilt it -- the flicker. selection_entities is
+                    // what the rebuild actually fills; the liveness check
+                    // guards against a save from before a teardown.
+                    bool built = !selector.selection_entities.empty()
+                        && selector.selection_entities.front().is_valid()
+                        && selector.selection_entities.front().is_alive();
+                    if (!built && !selector.sentence_template.empty()) {
                         selector.dirty = true;
-                        // recreate_annotation_entities(selector);
-                        // Save newly created entities back
-                        new_msg.ui_entities = selector.ui_entities;
-                        new_msg.selection_entities = selector.selection_entities;
-                        new_msg.token_count = selector.token_count;
                     }
                 });
                 return;
@@ -7057,11 +7618,28 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
             if (handled) return;
         }
 
+        // B - branch the selected span into an explicit paraphrase: a second
+        // line below the sentence, seeded with the span's words, reshaped
+        // into what the span MEANS ("my life" -> "life of Wesley"). The
+        // surface is never touched; Enter commits the branch as a Paraphrase
+        // entity related ExplicationOf to the message.
+        if (key == GLFW_KEY_B)
+        {
+            bool handled = false;
+            annotation_query.each([&](flecs::entity e, WordAnnotationSelector& selector) {
+                if (!selector.active || selector.sentence_template.empty()) return;
+                if (g_branch.editing) return;
+                open_branch(selector);
+                handled = g_branch.editing;
+            });
+            if (handled) return;
+        }
+
         // Letter keys (A-Z) - assign letter as binding symbol to selected token/part
-        // Exclude E, X, R which have special annotation functions
+        // Exclude E, X, R, Q, B which have special annotation functions
         if (key >= GLFW_KEY_A && key <= GLFW_KEY_Z &&
             key != GLFW_KEY_E && key != GLFW_KEY_X && key != GLFW_KEY_R &&
-            key != GLFW_KEY_Q)
+            key != GLFW_KEY_Q && key != GLFW_KEY_B)
         {
             char letter = 'a' + (key - GLFW_KEY_A);  // lowercase letter
             std::string symbol(1, letter);
@@ -7128,19 +7706,43 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                     } else if (tokens[token_idx].type == TokenType::Relationship) {
                         // Same translation as the digit handler: sub_part
                         // indexes the remaining stops, and with a joined side
-                        // the raw 0/1/2 layout no longer holds.
+                        // the raw 0/1/2 layout no longer holds. The same
+                        // symbol pressed again toggles the slot back to a
+                        // wildcard -- binding gestures are their own undo.
                         std::vector<int> roles = relationship_slot_roles(tokens, token_idx);
                         int role = (sub_part >= 0 && sub_part < (int)roles.size())
                                  ? roles[sub_part] : 1;
                         if (role == 0) {
-                            tokens[token_idx].source_symbol = symbol;
+                            tokens[token_idx].source_symbol =
+                                tokens[token_idx].source_symbol == symbol ? "" : symbol;
                         } else if (role == 2) {
-                            tokens[token_idx].target_symbol = symbol;
+                            tokens[token_idx].target_symbol =
+                                tokens[token_idx].target_symbol == symbol ? "" : symbol;
                         }
                         // badge part (1) doesn't accept symbol assignment
                         selector.sentence_template = tokens_to_template(tokens);
                         selector.dirty = true;
                         // recreate_annotation_entities(selector);
+                    } else if (tokens[token_idx].type == TokenType::Entity
+                               && tokens[token_idx].binding_symbol == symbol) {
+                        // The same symbol pressed again toggles the binding
+                        // off. A remote member vanishes outright -- no
+                        // surface stands behind it -- while a worded entity
+                        // returns to plain text.
+                        if (tokens[token_idx].text == "*") {
+                            tokens.erase(tokens.begin() + token_idx);
+                            if (selector.start_index > 0) {
+                                selector.start_index--;
+                                selector.end_index = selector.start_index;
+                            }
+                        } else {
+                            tokens[token_idx].type = TokenType::PlainText;
+                            tokens[token_idx].binding_symbol = "";
+                            tokens[token_idx].reified_symbol = "";
+                        }
+                        selector.sentence_template = tokens_to_template(tokens);
+                        selector.dirty = true;
+                        sync_representation_grounding(selector, selector.sentence_template);
                     } else if (tokens[token_idx].type == TokenType::Entity) {
                         // Update entity binding symbol
                         tokens[token_idx].binding_symbol = symbol;
@@ -7148,6 +7750,71 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                         selector.dirty = true;
                         sync_representation_grounding(selector, selector.sentence_template);
                         // recreate_annotation_entities(selector);
+                    } else if (tokens[token_idx].type == TokenType::Concept) {
+                        // A letter on the frame itself pulls a REMOTE member
+                        // into the comprehension: a token bound to that symbol
+                        // with no surface of its own, because the word it
+                        // stands for lives elsewhere -- a branch line's
+                        // "incomplete" joining the query beside "work". The
+                        // badge displays the symbol's lemma, found wherever
+                        // the symbol is bound across the message ring.
+                        //
+                        // Toggle, never duplicate: a query holds at most one
+                        // badge per symbol. If the symbol is already a member,
+                        // the press removes its remote badge instead; a worded
+                        // member is left alone (it is the word's annotation,
+                        // not the frame's) and the press adds nothing.
+                        int depth = 0;
+                        size_t frame_end = tokens.size();
+                        for (size_t i = token_idx; i < tokens.size(); i++) {
+                            if (tokens[i].type == TokenType::Concept) depth++;
+                            else if (tokens[i].type == TokenType::ConceptEnd
+                                     && --depth == 0) {
+                                frame_end = i;
+                                break;
+                            }
+                        }
+
+                        bool present = false, changed = false;
+                        for (size_t i = frame_end; i-- > (size_t)token_idx + 1; ) {
+                            if (tokens[i].type == TokenType::Entity
+                                && tokens[i].binding_symbol == symbol) {
+                                present = true;
+                                if (tokens[i].text == "*") {
+                                    tokens.erase(tokens.begin() + i);
+                                    changed = true;
+                                }
+                            }
+                        }
+
+                        if (!present) {
+                            std::string lemma;
+                            auto find_lemma = [&](const std::string& tmpl) {
+                                if (!lemma.empty()) return;
+                                for (const auto& tok : parse_sentence_template(tmpl)) {
+                                    if (tok.type == TokenType::Entity
+                                        && tok.binding_symbol == symbol
+                                        && tok.text != "*") {
+                                        lemma = tok.reified_symbol.empty()
+                                            ? tok.text : tok.reified_symbol;
+                                        return;
+                                    }
+                                }
+                            };
+                            find_lemma(selector.sentence_template);
+                            for (const auto& msg : g_annotatable_messages)
+                                find_lemma(msg.sentence_template);
+
+                            // Insert as the frame's last member, before ]].
+                            tokens.insert(tokens.begin() + frame_end,
+                                          {"*", symbol, "", "", lemma, TokenType::Entity});
+                            changed = true;
+                        }
+                        if (changed) {
+                            selector.sentence_template = tokens_to_template(tokens);
+                            selector.dirty = true;
+                            sync_representation_grounding(selector, selector.sentence_template);
+                        }
                     }
 
                     handled = true;
@@ -7455,10 +8122,34 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                                 tokens[i].reified_symbol = "";
                             }
                         }
+                        // Remote members have no surface word to revert to;
+                        // without the frame they are nothing, so they go with
+                        // it. Backwards, so the erases don't shift the rest.
+                        for (int i = limit - 1; i > token_idx; i--) {
+                            if (tokens[i].type == TokenType::Entity
+                                && tokens[i].text == "*") {
+                                tokens.erase(tokens.begin() + i);
+                                if (close >= 0) close--;
+                            }
+                        }
                         if (close >= 0) tokens.erase(tokens.begin() + close);
                         tokens.erase(tokens.begin() + token_idx);
                         selector.sentence_template = tokens_to_template(tokens);
                         selector.dirty = true;
+                        handled = true;
+                    }
+                    else if (tokens[token_idx].type == TokenType::Entity
+                             && tokens[token_idx].text == "*") {
+                        // A remote member: pulled into a frame by symbol, no
+                        // surface word of its own. X removes it outright --
+                        // there is nothing to revert to.
+                        tokens.erase(tokens.begin() + token_idx);
+                        selector.sentence_template = tokens_to_template(tokens);
+                        selector.dirty = true;
+                        if (selector.start_index > 0) {
+                            selector.start_index--;
+                            selector.end_index = selector.start_index;
+                        }
                         handled = true;
                     }
                     else if (tokens[token_idx].type == TokenType::Entity) {
@@ -7715,9 +8406,13 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                     // The interlocutor client might have some submodel dependencies...
                     // which might be logical to run on another server because other parts of Thornfield depend on it
 
-                    auto i_client = world->lookup("InterlocutorClient");
-                    i_client.set<SendMapRequest>({ { {"type", "message"}, {"content", chat->draft} } });
-                    i_client.set<AwaitResponse>({interlocutor_response});
+                    // Disabled for now: interlocutor.py is still the example
+                    // server, and its "At <timestamp> I read the latest
+                    // message" echo just noises up the history. Re-enable
+                    // when there is a real interlocutor behind the socket.
+                    // auto i_client = world->lookup("InterlocutorClient");
+                    // i_client.set<SendMapRequest>({ { {"type", "message"}, {"content", chat->draft} } });
+                    // i_client.set<AwaitResponse>({interlocutor_response});
 
                     // The message is also an entity. It lands in the headless
                     // world tagged Chat, so it is queryable and selectable
@@ -7731,6 +8426,20 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                     // Annotation badges for the message just sent: a wrapping
                     // Yoga row, so they flow onto further lines instead of
                     // running off the edge of the history panel.
+                    // The message's annotation stack: the sentence row plus
+                    // any committed paraphrase branch lines below it. Branch
+                    // rows live here BESIDE the sentence container, not
+                    // inside it, so rebuilding the sentence (which destroys
+                    // its children) leaves committed branches standing.
+                    auto message_stack = world->entity()
+                        .is_a(UIElement)
+                        .add(flecs::OrderedChildren)
+                        .add<UIYoga>()
+                        .set<UIFlexContainer>({
+                            YGFlexDirectionColumn, YGWrapNoWrap,
+                            YGJustifyFlexStart, YGAlignStretch, 4.0f})
+                        .child_of(chat_panel.message_list);
+
                     auto representation_ux = world->entity()
                         .is_a(UIElement)
                         // .add<DebugRenderBounds>()
@@ -7739,16 +8448,41 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                         .set<UIFlexContainer>({
                             YGFlexDirectionRow, YGWrapWrap,
                             YGJustifyFlexStart, YGAlignCenter, 2.0f})
-                        .child_of(chat_panel.message_list);
+                        // Room above for the sentence's POS tier, which
+                        // renders as an absolute strip in this margin.
+                        .set<UIMargin>({POS_TIER_HEIGHT, 0.0f, 0.0f, 0.0f})
+                        .child_of(message_stack);
 
                         // Register message in global list
                         
                         g_annotatable_messages.push_back({chat->draft, representation_ux});
                         int msg_idx = (int)g_annotatable_messages.size() - 1;
+                        // The selector now shows this message; without this,
+                        // the first Up/Down saved the fresh message's state
+                        // into whatever slot was current before -- so coming
+                        // back always looked unbuilt and rebuilt from scratch.
+                        g_current_message_idx = msg_idx;
 
                         flecs::entity interlocutorAnnotator = world->lookup("InterlocutorAnnotator");
 
                         // TODO: Only set sentence_template?
+                        // Preprocessing layer: the draft goes to the
+                        // expander before annotation work begins. Known
+                        // contractions unfold ("Here's" -> "Here is") so the
+                        // copula is annotatable as its own token; the reply
+                        // compare-and-sets, so beating it with an edit is safe.
+                        {
+                            flecs::entity expand_client = world->lookup("MorphologyExpandClient");
+                            if (expand_client.is_valid() && !expand_client.has<AwaitResponse>()) {
+                                g_expand_sent = chat->draft;
+                                expand_client.set<SendMapRequest>({{
+                                    {"type", "expand_text"},
+                                    {"text", chat->draft},
+                                }});
+                                expand_client.set<AwaitResponse>({expand_text_response});
+                            }
+                        }
+
                         interlocutorAnnotator.set<WordAnnotationSelector>({
                             chat->draft,           // sentence_template
                             {},                       // ui_entities
@@ -7869,6 +8603,13 @@ int main(int, char *[]) {
     flecs::entity entity_semantics_client = world->entity("EntitySemanticsClient")
         .set<ZMQClient>({ "ipc:///tmp/thornfield_entity_semantics_socket", zmq::socket_type::req });
 
+    // spaCy part-of-speech tagging: the default POS tier above each chat
+    // sentence, and eventually the noun gate for morphology rule constraints.
+    flecs::entity pos_server = world->entity("PosServer")
+        .set<SpawnRequest>({"python3", {"../scripts/pos.py"}});
+    flecs::entity pos_client = world->entity("PosClient")
+        .set<ZMQClient>({ "ipc:///tmp/thornfield_pos_socket", zmq::socket_type::req });
+
     // OpenFst plural transducer, induced live from lexicon.jsonl -- the S
     // gesture in the Lexicon panel teaches it.
     flecs::entity morphology_server = world->entity("MorphologyServer")
@@ -7876,6 +8617,8 @@ int main(int, char *[]) {
     flecs::entity morphology_client = world->entity("MorphologyClient")
         .set<ZMQClient>({ "ipc:///tmp/thornfield_morphology_socket", zmq::socket_type::req });
     flecs::entity morphology_rules_client = world->entity("MorphologyRulesClient")
+        .set<ZMQClient>({ "ipc:///tmp/thornfield_morphology_socket", zmq::socket_type::req });
+    flecs::entity morphology_expand_client = world->entity("MorphologyExpandClient")
         .set<ZMQClient>({ "ipc:///tmp/thornfield_morphology_socket", zmq::socket_type::req });
 
     // Bridge to a separate headless flecs world; the Entities panel's rows come
@@ -8901,6 +9644,17 @@ int main(int, char *[]) {
                                                YGJustifyFlexStart, YGAlignCenter, 3.0f})
                         .set<ZIndex>({12});
 
+                    if (!rule.layer.empty()) {
+                        world->entity()
+                            .is_a(UIElement)
+                            .child_of(row)
+                            .add<UIYoga>()
+                            .set<UIMargin>({0.0f, 6.0f, 0.0f, 0.0f})
+                            .set<TextRenderable>({rule.layer, "JetBrainsMono",
+                                                  11.0f, 0x6a6a6aFF})
+                            .set<ZIndex>({13});
+                    }
+
                     // The rewrite, in letter chips: consumed suffix, arrow,
                     // produced suffix (or the deletion mark when it produces
                     // nothing).
@@ -9008,7 +9762,28 @@ int main(int, char *[]) {
                     .set<ZIndex>({12});
                 int idx = 0;
                 for (char c : text) {
-                    if (std::isspace(static_cast<unsigned char>(c))) continue;
+                    // A space is a chip too -- a gap-width, selectable slot.
+                    // Every character must occupy an index, or the selection
+                    // ring desyncs from the text the moment a variant holds a
+                    // space ("Here is").
+                    if (std::isspace(static_cast<unsigned char>(c))) {
+                        auto gap = world->entity()
+                            .is_a(UIElement)
+                            .child_of(row)
+                            .add<UIYoga>()
+                            .set<UISize>({10.0f, 25.0f});
+                        if (idx >= ring_lo && idx <= ring_hi) {
+                            world->entity()
+                                .is_a(UIElement)
+                                .child_of(gap)
+                                .add<UIYoga>()
+                                .set<UIAbsoluteEdges>({-2.0f, -2.0f, -2.0f, -2.0f})
+                                .set<RoundedRectRenderable>({0.0f, 0.0f, 5.0f, true, 0xFFFFFFE0})
+                                .set<ZIndex>({14});
+                        }
+                        idx++;
+                        continue;
+                    }
                     bool off = disabled && idx < (int)disabled->size() && (*disabled)[idx];
                     flecs::entity chip = create_letter_chip(row, std::string(1, c),
                                                             off ? 0x2e2e2eFF : letter_color(c));
@@ -9050,12 +9825,9 @@ int main(int, char *[]) {
                     panel.prefilled = false;
                     panel.forms.clear();
                     if (!word.empty()) {
-                        std::string chars;
-                        for (char c : word)
-                            if (!std::isspace(static_cast<unsigned char>(c))) chars += c;
-                        panel.forms.push_back({chars, std::string()});
+                        panel.forms.push_back({word, std::string()});
                         panel.sel_start = panel.sel_end =
-                            std::max(0, (int)chars.size() - 1);
+                            std::max(0, (int)word.size() - 1);
                     } else {
                         panel.selecting = false;
                     }
@@ -9226,13 +9998,37 @@ int main(int, char *[]) {
         .kind(flecs::PreFrame)
         .immediate()
         .run([](flecs::iter& it) {
+            // A committed branch waiting for the bridge goes out as soon as
+            // the client frees up -- here because this system runs every
+            // frame regardless of which panels exist.
+            try_send_branch();
+
             std::vector<flecs::entity> dirty;
+            std::string want_pos;
             while (it.next()) {
                 auto selectors = it.field<WordAnnotationSelector>(0);
                 for (auto i : it) {
                     if (selectors[i].dirty) dirty.push_back(it.entity(i));
+                    if (want_pos.empty() && selectors[i].active
+                        && !selectors[i].sentence_template.empty())
+                        want_pos = surface_words(selectors[i].sentence_template);
                 }
             }
+
+            // Ask the POS server about a sentence it hasn't tagged. One
+            // request in flight; the reply caches by surface text and marks
+            // matching sentences dirty, so the tier appears on the rebuild
+            // that follows.
+            if (!want_pos.empty() && !g_pos_cache.count(want_pos)
+                && g_pos_requested != want_pos) {
+                flecs::entity client = world->lookup("PosClient");
+                if (client.is_valid() && !client.has<AwaitResponse>()) {
+                    g_pos_requested = want_pos;
+                    client.set<SendMapRequest>({{{"type", "tag"}, {"text", want_pos}}});
+                    client.set<AwaitResponse>({pos_tags_response});
+                }
+            }
+
             for (flecs::entity e : dirty) {
                 WordAnnotationSelector& selector = e.ensure<WordAnnotationSelector>();
                 sync_representation_grounding(selector, selector.sentence_template);

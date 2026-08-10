@@ -44,6 +44,11 @@ WORLD_PORT = int(os.environ.get("THORNFIELD_WORLD_PORT", "8001"))
 MIN_LEMMA = 2
 MAX_SUFFIX = 12
 
+# Below this confidence, expansion rules still propose in the Lexicon but do
+# NOT auto-rewrite sentences -- an uncertain rule silently mangling a genitive
+# is worse than a contraction left folded.
+EXPAND_MIN_CONFIDENCE = 0.6
+
 
 def query_world(expr, timeout=5.0):
     with pysocket.create_connection((WORLD_HOST, WORLD_PORT), timeout=timeout) as sock:
@@ -98,8 +103,9 @@ def fetch_demonstrations():
                 pairs.append((text.lower(), lemma.lower()))
     singular_texts = {t.lower() for t in singular_text.values()}
 
-    # Negative demonstrations: rejected derivations, as NotLemmaOf pairs.
+    # Negative demonstrations: rejected derivations, per layer.
     negatives = set()
+    expansion_negatives = set()
     try:
         forms = query_world("Form")
         form_text = {}
@@ -110,16 +116,43 @@ def fetch_demonstrations():
                 form_text[str(entity.get("name"))] = text
         for entity in forms.get("results", []):
             text = entity_text(entity)
-            targets = (entity.get("pairs") or {}).get("NotLemmaOf")
+            pairs_map = entity.get("pairs") or {}
+            for relation, bucket in (("NotLemmaOf", negatives),
+                                     ("NotExpansionOf", expansion_negatives)):
+                targets = pairs_map.get(relation)
+                if not text or targets is None:
+                    continue
+                for target in (targets if isinstance(targets, list) else [targets]):
+                    rejected = form_text.get(str(target))
+                    if rejected:
+                        bucket.add((text.lower(), rejected.lower()))
+    except Exception:
+        pass
+    # Expansion demonstrations: Contraction forms related ExpansionOf to
+    # their Expansion forms. Same shape as the number pairs; the same
+    # machinery learns from them.
+    expansions = []
+    try:
+        contractions = query_world("Contraction")
+        expansion_entities = query_world("Expansion")
+        expansion_text = {}
+        for entity in expansion_entities.get("results", []):
+            text = entity_text(entity)
+            if text:
+                expansion_text[f"#{entity.get('id')}"] = text
+                expansion_text[str(entity.get("name"))] = text
+        for entity in contractions.get("results", []):
+            text = entity_text(entity)
+            targets = (entity.get("pairs") or {}).get("ExpansionOf")
             if not text or targets is None:
                 continue
             for target in (targets if isinstance(targets, list) else [targets]):
-                rejected = form_text.get(str(target))
-                if rejected:
-                    negatives.add((text.lower(), rejected.lower()))
+                expanded = expansion_text.get(str(target))
+                if expanded:
+                    expansions.append((text.lower(), expanded.lower()))
     except Exception:
         pass
-    return pairs, plural_texts, singular_texts, negatives
+    return pairs, plural_texts, singular_texts, negatives, expansions, expansion_negatives
 
 
 def suffix_rewrite(plural, singular):
@@ -288,6 +321,7 @@ def main():
     print(f"[morphology] listening on {SOCKET_ADDR}", file=sys.stderr, flush=True)
 
     morph = Morphology([])
+    expander = Morphology([])
     known = -1
 
     while True:
@@ -296,11 +330,14 @@ def main():
         # Demonstrations may have arrived since the last request; relearn when
         # their count moves. The world is the source of truth, not a file.
         try:
-            pairs, plural_texts, singular_texts, negatives = fetch_demonstrations()
-            signature = (len(pairs) + len(plural_texts)
-                         + len(singular_texts) + len(negatives))
+            (pairs, plural_texts, singular_texts, negatives,
+             expansions, expansion_negatives) = fetch_demonstrations()
+            signature = (len(pairs) + len(plural_texts) + len(singular_texts)
+                         + len(negatives) + len(expansions)
+                         + len(expansion_negatives))
             if signature != known:
                 morph = Morphology(pairs, plural_texts, singular_texts, negatives)
+                expander = Morphology(expansions, negatives=expansion_negatives)
                 known = signature
                 mirror_rules(morph)
                 print(f"[morphology] {known} demonstrations, "
@@ -315,10 +352,63 @@ def main():
             reply = {"status": "OK"}
             if result:
                 reply.update(result)
+            else:
+                expansion = expander.apply(word) if word else None
+                if expansion:
+                    reply.update(expansion)
+                    reply["word_type"] = "Contraction"
+                    reply["variant"] = expansion["lemma"]
+                    reply["variant_type"] = "Expansion"
+            zsock.send(msgpack.packb(reply))
+        elif kind == "expand":
+            word = (req.get("word") or "").strip().lower()
+            result = expander.apply(word) if word else None
+            reply = {"status": "OK"}
+            if result:
+                reply["expansion"] = result["lemma"]
+                reply["rule"] = result["rule"]
+                reply["confidence"] = result["confidence"]
+            zsock.send(msgpack.packb(reply))
+        elif kind == "expand_text":
+            # The preprocessing layer: each whitespace token is offered to the
+            # expander; known contractions unfold in place, everything else
+            # passes through untouched. Trailing punctuation is lifted off,
+            # expanded, and re-attached, so "Here's," expands cleanly.
+            text = req.get("text") or ""
+            out_tokens = []
+            changed = False
+            for token in text.split(" "):
+                core = token
+                trailing = ""
+                while core and not (core[-1].isalnum() or core[-1] == "'"):
+                    trailing = core[-1] + trailing
+                    core = core[:-1]
+                result = expander.apply(core.lower()) if core else None
+                if result and (result["rule"] == "lexical"
+                               or result["confidence"] >= EXPAND_MIN_CONFIDENCE):
+                    replacement = result["lemma"]
+                    # Preserve leading capitalisation: Here's -> Here is.
+                    if core[:1].isupper():
+                        replacement = replacement[:1].upper() + replacement[1:]
+                    out_tokens.append(replacement + trailing)
+                    changed = True
+                else:
+                    out_tokens.append(token)
+            reply = {"status": "OK", "changed": changed,
+                     "text": " ".join(out_tokens)}
             zsock.send(msgpack.packb(reply))
         elif kind == "dump":
             reply = {"status": "OK"}
-            reply.update(morph.dump())
+            number = morph.dump()
+            expansion = expander.dump()
+            for rule in number["rules"]:
+                rule["layer"] = "number"
+            for rule in expansion["rules"]:
+                rule["layer"] = "expansion"
+            reply["states"] = number["states"] + expansion["states"]
+            reply["arcs"] = number["arcs"] + expansion["arcs"]
+            reply["lexicon"] = number["lexicon"] + expansion["lexicon"]
+            reply["rules"] = number["rules"] + expansion["rules"]
             zsock.send(msgpack.packb(reply))
         else:
             zsock.send(msgpack.packb({"status": "READY_WAITING"}))
