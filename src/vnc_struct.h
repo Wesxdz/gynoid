@@ -1,3 +1,5 @@
+#pragma once
+
 #include <iostream>       // Required for std::ostream
 #include <string>         // Required for std::string and std::to_string
 #include <vector>         // Required for std::vector (dirtyRects)

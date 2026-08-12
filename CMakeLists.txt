@@ -12,7 +12,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # add_definitions(AOTInductor_CUDA)
-add_executable(${PROJECT_NAME} src/main.cpp src/mel_spec_render.cpp src/glad.c src/vision_processor.cpp src/x11_outline.cpp src/dino_embedder.cpp src/thorn_vfx.cpp src/tradewinds.cpp src/stl_mesh.cpp src/panel3d.cpp src/screen3d.cpp)
+add_executable(${PROJECT_NAME} src/main.cpp src/mel_spec_render.cpp src/glad.c src/vision_processor.cpp src/x11_outline.cpp src/dino_embedder.cpp src/thorn_vfx.cpp src/tradewinds.cpp src/stl_mesh.cpp src/panel3d.cpp src/screen3d.cpp src/panels/registry.cpp src/panels/holodeck_panel.cpp)
 # deps/tracy-0.13.1/public/TracyClient.cpp
 
 target_include_directories(${PROJECT_NAME} PRIVATE "deps/cppzmq")
