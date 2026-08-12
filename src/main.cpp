@@ -77,6 +77,7 @@ using json = nlohmann::json;
 #include "components.h"
 #include "thorn_vfx.h"
 #include "panel3d.h"
+#include "screen3d.h"
 
 #include "tradewinds.h"
 
@@ -1343,19 +1344,40 @@ static YGSize yoga_measure_text(YGNodeConstRef node,
 }
 
 // Step 0: a Yoga root that fills a legacy-laid-out parent takes its UISize from
-// that parent's UIElementSize.
+// that parent's size. The parent's rect renderable is preferred over its
+// UIElementSize because it is the fresher of the two: EditorPropagate writes
+// renderables at the top of this same phase, while UIElementSize is last
+// frame's lift (sizeCalculationSystem runs after Yoga) -- reading the lift
+// here is where panel backgrounds picked up their resize lag. The renderable
+// kinds consulted mirror sizeCalculationSystem's rules, so the fallback only
+// changes *when* a size is seen, never which size steady-state settles on.
 static void yoga_sync_fill_parent(flecs::entity e)
 {
     const UIFillParent* fill = e.try_get<UIFillParent>();
     if (!fill) return;
     flecs::entity parent = e.parent();
     if (!parent.is_valid()) return;
-    const UIElementSize* parent_size = parent.try_get<UIElementSize>();
-    if (!parent_size) return;
+
+    float w = YGUndefined, h = YGUndefined;
+    if (const RectRenderable* rect = parent.try_get<RectRenderable>()) {
+        w = rect->width;
+        h = rect->height;
+    } else if (!parent.has<UIContainer>()) {
+        if (const RoundedRectRenderable* rrect = parent.try_get<RoundedRectRenderable>()) {
+            w = rrect->width;
+            h = rrect->height;
+        }
+    }
+    if (std::isnan(w) || std::isnan(h)) {
+        const UIElementSize* parent_size = parent.try_get<UIElementSize>();
+        if (!parent_size) return;
+        w = parent_size->width;
+        h = parent_size->height;
+    }
 
     UISize& sz = e.ensure<UISize>();
-    sz.w = std::max(0.0f, parent_size->width  - fill->pad_left - fill->pad_right);
-    sz.h = std::max(0.0f, parent_size->height - fill->pad_top  - fill->pad_bottom);
+    sz.w = std::max(0.0f, w - fill->pad_left - fill->pad_right);
+    sz.h = std::max(0.0f, h - fill->pad_top  - fill->pad_bottom);
 }
 
 // The content box available to a Yoga entity's children: the parent's resolved
@@ -3104,7 +3126,8 @@ std::vector<std::string> editor_types =
     "Data Fusion",
     "Entities",
     "Lexicon",
-    "Transducer"
+    "Transducer",
+    "Holodeck"
 };
 
 struct VNCData
@@ -4394,6 +4417,23 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         .set<ZIndex>({15})
         .child_of(grey_bkg);
 
+        // The 3D tooltip: the same badge recipe the header wears, riding the
+        // cursor over the viewport while a part is hovered. It is a plain
+        // nanovg element, so it is pure emission by construction -- the
+        // scene's lighting never touches it -- and screen-sized regardless of
+        // camera zoom. Parented to the canvas, not the viewport: the canvas's
+        // Expand locks its bounds, so parking the tooltip far off-canvas
+        // while nothing is hovered cannot inflate the bounds that
+        // Panel3DSyncSystem sizes the render target from. Amber to match the
+        // hover highlight it labels.
+        auto part_tooltip = world->entity()
+        .is_a(UIElement)
+        .child_of(canvas)
+        .add<DroidPartTooltip>()
+        .set<Position, Local>({-10000.0f, -10000.0f})
+        .set<ZIndex>({30});
+        create_badge(part_tooltip, UIElement, "3D part", 0xFAB257FF);
+
         auto badges = world->entity()
         .is_a(UIElement)
         .set<LayoutBox>({LayoutBox::Horizontal, 2.0f})
@@ -4950,7 +4990,48 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         .child_of(leaf.target<EditorCanvas>());
 
 
-    } else if(editor_type == EditorType::Episodic)
+    }
+    else if (editor_type == EditorType::Holodeck)
+    {
+        // The VNC stream as a plane in a walkable room. Same source plumbing
+        // as VNC Stream above -- get_vnc_source refcounts, so both panels can
+        // watch one connection -- but the pixels land on screen3d's emissive
+        // plane instead of a flat ImageRenderable.
+        auto badges = world->entity()
+        .is_a(UIElement)
+        .set<LayoutBox>({LayoutBox::Horizontal, 2.0f})
+        .set<Position, Local>({84.0f, 0.0f})
+        .child_of(leaf.target<EditorHeader>());
+
+        const char* vnc_host = getenv("VNC_SERVER_HOST");
+        if (!vnc_host) {
+            vnc_host = "192.168.1.104";
+        }
+        int port = 5901;
+
+        create_badge(badges, UIElement, "Holodeck", 0x9740f6ff);
+        create_badge(badges, UIElement, vnc_host, 0xa7a7a7ff, true);
+        create_badge(badges, UIElement, std::to_string(port).c_str(), 0xf64242ff, true);
+        create_badge(badges, UIElement, "click to walk", 0xFAB257FF, true);
+
+        VNCData data = get_vnc_source(leaf, vnc_host, port);
+
+        // Same shape as the Droid viewport: a Yoga fill-parent image whose
+        // texture is the module's offscreen room, resolution kept matched to
+        // the layout by Screen3DSyncSystem. UIAspectRatio opts out of the
+        // image's intrinsic ratio -- the room is whatever shape the panel is.
+        world->entity()
+        .is_a(UIElement)
+        .child_of(leaf.target<EditorCanvas>())
+        .add<UIYoga>()
+        .set<UIFillParent>({})
+        .add<UIAspectRatio>()
+        .add<Screen3DViewport>()
+        .add<IsStreamingFrom>(data.vnc_stream)
+        .set<ImageRenderable>({screen3d::image_handle(), 1.0f, 1.0f, 0.0f, 0.0f})
+        .set<ZIndex>({10});
+    }
+    else if(editor_type == EditorType::Episodic)
     {
 
         auto badges = world->entity()
@@ -5332,8 +5413,20 @@ void window_size_callback(GLFWwindow* window, int width, int height)
 }
 
 void processInput(GLFWwindow *window) {
-    if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
-        glfwSetWindowShouldClose(window, true);
+    // Edge-triggered so one press means one action: while the Holodeck walk
+    // holds the pointer, Escape releases it; otherwise it quits as before.
+    // Level-triggered here would quit the app on the same held press that
+    // just released the capture.
+    static bool esc_was_down = false;
+    const bool esc_down = glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS;
+    if (esc_down && !esc_was_down) {
+        if (screen3d::pointer_captured()) {
+            screen3d::release_pointer();
+        } else {
+            glfwSetWindowShouldClose(window, true);
+        }
+    }
+    esc_was_down = esc_down;
 }
 
 bool point_in_bounds(float x, float y, UIElementBounds bounds)
@@ -5524,9 +5617,11 @@ static void open_branch(WordAnnotationSelector& selector)
         .set<UIAbsoluteEdges>({0.0f, 0.0f, 0.0f, 0.0f})
         .set<RoundedRectRenderable>({0.0f, 0.0f, 2.0f, true, 0x4488FFAA})
         .set<ZIndex>({15});
+    // → rather than ↳: CharisSIL has no turned-arrow glyph, and a
+    // missing glyph draws as a blank tofu box beside every branch.
     world->entity()
         .is_a(UIElement).child_of(row).add<UIYoga>()
-        .set<TextRenderable>({"↳", "CharisSIL", 16.0f, 0x4488FFFF})
+        .set<TextRenderable>({"→", "CharisSIL", 16.0f, 0x4488FFFF})
         .set<ZIndex>({20});
     // The slot the words live in -- and, after commit, the container the
     // annotator rebuilds into, exactly like a sentence row. It takes the
@@ -5643,6 +5738,12 @@ static void scroll_callback(GLFWwindow* window, double xoffset, double yoffset)
 
 static void cursor_position_callback(GLFWwindow* window, double xpos, double ypos)
 {
+    // While the Holodeck walk owns the pointer, GLFW reports an unbounded
+    // virtual position. Feeding that into CursorState would sweep phantom
+    // hover/drag interactions across the whole UI, so the UI's idea of the
+    // cursor freezes at the capture point until release.
+    if (screen3d::pointer_captured()) return;
+
     // TODO: Move to Observer?
     CursorState& cursor_state = world->lookup("GLFWState").ensure<CursorState>();
     // TODO: Query for hoverable UIElement 
@@ -5731,6 +5832,11 @@ static int ui_hierarchy_depth(flecs::entity e)
 
 void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
 {
+    // Clicks while the Holodeck walk owns the pointer are part of the walk
+    // (or, later, in-room interaction) -- never UI clicks at the frozen
+    // cursor position.
+    if (screen3d::pointer_captured()) return;
+
     flecs::entity glfw_state = world->lookup("GLFWState");
     if (button == GLFW_MOUSE_BUTTON_LEFT)
     {
@@ -5888,6 +5994,10 @@ static flecs::entity focused_entity_query()
 
 static void char_callback(GLFWwindow* window, unsigned int codepoint)
 {
+    // WASD held during a Holodeck walk must not type into whatever text field
+    // happens to have focus behind the panel.
+    if (screen3d::pointer_captured()) return;
+
     if (codepoint < 32 || codepoint >= 127) return;
 
     // An open branch takes every printable character, ahead of everything --
@@ -6978,6 +7088,46 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
     if (key == GLFW_KEY_F11 && action == GLFW_PRESS)
     {
         toggle_fullscreen(window);
+        return;
+    }
+
+    // While the Holodeck walk owns the pointer it owns the keyboard too: the
+    // movement keys are polled by screen3d's input system, Escape's release is
+    // handled edge-triggered in processInput, and nothing leaks to the
+    // annotator, chat, or VNC passthrough underneath.
+    if (screen3d::pointer_captured()) return;
+
+    // TEMP DEBUG (Claude): F9 dumps the chat message subtree -- flecs hierarchy
+    // vs Yoga node ownership -- to stdout, to diagnose the branch-commit
+    // layout corruption. Remove when fixed.
+    if (key == GLFW_KEY_F9 && action == GLFW_PRESS)
+    {
+        std::function<void(flecs::entity, int)> dump = [&](flecs::entity e, int depth) {
+            const Position* pw = e.try_get<Position, World>();
+            const Position* pl = e.try_get<Position, Local>();
+            const UIElementSize* sz = e.try_get<UIElementSize>();
+            const YogaNode* yn = e.try_get<YogaNode>();
+            std::string pad(depth * 2, ' ');
+            fprintf(stderr, "DBG %s#%llu%s%s yoga=%p own=%p kids=%d wpos=(%.0f,%.0f) lpos=(%.0f,%.0f) sz=(%.0f,%.0f)",
+                pad.c_str(), (unsigned long long)e.id(),
+                e.name().length() ? " " : "", e.name().c_str(),
+                yn ? (void*)yn->node : nullptr,
+                yn && yn->node ? (void*)YGNodeGetOwner(yn->node) : nullptr,
+                yn && yn->node ? (int)YGNodeGetChildCount(yn->node) : -1,
+                pw ? pw->x : -1.f, pw ? pw->y : -1.f,
+                pl ? pl->x : -1.f, pl ? pl->y : -1.f,
+                sz ? sz->width : -1.f, sz ? sz->height : -1.f);
+            if (const TextRenderable* t = e.try_get<TextRenderable>())
+                fprintf(stderr, " text=\"%.40s\"", t->text.c_str());
+            if (e.has<UIYoga>()) fprintf(stderr, " UIYoga");
+            if (e.has<UIYogaLegacyLeaf>()) fprintf(stderr, " LegacyLeaf");
+            fprintf(stderr, "\n");
+            e.children([&](flecs::entity c) { dump(c, depth + 1); });
+        };
+        world->query<ChatPanel>().each([&](flecs::entity, ChatPanel& cp) {
+            fprintf(stderr, "DBG ==== message_list dump ====\n");
+            dump(cp.message_list, 0);
+        });
         return;
     }
 
@@ -8928,8 +9078,14 @@ int main(int, char *[]) {
     // it needs the GL context and nanovg, both of which exist by now. The
     // starting size is a placeholder -- Panel3DSyncSystem resizes the viewport
     // to the panel the first time one is laid out.
-    if (!panel3d::init(*world, vg, window, "../assets/truncated_frame.stl", 512, 512)) {
+    if (!panel3d::init(*world, vg, window, "../assets/polycarbonate_support_panel.stl",
+                       "../assets/vertex_structure.stl", 512, 512)) {
         std::cerr << "[panel3d] disabled; the Droid panel will show only its background" << std::endl;
+    }
+
+    // The Holodeck panel's walkable room, on the same offscreen-image pattern.
+    if (!screen3d::init(*world, vg, window, 512, 512)) {
+        std::cerr << "[screen3d] disabled; the Holodeck panel will show only its background" << std::endl;
     }
 
     auto renderQueueEntity = world->entity("RenderQueue")
@@ -9513,6 +9669,32 @@ int main(int, char *[]) {
                     visual.set<RoundedRectRenderable>({node_area.width-2, node_area.height-2, 4.0f, false, 0x010222});
                     flecs::entity outline = editor.target<EditorOutline>();
                     outline.set<RoundedRectRenderable>({node_area.width-2, node_area.height-2, 4.0f, true, 0x191919FF});
+
+                    // The Expand systems that size this visual's children (the
+                    // canvas and header backgrounds) run at PreUpdate -- after
+                    // Yoga and the size lift have already consumed the old
+                    // values, which is a visible frame of background lag on
+                    // every panel resize. Applying the same per-renderable
+                    // Expand formulas here, with the extent the visual was
+                    // just given, hands the rest of this frame current sizes;
+                    // the PreUpdate pass then re-applies identical values.
+                    const float extent_w = node_area.width - 2.0f;
+                    const float extent_h = node_area.height - 2.0f;
+                    visual.children([&](flecs::entity child) {
+                        const Expand* expand = child.try_get<Expand>();
+                        if (!expand) return;
+                        if (auto* rect = child.try_get_mut<RectRenderable>()) {
+                            if (expand->x_enabled)
+                                rect->width = extent_w * expand->x_percent - (expand->pad_left + expand->pad_right);
+                            if (expand->y_enabled)
+                                rect->height = extent_h * expand->y_percent - (expand->pad_top + expand->pad_bottom);
+                        } else if (auto* rrect = child.try_get_mut<RoundedRectRenderable>()) {
+                            if (expand->x_enabled)
+                                rrect->width = (extent_w - (expand->pad_left + expand->pad_right)) * expand->x_percent;
+                            if (expand->y_enabled)
+                                rrect->height = (extent_h - (expand->pad_top + expand->pad_bottom)) * expand->y_percent;
+                        }
+                    });
                 }
 
                 PanelSplit* split = editor.try_get_mut<PanelSplit>();
@@ -11046,6 +11228,10 @@ int main(int, char *[]) {
             glfwSetInputMode(window->handle, GLFW_CURSOR, GLFW_CURSOR_HIDDEN);
             return;
         }
+        // The Holodeck walk disabled the cursor; forcing NORMAL here every
+        // frame would snap it visible and end the mouselook a frame after it
+        // began.
+        if (screen3d::pointer_captured()) return;
         glfwSetInputMode(window->handle, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
 
         glfwSetCursor(window->handle, NULL);
@@ -11442,6 +11628,12 @@ int main(int, char *[]) {
     // Note: Message processing now handled by vnc_message_thread() on network thread
     auto vncMouseTrackingSystem = world->system<Position, ImageRenderable>()
         .with<IsStreamingFrom>(flecs::Wildcard)
+        // The Holodeck viewport streams from the same VNC source but is a 3D
+        // room, not a flat screen: mapping the cursor through its bounds as if
+        // it were the framebuffer would drive the remote pointer (and fight
+        // the flat panel over eventPassthroughEnabled) whenever the mouse
+        // crossed the panel.
+        .without<Screen3DViewport>()
         .term_at(0).second<World>()
         .kind(flecs::PreUpdate)
         .each([&](flecs::entity e, Position& pos, ImageRenderable& img) {
@@ -11491,13 +11683,20 @@ int main(int, char *[]) {
 
     auto vncPassthroughIndicatorVisibility = world->system<ImageRenderable>()
         .with<IsStreamingFrom>(flecs::Wildcard)
+        .without<Screen3DViewport>()
         .kind(flecs::PreUpdate)
         .each([&](flecs::entity e, ImageRenderable& img) {
             auto* handle = e.target<IsStreamingFrom>().try_get<VNCClientHandle>();
             if (!handle || !*handle) return;
             VNCClient& vnc = **handle;
             if (!vnc.connected || !vnc.client) return;
-            e.target<ActiveIndicator>().ensure<RenderStatus>().visible = vnc.eventPassthroughEnabled;
+            // Not every streaming element carries an indicator; ensure() on a
+            // null target is a fatal flecs assert, which is exactly how the
+            // Holodeck viewport crashed the app the moment its stream
+            // connected.
+            flecs::entity indicator = e.target<ActiveIndicator>();
+            if (!indicator.is_valid()) return;
+            indicator.ensure<RenderStatus>().visible = vnc.eventPassthroughEnabled;
         });
 
     auto spaceframeSelector = world->system<FilmstripData>()
@@ -11796,9 +11995,17 @@ int main(int, char *[]) {
         .cached()
         .build();
 
+    // A split divider being dragged means the pointer belongs to panel
+    // resizing, not to the 3D scene -- without this, resizing a Droid panel
+    // with the cursor over the viewport grabs the orbit camera and spins the
+    // model as a side effect of the resize gesture.
+    auto panel3d_split_drags = world->query_builder()
+        .with<Dragging>()
+        .build();
+
     world->system("Panel3DSyncSystem")
     .kind(flecs::OnLoad)
-    .run([panel3d_viewports, window](flecs::iter& it)
+    .run([panel3d_viewports, panel3d_split_drags, window](flecs::iter& it)
     {
         flecs::world w = it.world();
         bool live = false;
@@ -11825,11 +12032,94 @@ int main(int, char *[]) {
                 cursor_y = cursor->y;
             }
             const bool left_down = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
-            panel3d::set_pointer(cursor_x, cursor_y, left_down,
-                                 point_in_bounds(cursor_x, cursor_y, bounds));
+            // While a divider drag is live the viewport sees no pointer at
+            // all: no orbit grab, no hover highlight flicker as the divider
+            // sweeps across the 3D image.
+            const bool ui_drag = panel3d_split_drags.count() > 0;
+            panel3d::set_pointer(cursor_x, cursor_y, left_down && !ui_drag,
+                                 !ui_drag && point_in_bounds(cursor_x, cursor_y, bounds),
+                                 bounds.xmin, bounds.ymin);
         });
 
         if (!live) panel3d::set_active(false);
+    });
+
+    // The Holodeck panel's viewport, on Panel3DSyncSystem's exact pattern:
+    // size and activity follow the laid-out panel, the pointer feeds the walk
+    // (with the same divider-drag gate as the orbit camera), and each frame
+    // the VNC stream's current texture and native size reach the screen
+    // plane, so a mid-session mode switch on the remote side just works.
+    auto screen3d_viewports = world->query_builder<const UIElementBounds>()
+        .with<Screen3DViewport>()
+        .cached()
+        .build();
+
+    world->system("Screen3DSyncSystem")
+    .kind(flecs::OnLoad)
+    .run([screen3d_viewports, panel3d_split_drags, window](flecs::iter& it)
+    {
+        flecs::world w = it.world();
+        bool live = false;
+
+        screen3d_viewports.each([&](flecs::entity e, const UIElementBounds& bounds)
+        {
+            if (live) return;   // one room, so the first laid-out panel wins
+            int panel_w = (int)std::lround(bounds.xmax - bounds.xmin);
+            int panel_h = (int)std::lround(bounds.ymax - bounds.ymin);
+            if (panel_w <= 0 || panel_h <= 0) return;
+            live = true;
+
+            screen3d::set_active(true);
+            screen3d::resize(panel_w, panel_h);
+
+            ImageRenderable& img = e.ensure<ImageRenderable>();
+            img.imageHandle = screen3d::image_handle();
+
+            flecs::entity stream = e.target<IsStreamingFrom>();
+            if (stream.is_valid()) {
+                if (const VNCClientHandle* handle = stream.try_get<VNCClientHandle>()) {
+                    const VNCClient& client = **handle;
+                    screen3d::set_screen(client.vncTexture, client.width, client.height);
+                }
+            }
+
+            double cursor_x = 0.0, cursor_y = 0.0;
+            if (const CursorState* cursor = w.lookup("GLFWState").try_get<CursorState>()) {
+                cursor_x = cursor->x;
+                cursor_y = cursor->y;
+            }
+            const bool left_down = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
+            const bool ui_drag = panel3d_split_drags.count() > 0;
+            screen3d::set_pointer(cursor_x, cursor_y, left_down && !ui_drag,
+                                  !ui_drag && point_in_bounds(cursor_x, cursor_y, bounds));
+        });
+
+        if (!live) screen3d::set_active(false);
+    });
+
+    // The Droid panel's tooltip badge rides the cursor: bottom-left corner on
+    // the pointer, extending up-right, while a part is hovered. PreFrame, so
+    // the position flows through this frame's world-position and bounds
+    // propagation -- and the cursor read here is this frame's, polled before
+    // the pipeline ran, so the badge tracks live with no trailing. Only the
+    // shown/hidden state is the pick's, one frame behind like the highlight.
+    // The cursor is window-space and the holder canvas-local, so the canvas's
+    // bounds origin (stable outside panel rearranges) converts between them.
+    world->system<Position, const UIElementBounds>("Droid3DTooltipSystem")
+    .term_at(0).second<Local>()
+    .term_at(1).parent()
+    .with<DroidPartTooltip>()
+    .kind(flecs::PreFrame)
+    .each([](flecs::entity e, Position& pos, const UIElementBounds& canvas_bounds)
+    {
+        const CursorState* cursor = world->lookup("GLFWState").try_get<CursorState>();
+        if (panel3d::has_hover() && cursor) {
+            pos.x = (float)cursor->x - canvas_bounds.xmin;
+            pos.y = (float)cursor->y - canvas_bounds.ymin - BADGE_HEIGHT;
+        } else {
+            pos.x = -10000.0f;
+            pos.y = -10000.0f;
+        }
     });
 
     // Sync mel spec position during fill phase only
@@ -12389,6 +12679,7 @@ int main(int, char *[]) {
         // bind framebuffers of their own; this is where they hand control back,
         // so nanovg's flush at nvgEndFrame still lands in the UI framebuffer.
         panel3d::set_ui_target(graphics.fbo, graphics.uiWidth, graphics.uiHeight);
+        screen3d::set_ui_target(graphics.fbo, graphics.uiWidth, graphics.uiHeight);
 
         glfwStateEntity.set<Window>({window, winWidth, winHeight});
 
@@ -12517,6 +12808,7 @@ int main(int, char *[]) {
 
     // Cleanup 3D rendering resources
     cleanup3DRendering(graphics);
+    screen3d::shutdown();
     panel3d::shutdown(*world);
 
     nvgDeleteGL2(vg);

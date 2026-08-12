@@ -343,6 +343,15 @@ struct ImageRenderable
 // its hit test, so the tag is how that per-frame sync finds the element.
 struct Panel3DViewport {};
 
+// The Holodeck panel's 3D viewport element -- the screen3d module's offscreen
+// image, kept sized/fed by Screen3DSyncSystem the way Panel3DViewport is.
+struct Screen3DViewport {};
+
+// The Droid panel's 3D tooltip: a screen-sized badge on the canvas that rides
+// the cursor (bottom-left corner on the pointer) while a scene part is
+// hovered (panel3d::has_hover). Parked far off-canvas otherwise.
+struct DroidPartTooltip {};
+
 struct ZIndex {
     int layer;
 };
@@ -851,6 +860,9 @@ enum class EditorType
     Entities,
     Lexicon,
     Transducer,
+    // A VNC stream hung as a plane in a walkable 3D room (screen3d.h).
+    // Appended at the end: saved layouts store these as ints.
+    Holodeck,
     // SystemNavigator,
 
     // Bookshelf,

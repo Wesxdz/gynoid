@@ -1,9 +1,11 @@
 #include "panel3d.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -84,6 +86,248 @@ constexpr glm::vec3 kGroundAmbient{0.042f, 0.040f, 0.038f};
 constexpr glm::vec3 kBackdropCenter{0.285f, 0.293f, 0.310f};
 constexpr glm::vec3 kBackdropEdge{0.120f, 0.126f, 0.140f};
 
+// Panel finish: light neutral grey, and a warm amber for the panel under the
+// mouse. The CAD pass reads Material as the base colour, so hover feedback is
+// just a material swap on the picked entity.
+constexpr glm::vec3 kPanelColor{0.76f, 0.78f, 0.82f};
+constexpr glm::vec3 kPanelHoverColor{0.98f, 0.70f, 0.34f};
+
+// Vertex connectors, a step darker than the panels so the printed structure
+// reads apart from the polycarbonate faces.
+constexpr glm::vec3 kVertexColor{0.58f, 0.60f, 0.65f};
+
+// ---- Dodecahedroid panel layout ---------------------------------------------
+// Twelve support panels posed as the faces of a dodecahedron, ported from the
+// chassis sources (maids/heonae/chassis/src): dodecahedroid_config.scad supplies
+// pos / rots / panel_rots, and truncated_frame.scad wraps the loop in the
+// edge-alignment rotations rotate([0,0,-30]) rotate([-magic_angle,0,60]). The
+// STL is a single panel in the SCAD module's local frame, so replaying the same
+// transform chain reproduces the assembly.
+
+constexpr float kPanelRadius = 14.0f;      // cm, pentagon circumradius
+constexpr float kDihedralDeg = 116.565f;
+constexpr float kPanelThickness = 0.3f;    // cm
+
+// pos[i] from the config, unit face directions scaled by panel_edge_length.
+constexpr glm::vec3 kPanelPos[12] = {
+    { 0.58541018f,  0.0f,         0.94721353f},
+    { 0.0f,         0.94721353f,  0.58541024f},
+    {-0.58541018f,  0.0f,         0.94721353f},
+    {-0.94721353f,  0.58541018f,  0.0f},
+    {-0.58541024f,  0.0f,        -0.94721353f},
+    {-0.94721353f, -0.58541018f,  0.0f},
+    { 0.0f,        -0.94721353f, -0.58541018f},
+    { 0.94721353f, -0.58541024f,  0.0f},
+    { 0.0f,        -0.94721353f,  0.58541018f},
+    { 0.0f,         0.94721353f, -0.58541018f},
+    { 0.94721353f,  0.58541018f,  0.0f},
+    { 0.58541018f,  0.0f,        -0.94721353f},
+};
+
+// rots[i]: OpenSCAD euler degrees, X applied first, then Y, then Z.
+constexpr glm::vec3 kPanelTiltDeg[12] = {
+    {  0.0f,       -148.282526f, 0.0f},
+    { 58.282523f,  -180.0f,      0.0f},
+    {  0.0f,        148.282526f, 0.0f},
+    { 31.717473f,    90.0f,      0.0f},
+    {  0.0f,         31.717477f, 0.0f},
+    {-31.717473f,    90.0f,      0.0f},
+    {-58.282523f,     0.0f,      0.0f},
+    {-31.717477f,   -90.0f,      0.0f},
+    {-58.282523f,  -180.0f,      0.0f},
+    { 58.282523f,     0.0f,      0.0f},
+    { 31.717473f,   -90.0f,      0.0f},
+    {  0.0f,        -31.717474f, 0.0f},
+};
+
+// panel_rots[i]: the in-plane spin that aligns each panel's edges.
+constexpr float kPanelSpinDeg[12] = {
+    -36.0f, -162.0f, 216.0f, 18.0f, 36.0f, -18.0f,
+     18.0f,  -18.0f,  90.0f, 270.0f, 18.0f, 144.0f,
+};
+
+// Vertices of the standard unit-edge dodecahedron, copied from
+// vertex_structure.scad's Dodecahedron_Grounded. The config's `pos` face
+// directions above are exactly this solid's face centres, so panels and
+// vertex connectors share one polyhedron and one assembly rotation.
+constexpr float kC0 = 0.80901699f;   // (1 + sqrt(5)) / 4
+constexpr float kC1 = 1.30901699f;   // (3 + sqrt(5)) / 4
+constexpr glm::vec3 kDodecaVerts[20] = {
+    { 0.0f,  0.5f,  kC1}, { 0.0f,  0.5f, -kC1}, { 0.0f, -0.5f,  kC1}, { 0.0f, -0.5f, -kC1},
+    {  kC1,  0.0f, 0.5f}, {  kC1,  0.0f,-0.5f}, { -kC1,  0.0f, 0.5f}, { -kC1,  0.0f,-0.5f},
+    { 0.5f,   kC1, 0.0f}, { 0.5f,  -kC1, 0.0f}, {-0.5f,   kC1, 0.0f}, {-0.5f,  -kC1, 0.0f},
+    {  kC0,   kC0,  kC0}, {  kC0,   kC0, -kC0}, {  kC0,  -kC0,  kC0}, {  kC0,  -kC0, -kC0},
+    { -kC0,   kC0,  kC0}, { -kC0,   kC0, -kC0}, { -kC0,  -kC0,  kC0}, { -kC0,  -kC0, -kC0},
+};
+
+// Dodecahedron_Grounded rotates by magic_angle about X, which drops vertex 3
+// ([0,-0.5,-C1]) exactly onto the -Z axis; the connector is modelled around
+// that grounded vertex. These two indices are the reference the vertex poses
+// transport from.
+constexpr int kGroundedVert = 3;
+constexpr int kGroundedNeighbor = 1;
+
+struct PanelPose
+{
+    glm::quat rotation;
+    glm::vec3 translation;
+};
+
+// The shared assembly geometry: panel_edge_length / magic_angle exactly as the
+// config derives them (the edge length cancels out of magic_angle but not out
+// of the translations), and truncated_frame.scad's edge-alignment wrapper
+// rotate([0,0,-30]) rotate([-magic,0,60]), collapsed to Rz(30) * Rx(-magic).
+struct AssemblyBasis
+{
+    float edge;
+    float inner_edge;
+    float magic;
+    glm::quat outer;
+};
+
+AssemblyBasis assemblyBasis()
+{
+    AssemblyBasis basis;
+    const float eq_edge = std::sqrt((5.0f - std::sqrt(5.0f)) / 2.0f);
+    basis.edge = kPanelRadius * eq_edge;
+    const float panel_height = std::sqrt(5.0f + 2.0f * std::sqrt(5.0f)) / 2.0f * basis.edge;
+    const float height_stack = 2.0f * std::sin(glm::radians(kDihedralDeg / 2.0f)) * panel_height;
+    basis.magic = std::atan(basis.edge / height_stack);
+
+    // The inner-surface dodecahedron, from the config: panel_Z and
+    // inner_panel_radius shrink the pentagon so its face planes lie on the
+    // panels' inner surface, panel_thickness behind the outer faces. The
+    // vertex connectors are assembled against this smaller solid -- that is
+    // what tucks them precisely behind the panels (penta_connector.scad
+    // places them at inner_panel_radius, and vertex_composite.scad's
+    // PentaVolume translates panels by inner_panel_edge_length).
+    const float panel_z = kPanelThickness / std::tan(glm::radians(kDihedralDeg / 2.0f));
+    const float inner_radius = kPanelRadius - (kPanelThickness - panel_z) * 2.0f;
+    basis.inner_edge = inner_radius * eq_edge;
+
+    basis.outer = glm::angleAxis(glm::radians(30.0f), glm::vec3(0.0f, 0.0f, 1.0f))
+                * glm::angleAxis(-basis.magic, glm::vec3(1.0f, 0.0f, 0.0f));
+    return basis;
+}
+
+// OpenSCAD's rotate([x, y, z]) rotates about X first, then Y, then Z.
+glm::quat scadRotate(const glm::vec3& deg)
+{
+    const glm::vec3 r = glm::radians(deg);
+    return glm::angleAxis(r.z, glm::vec3(0.0f, 0.0f, 1.0f))
+         * glm::angleAxis(r.y, glm::vec3(0.0f, 1.0f, 0.0f))
+         * glm::angleAxis(r.x, glm::vec3(1.0f, 0.0f, 0.0f));
+}
+
+std::array<PanelPose, 12> panelPoses()
+{
+    const AssemblyBasis basis = assemblyBasis();
+    std::array<PanelPose, 12> poses;
+    for (int i = 0; i < 12; ++i) {
+        poses[i].rotation = basis.outer * scadRotate(kPanelTiltDeg[i])
+                          * glm::angleAxis(glm::radians(kPanelSpinDeg[i]), glm::vec3(0.0f, 0.0f, 1.0f));
+        poses[i].translation = basis.outer * (kPanelPos[i] * basis.edge);
+    }
+    return poses;
+}
+
+// Poses for the twenty vertex connectors. The connector mesh lives at the
+// grounded vertex with +Z pointing at the dodecahedron's centre, so each pose
+// is the frame transport from that vertex to another: build an orthonormal
+// frame at both vertices (inward axis + one incident edge), and the frame
+// change is a rotation of the dodecahedron's own symmetry group. The choice of
+// incident edge does not matter -- the connector is 3-fold symmetric about its
+// axis, exactly like the vertex figure.
+std::array<PanelPose, 20> vertexPoses()
+{
+    const AssemblyBasis basis = assemblyBasis();
+
+    // Orthonormal frame at vertex `v`: +Z inward, +X along the edge to `n`.
+    auto frame = [](const glm::vec3& v, const glm::vec3& n) {
+        const glm::vec3 z = -glm::normalize(v);
+        const glm::vec3 e = n - v;
+        const glm::vec3 x = glm::normalize(e - glm::dot(e, z) * z);
+        return glm::mat3(x, glm::cross(z, x), z);
+    };
+
+    // First edge-adjacent vertex: the solid has unit edges, so adjacency is
+    // "distance 1" -- no hand-maintained edge table to drift out of date.
+    auto neighbor = [](int k) {
+        for (int j = 0; j < 20; ++j) {
+            if (j != k && std::fabs(glm::distance(kDodecaVerts[j], kDodecaVerts[k]) - 1.0f) < 0.01f) {
+                return kDodecaVerts[j];
+            }
+        }
+        return kDodecaVerts[k];   // unreachable: every vertex has 3 neighbours
+    };
+
+    const glm::mat3 ref = frame(kDodecaVerts[kGroundedVert], kDodecaVerts[kGroundedNeighbor]);
+    // Undo the grounding rotation baked into the mesh, so the transport starts
+    // from the vertex's standard-orientation cone.
+    const glm::quat unground = glm::angleAxis(-basis.magic, glm::vec3(1.0f, 0.0f, 0.0f));
+
+    std::array<PanelPose, 20> poses;
+    for (int k = 0; k < 20; ++k) {
+        const glm::mat3 transport = frame(kDodecaVerts[k], neighbor(k)) * glm::transpose(ref);
+        poses[k].rotation = basis.outer * glm::quat_cast(transport) * unground;
+        // Vertices of the *inner* dodecahedron: the connectors nest against
+        // the panels' inner surface, not the outer face planes.
+        poses[k].translation = basis.outer * (kDodecaVerts[k] * basis.inner_edge);
+    }
+    return poses;
+}
+
+// ---- Picking ---------------------------------------------------------------
+
+// Möller-Trumbore, tolerant of an unnormalized direction: `t` comes back in
+// units of |dir|, which is what lets hits found in different panels' local
+// spaces be compared along the one world-space ray that produced them.
+bool rayTriangle(const glm::vec3& o, const glm::vec3& d,
+                 const glm::vec3& a, const glm::vec3& b, const glm::vec3& c,
+                 float& t)
+{
+    constexpr float kEps = 1e-7f;
+    const glm::vec3 e1 = b - a;
+    const glm::vec3 e2 = c - a;
+    const glm::vec3 p = glm::cross(d, e2);
+    const float det = glm::dot(e1, p);
+    if (std::fabs(det) < kEps) return false;
+    const float inv = 1.0f / det;
+    const glm::vec3 s = o - a;
+    const float u = glm::dot(s, p) * inv;
+    if (u < 0.0f || u > 1.0f) return false;
+    const glm::vec3 q = glm::cross(s, e1);
+    const float v = glm::dot(d, q) * inv;
+    if (v < 0.0f || u + v > 1.0f) return false;
+    const float hit = glm::dot(e2, q) * inv;
+    if (hit <= 0.0f) return false;
+    t = hit;
+    return true;
+}
+
+// Slab test against the panel mesh's local bounds -- the cheap reject that
+// keeps the triangle walk to the one or two panels actually under the ray.
+bool rayAabb(const glm::vec3& o, const glm::vec3& d,
+             const glm::vec3& lo, const glm::vec3& hi)
+{
+    float tmin = 0.0f;
+    float tmax = std::numeric_limits<float>::max();
+    for (int axis = 0; axis < 3; ++axis) {
+        if (std::fabs(d[axis]) < 1e-12f) {
+            if (o[axis] < lo[axis] || o[axis] > hi[axis]) return false;
+            continue;
+        }
+        const float inv = 1.0f / d[axis];
+        float t0 = (lo[axis] - o[axis]) * inv;
+        float t1 = (hi[axis] - o[axis]) * inv;
+        if (t0 > t1) std::swap(t0, t1);
+        tmin = std::max(tmin, t0);
+        tmax = std::min(tmax, t1);
+        if (tmin > tmax) return false;
+    }
+    return true;
+}
+
 struct State
 {
     NVGcontext* vg = nullptr;
@@ -110,8 +354,39 @@ struct State
     bool hovering = false;
     double scroll = 0.0;
 
+    // Viewport top-left in window coordinates, from the panel's layout bounds.
+    // With it, (mouse - panel) in pixels is a point on the offscreen image.
+    double panel_x = 0.0;
+    double panel_y = 0.0;
+
+
     flecs::entity camera;
     r3d::Mesh3D mesh;
+    r3d::Mesh3D vertex_mesh;
+
+    // CPU copies of the part meshes for mouse picking, in their STL-local
+    // frames, with local bounds for the slab pre-test. One copy per part kind
+    // serves all its instances; the pick transforms the ray, not the triangles.
+    struct PickMesh
+    {
+        std::vector<glm::vec3> positions;
+        std::vector<uint32_t> indices;
+        glm::vec3 lo{0.0f};
+        glm::vec3 hi{0.0f};
+    };
+    PickMesh panel_pick;
+    PickMesh vertex_pick;
+
+    // Everything the hover ray can land on: the entity, the part mesh it
+    // instances, and the base colour to restore when the highlight moves on.
+    struct Pickable
+    {
+        flecs::entity entity;
+        const PickMesh* mesh = nullptr;
+        glm::vec3 base_color{1.0f};
+    };
+    std::vector<Pickable> pickables;
+    int hovered = -1;
 
     // Programs owned by this panel, replacing the module's cel-shaded opaque
     // pass and daylight sky gradient.
@@ -330,6 +605,77 @@ void PresentToPanel(flecs::iter& it)
 
 // ---- Input -----------------------------------------------------------------
 
+// Cast the ray under the mouse through every pickable part -- panels and
+// vertex connectors alike -- and return the index of the nearest hit, or -1.
+// Reads RenderFrame, which at PreUpdate still holds the previous frame's
+// matrices -- one frame of lag on a hover highlight is invisible, and it
+// saves rebuilding the camera math here.
+int pickPart(flecs::world& world)
+{
+    if (!g.hovering || g.width <= 0 || g.height <= 0) return -1;
+    const r3d::RenderFrame* fr = world.try_get<r3d::RenderFrame>();
+    if (!fr || !fr->valid) return -1;
+
+    // Cursor to NDC on the panel image, then NDC to a world-space segment
+    // across the depth range. inverse(viewProj) rather than hand-built ortho
+    // extents, so this stays right if the projection ever changes.
+    const float u = 2.0f * (float)((g.mouse_x - g.panel_x) / g.width) - 1.0f;
+    const float v = 1.0f - 2.0f * (float)((g.mouse_y - g.panel_y) / g.height);
+    const glm::mat4 inv_vp = glm::inverse(fr->viewProj);
+    const glm::vec4 h0 = inv_vp * glm::vec4(u, v, -1.0f, 1.0f);
+    const glm::vec4 h1 = inv_vp * glm::vec4(u, v, 1.0f, 1.0f);
+    const glm::vec3 origin = glm::vec3(h0) / h0.w;
+    const glm::vec3 dir = glm::vec3(h1) / h1.w - origin;
+
+    int hit = -1;
+    float best = std::numeric_limits<float>::max();
+    for (int i = 0; i < (int)g.pickables.size(); ++i) {
+        const State::Pickable& part = g.pickables[i];
+        if (!part.mesh || !part.entity.is_valid() || !part.entity.is_alive()) continue;
+        const r3d::Transform* trans = part.entity.try_get<r3d::Transform>();
+        if (!trans) continue;
+
+        // The ray moves into part-local space instead of the triangles moving
+        // out. The direction is left unnormalized so every t is a fraction of
+        // the same world segment, comparable across parts.
+        const glm::mat4 inv_model = glm::inverse(trans->matrix);
+        const glm::vec3 o = glm::vec3(inv_model * glm::vec4(origin, 1.0f));
+        const glm::vec3 d = glm::mat3(inv_model) * dir;
+        if (!rayAabb(o, d, part.mesh->lo, part.mesh->hi)) continue;
+
+        const std::vector<glm::vec3>& pts = part.mesh->positions;
+        const std::vector<uint32_t>& idx = part.mesh->indices;
+        for (size_t k = 0; k + 2 < idx.size(); k += 3) {
+            float t = 0.0f;
+            if (rayTriangle(o, d, pts[idx[k]], pts[idx[k + 1]], pts[idx[k + 2]], t)
+                && t < best) {
+                best = t;
+                hit = i;
+            }
+        }
+    }
+    return hit;
+}
+
+// Swap the hover highlight onto `index`, clearing the previous one. -1 clears.
+void setHovered(int index)
+{
+    if (index == g.hovered) return;
+    if (g.hovered >= 0 && g.hovered < (int)g.pickables.size()) {
+        const State::Pickable& prev = g.pickables[g.hovered];
+        if (prev.entity.is_valid() && prev.entity.is_alive()) {
+            prev.entity.set<r3d::Material>({prev.base_color});
+        }
+    }
+    if (index >= 0) {
+        const State::Pickable& next = g.pickables[index];
+        if (next.entity.is_valid() && next.entity.is_alive()) {
+            next.entity.set<r3d::Material>({kPanelHoverColor});
+        }
+    }
+    g.hovered = index;
+}
+
 // Drives render3d's orbit controller from the pointer state the caller pushed
 // in. The controller reads InputState but does not decide when a drag is
 // happening -- that is the application's call, and here it means "left button
@@ -358,6 +704,8 @@ void PanelInput(flecs::iter& it)
         }
         g.scroll = 0.0;
     }
+
+    setHovered(pickPart(world));
 }
 
 // ---- Setup -----------------------------------------------------------------
@@ -402,16 +750,48 @@ void applyRenderSize(flecs::world& world, int width, int height)
 // ---- Public API ------------------------------------------------------------
 
 bool init(flecs::world& world, NVGcontext* vg, GLFWwindow* window,
-          const std::string& stl_path, int width, int height)
+          const std::string& panel_stl_path, const std::string& vertex_stl_path,
+          int width, int height)
 {
     if (g.ready) return true;
 
     width = std::max(width, 1);
     height = std::max(height, 1);
 
-    StlMesh stl = loadStl(stl_path);
+    StlMesh stl = loadStl(panel_stl_path);
     if (!stl.valid) return false;
-    normalizeStl(stl, kModelSize);
+
+    // The connectors are decoration around the panels, so a missing mesh
+    // degrades to panels-only rather than taking the whole scene down.
+    StlMesh vertex_stl = loadStl(vertex_stl_path);
+    if (!vertex_stl.valid) {
+        std::cerr << "[panel3d] no vertex connector mesh; rendering panels only" << std::endl;
+    }
+
+    // The meshes stay in file units; each entity carries its pose, and a
+    // uniform fit scale takes the place of normalizeStl -- computed against the
+    // assembled bounds rather than one part, so the camera framing constants
+    // keep meaning what they did for the one-piece frame.
+    const std::array<PanelPose, 12> poses = panelPoses();
+    const std::array<PanelPose, 20> vertex_poses = vertexPoses();
+    glm::vec3 lo(std::numeric_limits<float>::max());
+    glm::vec3 hi(std::numeric_limits<float>::lowest());
+    auto grow = [&](const StlMesh& part, const PanelPose& pose) {
+        for (const r3d::Vertex& v : part.vertices) {
+            const glm::vec3 w = pose.rotation * v.pos + pose.translation;
+            lo = glm::min(lo, w);
+            hi = glm::max(hi, w);
+        }
+    };
+    for (const PanelPose& pose : poses) grow(stl, pose);
+    if (vertex_stl.valid) {
+        for (const PanelPose& pose : vertex_poses) grow(vertex_stl, pose);
+    }
+    const glm::vec3 assembly_center = (lo + hi) * 0.5f;
+    const glm::vec3 assembly_extent = hi - lo;
+    const float largest = std::max(assembly_extent.x,
+                                   std::max(assembly_extent.y, assembly_extent.z));
+    const float fit = largest > 0.0f ? kModelSize / largest : 1.0f;
 
     g.vg = vg;
     g.window = window;
@@ -446,6 +826,20 @@ bool init(flecs::world& world, NVGcontext* vg, GLFWwindow* window,
 
     g.mesh = r3d::uploadMesh(stl.vertices, stl.indices);
 
+    // Kept past upload for the hover pick: positions only, the normals stay on
+    // the GPU. Bounds come straight from the loader, pre-any-transform, which
+    // is the frame the pick ray is moved into.
+    auto toPickMesh = [](const StlMesh& part, State::PickMesh& out) {
+        out.positions.clear();
+        out.positions.reserve(part.vertices.size());
+        for (const r3d::Vertex& v : part.vertices) out.positions.push_back(v.pos);
+        out.indices = part.indices;
+        out.lo = part.min;
+        out.hi = part.max;
+    };
+    toPickMesh(stl, g.panel_pick);
+    if (vertex_stl.valid) toPickMesh(vertex_stl, g.vertex_pick);
+
     g.camera = world.entity("Panel3DCamera")
         .set<r3d::Camera>({
             .zoom = kZoomDefault,
@@ -462,18 +856,36 @@ bool init(flecs::world& world, NVGcontext* vg, GLFWwindow* window,
         .set<r3d::Transform>({})
         .add<r3d::ActiveCamera>();
 
-    world.entity("Panel3DDroid")
-        .set<r3d::Position3D>({{0.0f, 0.0f, 0.0f}})
-        .set<r3d::Transform>({})
-        .set<r3d::Mesh3D>(g.mesh)
-        // Light neutral grey. The CAD pass reads this as the base colour, so
-        // this is the one place the part's finish colour is set.
-        .set<r3d::Material>({{0.76f, 0.78f, 0.82f}})
-        .set<r3d::Visible>({true})
-        // Opts the mesh out of the module's cel-shaded opaque pass in favour of
-        // CadOpaquePass -- the extension point render3d documents for exactly
-        // this. It stays in the frustum/transform machinery either way.
-        .add<r3d::DeferredDraw>();
+    // One entity per chassis panel, all sharing the uploaded mesh. The bake
+    // composes translate * rotate * scale, and a uniform scale commutes with
+    // rotation, so this is exactly fit * (pose - centre) applied to the model.
+    auto spawnPart = [&](const PanelPose& pose, const r3d::Mesh3D& mesh,
+                         const State::PickMesh& pick, const glm::vec3& color) {
+        flecs::entity part = world.entity()
+            .set<r3d::Position3D>({fit * (pose.translation - assembly_center)})
+            .set<r3d::Rotation3D>({pose.rotation})
+            .set<r3d::Scale3D>({glm::vec3(fit)})
+            .set<r3d::Transform>({})
+            .set<r3d::Mesh3D>(mesh)
+            .set<r3d::Material>({color})
+            .set<r3d::Visible>({true})
+            // Opts the mesh out of the module's cel-shaded opaque pass in
+            // favour of CadOpaquePass -- the extension point render3d
+            // documents for exactly this. It stays in the frustum/transform
+            // machinery either way.
+            .add<r3d::DeferredDraw>();
+        g.pickables.push_back({part, &pick, color});
+    };
+
+    for (const PanelPose& pose : poses) {
+        spawnPart(pose, g.mesh, g.panel_pick, kPanelColor);
+    }
+    if (vertex_stl.valid) {
+        g.vertex_mesh = r3d::uploadMesh(vertex_stl.vertices, vertex_stl.indices);
+        for (const PanelPose& pose : vertex_poses) {
+            spawnPart(pose, g.vertex_mesh, g.vertex_pick, kVertexColor);
+        }
+    }
 
     // Module passes this panel replaces. r3d.Present goes to the default
     // framebuffer instead of the panel texture; r3d.SkyPass paints a daylight
@@ -523,6 +935,9 @@ void set_active(bool active)
 {
     if (!g.ready || active == g.active) return;
     g.active = active;
+    // A panel closed mid-hover would otherwise reopen with the highlight still
+    // painted on -- PanelInput early-outs while inactive and never clears it.
+    if (!active) setHovered(-1);
     for (flecs::entity pass : g.passes) {
         if (active) pass.enable(); else pass.disable();
     }
@@ -546,17 +961,25 @@ void set_ui_target(unsigned int fbo, int width, int height)
     g.ui_height = height;
 }
 
-void set_pointer(double mouse_x, double mouse_y, bool left_down, bool hovering)
+void set_pointer(double mouse_x, double mouse_y, bool left_down, bool hovering,
+                 double panel_x, double panel_y)
 {
     g.mouse_x = mouse_x;
     g.mouse_y = mouse_y;
     g.left_down = left_down;
     g.hovering = hovering;
+    g.panel_x = panel_x;
+    g.panel_y = panel_y;
 }
 
 void add_scroll(double delta)
 {
     g.scroll += delta;
+}
+
+bool has_hover()
+{
+    return g.ready && g.active && g.hovered >= 0;
 }
 
 bool view_key(int key, int mods)
@@ -618,9 +1041,14 @@ void shutdown(flecs::world& world)
     if (!g.ready) return;
     releaseViewport();
     g.cad_query = {};
+    g.panel_pick = {};
+    g.vertex_pick = {};
+    g.pickables.clear();
+    g.hovered = -1;
     if (g.cad_shader) { glDeleteProgram(g.cad_shader); g.cad_shader = 0; }
     if (g.backdrop_shader) { glDeleteProgram(g.backdrop_shader); g.backdrop_shader = 0; }
     r3d::cleanupMesh(g.mesh);
+    r3d::cleanupMesh(g.vertex_mesh);
     r3d::shutdown(world);
     g.ready = false;
 }

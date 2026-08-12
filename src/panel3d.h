@@ -21,12 +21,16 @@ struct NVGcontext;
 
 namespace panel3d {
 
-// Import render3d into `world`, load `stl_path`, and build the scene at an
-// initial `width` x `height`. Requires a current GL context. Returns false if
-// the model could not be loaded, in which case nothing is registered and the
-// panel simply shows its background.
+// Import render3d into `world`, load the chassis part meshes, and build the
+// scene at an initial `width` x `height`. `panel_stl_path` is one support
+// panel and `vertex_stl_path` one vertex connector, both in their SCAD-local
+// frames; the dodecahedroid layout instances them twelve and twenty times.
+// Requires a current GL context. Returns false if the panel mesh could not be
+// loaded, in which case nothing is registered and the panel simply shows its
+// background; a missing vertex mesh only costs the connectors.
 bool init(flecs::world& world, NVGcontext* vg, GLFWwindow* window,
-          const std::string& stl_path, int width, int height);
+          const std::string& panel_stl_path, const std::string& vertex_stl_path,
+          int width, int height);
 
 // nanovg image handle for the viewport, or -1 before a successful init.
 int image_handle();
@@ -46,11 +50,19 @@ void set_ui_target(unsigned int fbo, int width, int height);
 
 // Pointer state for the orbit camera, in window coordinates. `hovering` gates
 // the drag so a press that began elsewhere never grabs the camera.
-void set_pointer(double mouse_x, double mouse_y, bool left_down, bool hovering);
+// `panel_x`/`panel_y` are the viewport's top-left corner in the same window
+// coordinates -- what turns the cursor into a point on the 3D image, so the
+// hover pick can cast a ray under the mouse.
+void set_pointer(double mouse_x, double mouse_y, bool left_down, bool hovering,
+                 double panel_x, double panel_y);
 
 // Accumulate a scroll wheel delta; applied as zoom on the next frame the panel
 // is hovered. Safe to call from a GLFW callback.
 void add_scroll(double delta);
+
+// True while the hover pick has a part under the mouse -- the show/hide
+// signal for cursor-attached UI such as the Droid panel's tooltip badge.
+bool has_hover();
 
 // Blender-style numpad view controls, for a GLFW key callback:
 //
