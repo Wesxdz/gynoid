@@ -1185,3 +1185,137 @@
 {"ts": 1786338754, "speaker": "Wesley", "template": "Here's a simple {{example, 0}}", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
 {"ts": 1786338756, "speaker": "Wesley", "template": "Here's a simple [[Q1:2 {{example, 0}} ]]", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
 {"ts": 1786338760, "speaker": "Wesley", "template": "Here's a simple [[Q1:2 {{example, 0}} {{*, i:simpler}} ]]", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786340282, "speaker": "Wesley", "template": "A simple example", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786340287, "speaker": "Wesley", "template": "straightforward", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786346434, "speaker": "Wesley", "template": "{{straightforward, t}}", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786346434, "speaker": "Wesley", "template": "{{straightforward, h}}", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786346434, "speaker": "Wesley", "template": "{{straightforward, o}}", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786346435, "speaker": "Wesley", "template": "straightforward", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786346440, "speaker": "Wesley", "template": "Thornfield", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786385940, "speaker": "Wesley", "template": "I wasn't always a troll's silicone snare", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786386135, "speaker": "Wesley", "template": "He wasn't going down", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786386198, "speaker": "Wesley", "template": "I wasn't always a troll's silicone snare", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786386332, "speaker": "Wesley", "template": "I wasn't always a {{troll's, h}} silicone snare", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786386332, "speaker": "Wesley", "template": "I wasn't always a troll's silicone snare", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786386337, "speaker": "Wesley", "template": "He was the troll's best friend", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786386347, "speaker": "Wesley", "template": "I wasn't going to go", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786386347, "speaker": "Wesley", "template": "I was not going to go", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786386811, "speaker": "Wesley", "template": "friend of", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786387165, "speaker": "Wesley", "template": "He was the troll's best friend", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786387791, "speaker": "Wesley", "template": "He was the troll's best friend", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786387799, "speaker": "Wesley", "template": "friend of", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786387808, "speaker": "Wesley", "template": "I'm going to say this one", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786387814, "speaker": "Wesley", "template": "thing", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786387819, "speaker": "Wesley", "template": "togo", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786387851, "speaker": "Wesley", "template": "It's only a problem sometimes", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786387854, "speaker": "Wesley", "template": "always", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786387871, "speaker": "Wesley", "template": "Perhaps it's a complex issue", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786387875, "speaker": "Wesley", "template": "aa\\ sdfgdf", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786387919, "speaker": "Wesley", "template": "My dreams of new land", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786387921, "speaker": "Wesley", "template": "landasdfsad", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786387925, "speaker": "Wesley", "template": "Now it works fine", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786387926, "speaker": "Wesley", "template": "itasdfadf", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786387930, "speaker": "Wesley", "template": "Not even a problem", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786387932, "speaker": "Wesley", "template": "Not", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786387951, "speaker": "Wesley", "template": "{{Not, p}}", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786387951, "speaker": "Wesley", "template": "Not", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786387953, "speaker": "Wesley", "template": "{{Not, 0}}", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786387955, "speaker": "Wesley", "template": "{{Not, R *:*}}", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786387955, "speaker": "Wesley", "template": "Not even a problem", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786387978, "speaker": "Wesley", "template": "I think it's great", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786387980, "speaker": "Wesley", "template": "I think {{it's, i}} great", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786388001, "speaker": "Wesley", "template": "I think it's great", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786388002, "speaker": "Wesley", "template": "I {{think, t}} it's great", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786388011, "speaker": "Wesley", "template": "I think it's great", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786388012, "speaker": "Wesley", "template": "think", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786388014, "speaker": "Wesley", "template": "sadfasdfklasdf", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786388014, "speaker": "Wesley", "template": "{{sadfasdfklasdf, a}}", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786388015, "speaker": "Wesley", "template": "{{sadfasdfklasdf, s}}", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786388015, "speaker": "Wesley", "template": "{{sadfasdfklasdf, d}}", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786388015, "speaker": "Wesley", "template": "{{sadfasdfklasdf, f}}", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786388016, "speaker": "Wesley", "template": "sadfasdfklasdf", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786388018, "speaker": "Wesley", "template": "{{sadfasdfklasdf, s}}", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786388024, "speaker": "Wesley", "template": "Branching only works sometimes", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786388026, "speaker": "Wesley", "template": "sometimes", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786388029, "speaker": "Wesley", "template": "Almost always", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786388030, "speaker": "Wesley", "template": "Almost", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786388309, "speaker": "Wesley", "template": "He was the troll's best friend", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786388349, "speaker": "Wesley", "template": "friend of", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786388382, "speaker": "Wesley", "template": "{{friend, i}} of", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786388382, "speaker": "Wesley", "template": "{{friend, w}} of", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786388382, "speaker": "Wesley", "template": "{{friend, a}} of", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786388382, "speaker": "Wesley", "template": "{{friend, s}} of", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786388382, "speaker": "Wesley", "template": "{{friend, n}} of", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786388382, "speaker": "Wesley", "template": "{{friend, t}} of", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786388382, "speaker": "Wesley", "template": "{{friend, g}} of", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786388383, "speaker": "Wesley", "template": "{{friend, o}} of", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786388383, "speaker": "Wesley", "template": "{{friend, i}} of", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786388383, "speaker": "Wesley", "template": "{{friend, n}} of", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786388383, "speaker": "Wesley", "template": "{{friend, g}} of", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786388383, "speaker": "Wesley", "template": "{{friend, t}} of", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786388383, "speaker": "Wesley", "template": "{{friend, o}} of", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786388383, "speaker": "Wesley", "template": "{{friend, g}} of", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786388383, "speaker": "Wesley", "template": "{{friend, o}} of", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786388389, "speaker": "Wesley", "template": "of not", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786388392, "speaker": "Wesley", "template": "{{of, a}} not", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786388392, "speaker": "Wesley", "template": "{{of, s}} not", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786388392, "speaker": "Wesley", "template": "{{of, i}} not", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786388392, "speaker": "Wesley", "template": "{{of, m}} not", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786388392, "speaker": "Wesley", "template": "{{of, p}} not", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786388392, "speaker": "Wesley", "template": "{{of, l}} not", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786388392, "speaker": "Wesley", "template": "of not", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786388392, "speaker": "Wesley", "template": "{{of, 0}} not", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786388392, "speaker": "Wesley", "template": "of not", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786388392, "speaker": "Wesley", "template": "{{of, a}} not", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786388392, "speaker": "Wesley", "template": "{{of, m}} not", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786388392, "speaker": "Wesley", "template": "{{of, p}} not", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786388392, "speaker": "Wesley", "template": "{{of, l}} not", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786388392, "speaker": "Wesley", "template": "of not", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786388399, "speaker": "Wesley", "template": "notr", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786389430, "speaker": "Wesley", "template": "He was the troll's best friend", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786389434, "speaker": "Wesley", "template": "friend of", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786389437, "speaker": "Wesley", "template": "{{friend, i}} of", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786389437, "speaker": "Wesley", "template": "{{friend, w}} of", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786389437, "speaker": "Wesley", "template": "{{friend, a}} of", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786389437, "speaker": "Wesley", "template": "{{friend, s}} of", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786389437, "speaker": "Wesley", "template": "{{friend, n}} of", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786389437, "speaker": "Wesley", "template": "{{friend, t}} of", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786389437, "speaker": "Wesley", "template": "{{friend, g}} of", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786389437, "speaker": "Wesley", "template": "{{friend, o}} of", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786389437, "speaker": "Wesley", "template": "{{friend, i}} of", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786389437, "speaker": "Wesley", "template": "{{friend, n}} of", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786389437, "speaker": "Wesley", "template": "{{friend, g}} of", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786389437, "speaker": "Wesley", "template": "{{friend, t}} of", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786389437, "speaker": "Wesley", "template": "{{friend, o}} of", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786389437, "speaker": "Wesley", "template": "{{friend, g}} of", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786389437, "speaker": "Wesley", "template": "{{friend, o}} of", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786389696, "speaker": "Wesley", "template": "the cat sat on the mat", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786389699, "speaker": "Wesley", "template": "on xx", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786389703, "speaker": "Wesley", "template": "he went to the store", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786389706, "speaker": "Wesley", "template": "the xx", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786549765, "speaker": "Wesley", "template": "Mouse hovers over VertexStructure 5", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786549770, "speaker": "Wesley", "template": "{{Mouse, m}} hovers over VertexStructure 5", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786549774, "speaker": "Wesley", "template": "{{Mouse, m}} {{hovers over, R *:*}} VertexStructure 5", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786549776, "speaker": "Wesley", "template": "{{Mouse, m}} {{hovers over, R *:*}} {{VertexStructure, v}} 5", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786549777, "speaker": "Wesley", "template": "{{Mouse, m}} {{hovers over, R *:*}} VertexStructure 5", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786549791, "speaker": "Wesley", "template": "Mouse hovers over Vertex Structure 5", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786549793, "speaker": "Wesley", "template": "{{Mouse, m}} hovers over Vertex Structure 5", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786549794, "speaker": "Wesley", "template": "{{Mouse, m}} {{hovers over, R *:*}} Vertex Structure 5", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786549796, "speaker": "Wesley", "template": "{{Mouse, m}} {{hovers over, R *:*}} {{Vertex Structure 5, v}}", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786549797, "speaker": "Wesley", "template": "{{Mouse, m}} {{hovers over, R m:v}} {{Vertex Structure 5, v}}", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786550834, "speaker": "Wesley", "template": "Show me all the Vertex Structures", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786550838, "speaker": "Wesley", "template": "{{Show, s}} me all the Vertex Structures", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786550839, "speaker": "Wesley", "template": "{{Show, s}} {{me, w}} all the Vertex Structures", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786550844, "speaker": "Wesley", "template": "{{Show, s}} {{me, w}} all the {{Vertex Structures, v}}", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786550848, "speaker": "Wesley", "template": "{{Show, s}} {{me, w}} all the [[Q0:1 {{Vertex Structures, v}} ]]", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786551339, "speaker": "Wesley", "template": "{{Show, s}} {{me, w}} all the [[Q0:1 {{Vertex Structures, c}} ]]", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786551339, "speaker": "Wesley", "template": "{{Show, s}} {{me, w}} all the [[Q0:1 {{Vertex Structures, l}} ]]", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786551339, "speaker": "Wesley", "template": "{{Show, s}} {{me, w}} all the [[Q0:1 Vertex Structures ]]", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786551339, "speaker": "Wesley", "template": "{{Show, s}} {{me, w}} all the [[Q0:1 {{Vertex, R *:*}} Structures ]]", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786551339, "speaker": "Wesley", "template": "{{Show, s}} {{me, w}} all the [[Q0:1 {{Vertex, R a:*}} Structures ]]", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786551342, "speaker": "Wesley", "template": "{{Show, s}} {{me, w}} all the {{Vertex, R a:*}} Structures", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786551344, "speaker": "Wesley", "template": "{{Show, s}} {{me, w}} all the Vertex Structures", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786551345, "speaker": "Wesley", "template": "{{Show, s}} {{me, w}} all the {{Vertex Structures, v}}", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786551346, "speaker": "Wesley", "template": "{{Show, s}} {{me, w}} all the [[Q0:1 {{Vertex Structures, v}} ]]", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786555578, "speaker": "Wesley", "template": "a simple example", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}
+{"ts": 1786555594, "speaker": "Wesley", "template": "Paphos Peach makes gynoids", "entities": [{"name": "Wesley", "symbol": "w"}, {"name": "Heonae", "symbol": "h"}], "prior": []}

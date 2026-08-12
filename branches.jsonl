@@ -13,3 +13,23 @@
 {"ts": 1786338410, "message": "A simple test", "span": "simple", "paraphrase": "straightforward"}
 {"ts": 1786338660, "message": "Here's a simple test", "span": "simple", "paraphrase": "straightforward"}
 {"ts": 1786338691, "message": "Here's a simple example", "span": "simple", "paraphrase": "simpler"}
+{"ts": 1786340287, "message": "A simple example", "span": "simple", "paraphrase": "straightforward"}
+{"ts": 1786386811, "message": "He was the troll's best friend", "span": "friend", "paraphrase": "friend of"}
+{"ts": 1786387799, "message": "He was the troll's best friend", "span": "friend", "paraphrase": "friend of"}
+{"ts": 1786387814, "message": "I'm going to say this one", "span": "one", "paraphrase": "thing"}
+{"ts": 1786387819, "message": "I'm going to say this one", "span": "to", "paraphrase": "togo"}
+{"ts": 1786387854, "message": "It's only a problem sometimes", "span": "only", "paraphrase": "always"}
+{"ts": 1786387875, "message": "Perhaps it's a complex issue", "span": "a", "paraphrase": "aa\\ sdfgdf"}
+{"ts": 1786387921, "message": "My dreams of new land", "span": "land", "paraphrase": "landasdfsad"}
+{"ts": 1786387926, "message": "Now it works fine", "span": "it", "paraphrase": "itasdfadf"}
+{"ts": 1786387932, "message": "Not even a problem", "span": "Not", "paraphrase": "Not"}
+{"ts": 1786388012, "message": "I think it's great", "span": "think", "paraphrase": "think"}
+{"ts": 1786388017, "message": "sadfasdfklasdf", "span": "sadfasdfklasdf", "paraphrase": "sadfasdfklasdf"}
+{"ts": 1786388026, "message": "Branching only works sometimes", "span": "sometimes", "paraphrase": "sometimes"}
+{"ts": 1786388030, "message": "Almost always", "span": "Almost", "paraphrase": "Almost"}
+{"ts": 1786388349, "message": "He was the troll's best friend", "span": "friend", "paraphrase": "friend of"}
+{"ts": 1786388389, "message": "friend of", "span": "of", "paraphrase": "of not"}
+{"ts": 1786388399, "message": "of not", "span": "not", "paraphrase": "notr"}
+{"ts": 1786389434, "message": "He was the troll's best friend", "span": "friend", "paraphrase": "friend of"}
+{"ts": 1786389699, "message": "the cat sat on the mat", "span": "on", "paraphrase": "on xx"}
+{"ts": 1786389706, "message": "he went to the store", "span": "the", "paraphrase": "the xx"}
