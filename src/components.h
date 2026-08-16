@@ -50,19 +50,64 @@ struct UIElementBounds {
     float xmin, ymin, xmax, ymax;
 };
 
+// What the Peach Core panel knows about a supporting process.
+//
+// The first three are what Thornfield can observe from outside: no process, a
+// process we just spawned, a process that exists. Ready is different in kind --
+// only the server knows when its model is loaded and it is answering, so it has
+// to say so. It reports over the announce socket in server_registry.h, and
+// until it does it sits at Running.
 enum class ServerStatus
 {
     Offline,
-    Loading,
+    Starting,
+    Running,
     Ready,
 };
 
-struct ServerScript
+// One entry from assets/config/servers.json, held by a registry entity that
+// outlives any panel. See that file for what each field means.
+struct ServerDef
 {
-    std::string name;
-    std::string conda_env;
-    std::string launcher_path;
+    std::string id;
+    std::string label;
+    std::string icon;
+    std::string description;
+
+    std::string script;
+    std::string cwd;
+    std::vector<std::string> args;
+
+    std::string conda_env;              // "" = whatever python3 resolves to
+    std::string launch = "direct";      // "direct" | "conda-run"
+    std::string socket;
+    std::string match;                  // /proc/<pid>/cmdline needle
+
+    bool autostart = false;
 };
+
+struct ServerState
+{
+    ServerStatus status = ServerStatus::Offline;
+
+    // The process id, and whether Thornfield is the one that started it. A
+    // foreign process can be reported but not stopped -- we do not own it, and
+    // killing something the user launched by hand is not ours to do.
+    int pid = 0;
+    bool owned = false;
+
+    double started_at = 0.0;            // world time, for the warmup grace
+
+    // Set by the server's own announcement, cleared when the process goes away.
+    // last_report is world time; once servers announce periodically rather than
+    // once, it is what lets a wedged server decay back out of Ready.
+    bool ready = false;
+    double last_report = 0.0;
+};
+
+// Icon entity --ServerOf--> registry entity. Panels come and go; the registry
+// entity and its process do not, so the icon only ever holds this reference.
+struct ServerOf {};
 
 struct RenderStatus {
     bool visible;
@@ -338,6 +383,25 @@ struct ImageRenderable
     float texOffsetY = 0.0f;
 };
 
+// Scroll position of a chat transcript, in pixels from the bottom. Zero is the
+// newest message resting on the panel's lower edge, which is where a chat wants
+// to sit; scrolling up reveals history. Lives on the message list.
+struct ChatScroll { float offset = 0.0f; };
+
+// The slider of a transcript's scrollbar. Points at the ChatScroll it reports,
+// so the system that sizes it needs no fixed hierarchy between the two.
+struct ChatScrollbarOf {};
+
+// A playable clip, drawn as its styled spectrogram. The image is the strip's
+// own ImageRenderable; this carries what the strip needs to behave as a player
+// -- which file to play, and how long it is, so a playhead can be positioned
+// without asking the audio device about a clip it may not have loaded.
+struct SpecStrip
+{
+    std::string wav_path;
+    std::string palette;      // empty = spectrogram::default_palette()
+};
+
 // Marks the ImageRenderable whose texture is the offscreen render3d scene (see
 // panel3d.h). The panel's laid-out bounds drive the viewport's resolution and
 // its hit test, so the tag is how that per-frame sync finds the element.
@@ -438,6 +502,33 @@ struct ChatMessageView {
 
 struct FocusChatInput {};
 struct SendChatMessage {};
+
+// The badge under the Interlocutor's annotation cursor -- what the selected
+// stop literally displays -- or empty when the cursor is on plain text or
+// annotation mode is off. Defined in main.cpp beside the annotator state it
+// reads; declared here so panel modules can key off the selection.
+std::string annotator_selected_badge();
+
+// The binding symbol and colour a named entity's badge wears on-screen -- its
+// unique shorthand id, recovered from the annotated messages that bound it.
+// Returns false for names with no bound identity (pure types, unannotated
+// words); such badges keep whatever colours their panel gives them.
+bool entity_screen_style(const std::string& name, std::string* symbol, uint32_t* color);
+
+// The relationship under the Interlocutor's annotation cursor as
+// "source\trelation\ttarget", or empty when the cursor is elsewhere. Defined
+// in main.cpp beside the annotator state it reads.
+std::string annotator_selected_triple();
+
+// Which role of an annotated relationship the MOUSE is over: 0 source, 1 the
+// relation, 2 target, -1 none. Joined badges count as the slot they fuse
+// into. Defined in main.cpp.
+int annotator_hovered_slot();
+
+// Same encoding for the annotation CURSOR's position: the role of the
+// selected stop, with an entity badge bound into a relationship's end
+// counting as that end. Defined in main.cpp.
+int annotator_selected_slot();
 
 // The inner row of a badge, where its label and symbols live. Published so a
 // caller can nest another badge *inside* this one -- a relationship block that
@@ -610,17 +701,35 @@ struct EntityQuery {
     std::string applied;
     bool focused = false;
 
-    // What submitting the bar does. Both share the keyboard plumbing; only the
-    // effect of Enter differs.
+    // What submitting the bar does. All kinds share the keyboard plumbing;
+    // only the effect of Enter differs.
     enum Kind {
         Semantic,   // re-rank the loaded rows by proximity / relation
         Flecs,      // re-query the headless world for a new set of rows
+        Supertype,  // assert <lattice focus> SubtypeOf <typed name> in the world
+        Subtype,    // assert <typed name> SubtypeOf <lattice focus> in the world
+        Instance,   // ensure <typed name> as an individual tagged <lattice focus>
     } kind = Semantic;
 
     std::string placeholder;
 };
 
 struct FocusEntityQuery {};
+
+// A supertype or subtype name submitted from a Lattice panel's entry shell,
+// parked on the panel until its module sends it to the world. Components
+// rather than direct calls because the Enter key is handled in main.cpp's
+// shared input plumbing, which should not know how the lattice talks to the
+// bridge. Two components, not a flag: both entries can be mid-flight at once.
+struct SupertypeSubmit {
+    std::string name;
+};
+struct SubtypeSubmit {
+    std::string name;
+};
+struct InstanceSubmit {
+    std::string name;
+};
 
 // Display order for an Entities panel: row position -> index into the backing
 // data. Empty means identity, which is also what it falls back to whenever a
@@ -863,6 +972,12 @@ enum class EditorType
     // A VNC stream hung as a plane in a walkable 3D room (screen3d.h).
     // Appended at the end: saved layouts store these as ints.
     Holodeck,
+    // Type lattices: where an entity sits under subsumption, and how the
+    // lattices of several entities line up when they form an analogy.
+    Lattice,
+    // Triple generalization: the seven adornments of a triple (Ego, Alter,
+    // Bridge, ...) and their extensions -- see type_generalization.png.
+    TypeGen,
     // SystemNavigator,
 
     // Bookshelf,

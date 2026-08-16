@@ -12,7 +12,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # add_definitions(AOTInductor_CUDA)
-add_executable(${PROJECT_NAME} src/main.cpp src/mel_spec_render.cpp src/glad.c src/vision_processor.cpp src/x11_outline.cpp src/dino_embedder.cpp src/thorn_vfx.cpp src/tradewinds.cpp src/stl_mesh.cpp src/panel3d.cpp src/screen3d.cpp src/panels/registry.cpp src/panels/holodeck_panel.cpp)
+add_executable(${PROJECT_NAME} src/main.cpp src/mel_spec_render.cpp src/glad.c src/vision_processor.cpp src/x11_outline.cpp src/dino_embedder.cpp src/thorn_vfx.cpp src/tradewinds.cpp src/stl_mesh.cpp src/panel3d.cpp src/screen3d.cpp src/panels/registry.cpp src/panels/holodeck_panel.cpp src/panels/droid_panel.cpp src/panels/peach_core_panel.cpp src/panels/lattice_panel.cpp src/panels/typegen_panel.cpp src/server_registry.cpp src/capabilities/function_library.cpp src/capabilities/speech.cpp src/capabilities/audio_player.cpp src/capabilities/spectrogram.cpp src/capabilities/spec_strip.cpp)
 # deps/tracy-0.13.1/public/TracyClient.cpp
 
 target_include_directories(${PROJECT_NAME} PRIVATE "deps/cppzmq")
@@ -112,8 +112,24 @@ target_include_directories(fpng PUBLIC deps/mel_spec/deps/fpng/src)
 set_target_properties(fpng PROPERTIES CXX_STANDARD 11)
 target_compile_options(fpng PRIVATE -msse4.1 -mpclmul)
 
+find_package(PkgConfig REQUIRED)
+
 # mel_spec libraries (audio streaming and mel spectrogram generation)
 add_subdirectory("deps/mel_spec")
+
+# spec_hud -- the styled mel spectrogram renderer vendored from paphos/spec_gen.
+# Compiled as C++ for fpng's sake, the same way spec_gen builds it, and with
+# SPEC_HUD_LIBRARY to drop its CLI main(). Note this is a different, much larger
+# renderer than deps/mel_spec/src/spec_hud.c, which is a live GL stream view.
+pkg_check_modules(SNDFILE REQUIRED sndfile)
+pkg_check_modules(FFTW3F REQUIRED fftw3f)
+add_library(spec_hud STATIC deps/spec_hud/spec_hud.c)
+set_source_files_properties(deps/spec_hud/spec_hud.c PROPERTIES LANGUAGE CXX)
+target_compile_definitions(spec_hud PRIVATE SPEC_HUD_LIBRARY FPNG_NO_SSE=1)
+target_include_directories(spec_hud
+    PUBLIC deps/spec_hud
+    PRIVATE ${SNDFILE_INCLUDE_DIRS} ${FFTW3F_INCLUDE_DIRS})
+target_link_libraries(spec_hud PUBLIC fpng ${SNDFILE_LIBRARIES} ${FFTW3F_LIBRARIES} m)
 
 # glm (header-only). The light distribution has no top-level CMakeLists, so the
 # INTERFACE target render3d links against is declared here.
@@ -160,7 +176,7 @@ target_link_libraries(query_server flecs spatialindex lmdb pthread)
 set_property(TARGET query_server PROPERTY CXX_STANDARD 20)
 # ----
 
-target_link_libraries(${PROJECT_NAME} flecs enet glfw glad nanovg fpng X11 Xi Xtst SDL2 SDL2_image ${OpenCV_LIBS} query_server Tracy::TracyClient libssh2::libssh2 dinov2 msgpack-cxx libzmq yogacore render3d)
+target_link_libraries(${PROJECT_NAME} flecs enet glfw glad nanovg fpng X11 Xi Xtst SDL2 SDL2_image ${OpenCV_LIBS} query_server Tracy::TracyClient libssh2::libssh2 dinov2 msgpack-cxx libzmq yogacore render3d spec_hud)
 
 # Add audio stream client executable
 add_executable(audio_stream_client src/audio_stream_client.c)

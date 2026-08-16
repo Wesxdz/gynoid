@@ -1,0 +1,119 @@
+// The external processes that support the gynoid, as shown in the Peach Core
+// panel. Read once at startup by src/server_registry.cpp; edit and relaunch to
+// add a server -- no rebuild.
+//
+// Comments are allowed: the loader parses with ignore_comments.
+//
+// Fields
+//   id          stable key. Names the registry entity; must be unique.
+//   label       shown in the hover overlay.
+//   icon        assets/server_hud/<icon>.png, 81x97. The status band is
+//               proportioned off minilm.png's painted caption strip, so art
+//               that keeps a 1px keyline and leaves its bottom ~18/97 clear
+//               lines up with it. Do not point this at a sprite sheet --
+//               representations.png is 1223x44 and renders as a strip of glyphs.
+//   description one line, shown in the hover overlay.
+//   script      passed to the interpreter. Relative paths resolve against cwd.
+//   cwd         working directory for the process. "" keeps Thornfield's
+//               (which is the build/ directory, hence the ../ paths below).
+//   args        extra arguments appended after the script.
+//   env         conda environment name. "" runs whatever python3 is on PATH.
+//   launch      how to enter that environment. Ignored when env is "".
+//                 "direct"    <conda_root>/envs/<env>/bin/python -u <script>
+//                             One process, so signals land straight on python.
+//                             Skips activation hooks.
+//                 "conda-run" conda run -n <env> --no-capture-output python -u
+//                             Full activation, for envs that need what their
+//                             activate scripts set (LD_LIBRARY_PATH, CUDA
+//                             paths). Adds a wrapper process, which the
+//                             process-group kill in tradewinds.cpp handles.
+//   socket      ZMQ address the server binds. Documentation only for now --
+//               liveness comes from the process table, not from this.
+//   match       substring matched against /proc/<pid>/cmdline to notice a
+//               server you started outside Thornfield. Defaults to `script`.
+//   autostart   spawn at startup. The five below were previously hardcoded in
+//               main() and default true so boot behaves as it always has.
+{
+  "conda_root": "~/miniconda3",
+
+  "servers": [
+    {
+      "id": "interlocutor",
+      "label": "Interlocutor",
+      "icon": "interlocutor",
+      "description": "Chat backend. Answers the Interlocutor panel's messages.",
+      "script": "../scripts/interlocutor.py",
+      "socket": "ipc:///tmp/thornfield_interlocutor_socket",
+      "autostart": true
+    },
+    {
+      "id": "entity_semantics",
+      "label": "Entity Semantics",
+      "icon": "entity_embeddings",
+      "description": "sentence-transformers embeddings. Orders the Entities panel by semantic proximity.",
+      "script": "../scripts/entity_semantics.py",
+      "socket": "ipc:///tmp/thornfield_entity_semantics_socket",
+      "autostart": true
+    },
+    {
+      "id": "pos",
+      "label": "Part of Speech",
+      "icon": "pos_transformer",
+      "description": "spaCy tagger. Drives the POS tier above each chat sentence.",
+      "script": "../scripts/pos.py",
+      "socket": "ipc:///tmp/thornfield_pos_socket",
+      "autostart": true
+    },
+    {
+      "id": "morphology",
+      "label": "Morphology",
+      "icon": "morphology",
+      "description": "OpenFst plural transducer, induced live from lexicon.jsonl.",
+      "script": "../scripts/morphology.py",
+      "socket": "ipc:///tmp/thornfield_morphology_socket",
+      "autostart": true
+    },
+    {
+      "id": "entity_query",
+      "label": "Entity Query",
+      "icon": "scene_query",
+      "description": "Bridge to the headless flecs world behind the Entities panel.",
+      "script": "../scripts/entity_query.py",
+      "socket": "ipc:///tmp/thornfield_entity_query_socket",
+      "autostart": true
+    },
+
+    // The first server in its own conda environment, and the first that
+    // announces its own readiness -- its band goes green only once the CUDA
+    // model is actually loaded, not when the process appears. autostart is off
+    // because loading it costs GPU memory and ~30s; click the icon when you
+    // want speech.
+    {
+      "id": "chatterbox",
+      "label": "Chatterbox TTS",
+      "icon": "chatterbox",
+      "description": "Speech synthesis. Announces READY once the CUDA model is loaded.",
+      "script": "../servers/chatter_zmq_server.py",
+      "env": "chatterbox",
+      "launch": "direct",
+      "socket": "ipc:///tmp/thornfield_chatter_socket",
+      "autostart": false
+    }
+
+    // Other servers elsewhere on the system go here. parakeet is the remaining
+    // conda environment on this machine -- fill in the real script path and
+    // drop the leading comment markers.
+    //
+    // ,{
+    //   "id": "parakeet",
+    //   "label": "Parakeet ASR",
+    //   "icon": "parakeet",
+    //   "description": "Speech recognition.",
+    //   "script": "server.py",
+    //   "cwd": "/home/wesxdz/paphos/stream_mic",
+    //   "env": "parakeet",
+    //   "launch": "conda-run",
+    //   "autostart": false
+    // }
+  ]
+}

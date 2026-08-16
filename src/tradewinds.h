@@ -69,6 +69,17 @@ struct module {
     module(flecs::world& world);
 };
 
+// In-flight reservation for a REQ client, visible IMMEDIATELY -- unlike the
+// has<AwaitResponse>() guard, which is blind within a frame because component
+// sets are deferred until the merge. Two systems that both pass the deferred
+// guard in one frame each fire the send observer, and the second send on a
+// REQ socket is a fatal zmq EFSM. Every sender sharing a client must guard
+// with try_reserve instead of has<AwaitResponse>(); the receive system
+// releases the reservation when the reply lands, *before* invoking the
+// handler, so a handler that chains a follow-up request can re-reserve.
+bool try_reserve(flecs::entity client);
+void release(flecs::entity client);
+
 }
 
 #ifdef __cplusplus

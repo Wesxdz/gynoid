@@ -17,6 +17,8 @@
 #include <algorithm>
 #include <unordered_map>
 #include <cfloat>
+#include <mutex>
+#include <string>
 
 namespace query_server {
 
@@ -25,6 +27,15 @@ static flecs::world* g_world = nullptr;
 static spatial::SpatialIndexManager* g_spatial_index = nullptr;
 // Component serializers removed - now using flecs reflection with entity.to_json()
 static SpatialQueryHandler g_spatial_handler = nullptr;
+
+// Requests parked between a connection thread and the host's frame loop.
+// Connection threads only do socket I/O; every world access happens in
+// process_pending(), on the thread that owns the world. Handlers used to run
+// on the connection thread, which raced the host's own frame the moment the
+// host was a live editor rather than a headless world.
+struct PendingRequest { int socket; std::string request; };
+static std::mutex g_pending_mutex;
+static std::vector<PendingRequest> g_pending;
 
 // Thread-local jump buffer for error recovery
 thread_local jmp_buf error_jump_buffer;
@@ -123,10 +134,14 @@ static std::string first_unknown_identifier(const std::string& expr) {
         std::string term = expr.substr(pos, end - pos);
         pos = end + 1;
 
-        // Trim, then drop the operators that may lead a term.
-        size_t b = term.find_first_not_of(" \t!?[|");
+        // Trim, then drop the operators that may lead a term. Parens are
+        // trimmed too so pair syntax splits into judgeable halves: the comma
+        // split cuts "(IsA, Often)" into "(IsA" and "Often)", and both name
+        // identifiers this check exists to catch.
+        size_t b = term.find_first_not_of(" \t!?[|(");
         if (b == std::string::npos) continue;
-        size_t e = term.find_last_not_of(" \t]|");
+        size_t e = term.find_last_not_of(" \t]|)");
+        if (e == std::string::npos || e < b) continue;
         term = term.substr(b, e - b + 1);
 
         // A relation term names its relation before the parenthesis.
@@ -134,6 +149,7 @@ static std::string first_unknown_identifier(const std::string& expr) {
         if (paren != std::string::npos) term = term.substr(0, paren);
 
         if (term.empty() || term == "_" || term == "*" || term[0] == '$') continue;
+        if (isdigit((unsigned char)term[0])) continue;   // numeric literal, not a name
 
         bool plain = true;
         for (char c : term) {
@@ -256,6 +272,77 @@ static bool handle_relate(int client_socket, const char* request) {
     return true;
 }
 
+// A reified triple: the statement (src, rel, tgt) as an entity of its own, so
+// statements can be typed, referred to, and stand in slots of further triples.
+// Migrated from paphos/reification. level counts how deep the target chain of
+// reifications nests -- a statement about a statement is level 1, and so on.
+struct Reify {
+    ecs_entity_t src;
+    ecs_entity_t rel;
+    ecs_entity_t tgt;
+    uint8_t level;
+};
+
+static uint64_t triple_hash(ecs_entity_t src, ecs_entity_t rel, ecs_entity_t tgt) {
+    return src ^ (rel << 21) ^ (tgt << 42);
+}
+
+// triple -> statement entity, so re-asserting a statement returns the one that
+// already stands for it instead of minting a twin.
+static std::unordered_map<uint64_t, ecs_entity_t> g_reified;
+
+// reify <Relation> <id1> <id2>
+//
+// Asserts the pair (like relate) AND finds-or-creates the statement entity
+// carrying it, replying with the statement's id. The statement is what lets a
+// triple be the subject or object of another triple.
+static bool handle_reify(int client_socket, const char* request) {
+    if (strncmp(request, "reify ", 6) != 0) return false;
+
+    char rel_name[128] = {0};
+    unsigned long long id1 = 0, id2 = 0;
+    char response[256];
+
+    if (sscanf(request + 6, "%127s %llu %llu", rel_name, &id1, &id2) != 3) {
+        snprintf(response, sizeof(response),
+                 "{\"error\": \"reify needs <Relation> <id1> <id2>\"}\n");
+        send(client_socket, response, strlen(response), 0);
+        return true;
+    }
+
+    flecs::entity a = g_world->entity((ecs_entity_t)id1);
+    flecs::entity b = g_world->entity((ecs_entity_t)id2);
+    if (!a.is_alive() || !b.is_alive()) {
+        snprintf(response, sizeof(response), "{\"error\": \"no such entity\"}\n");
+        send(client_socket, response, strlen(response), 0);
+        return true;
+    }
+
+    flecs::entity rel = g_world->lookup(rel_name);
+    if (!rel.is_valid()) rel = g_world->entity(rel_name);
+
+    a.add(rel, b);
+
+    const uint64_t hash = triple_hash(a.id(), rel.id(), b.id());
+    flecs::entity statement;
+    auto it = g_reified.find(hash);
+    if (it != g_reified.end() && g_world->entity(it->second).is_alive()) {
+        statement = g_world->entity(it->second);
+    } else {
+        const Reify* nested = b.try_get<Reify>();
+        const uint8_t level = nested ? (uint8_t)(nested->level + 1) : 0;
+        statement = g_world->entity().set<Reify>({a.id(), rel.id(), b.id(), level});
+        g_reified[hash] = statement.id();
+    }
+
+    snprintf(response, sizeof(response),
+             "{\"status\": \"OK\", \"id\": %llu, \"level\": %d}\n",
+             (unsigned long long)statement.id(),
+             (int)statement.get<Reify>().level);
+    send(client_socket, response, strlen(response), 0);
+    return true;
+}
+
 // True for entities flecs defines for its own bookkeeping -- traits, builtin
 // components, module scopes. A query of "_" matches literally everything, so
 // without this an unfiltered listing is ~40 entities of ECS plumbing before any
@@ -296,6 +383,11 @@ void initialize(flecs::world* world, spatial::SpatialIndexManager* spatial_index
     // to_json() like any component the host declared itself.
     world->component<EntityText>("Text").member<std::string>("value");
     world->component<EntityCreatedAt>("CreatedAt").member<double>("time");
+    world->component<Reify>("Reify")
+        .member<uint64_t>("src")
+        .member<uint64_t>("rel")
+        .member<uint64_t>("tgt")
+        .member<uint8_t>("level");
 }
 
 // Register component serializer
@@ -899,6 +991,18 @@ void handle_query(int client_socket, const char* query_str) {
             .expr(flecs_query_str.c_str())
             .build();
 
+        // An expression flecs refused to compile must answer as an error, not
+        // be iterated: get_iter on a null query is a fatal assert, and this
+        // server runs inside Thornfield -- the crash would take the editor
+        // with it.
+        if (!query) {
+            const char* error = "{\"error\": \"invalid query expression\"}\n";
+            send(client_socket, error, strlen(error), 0);
+            error_handler_set = false;
+            sigaction(SIGSEGV, &old_sa, nullptr);
+            return;
+        }
+
         // Build JSON response
         std::vector<char> response_storage(QUERY_RESPONSE_CAPACITY);
             char* response = response_storage.data();
@@ -984,29 +1088,41 @@ void* client_handler(void* arg) {
         while (*query == ' ' || *query == '\t') query++;
         if (*query == '\0') query = "_";
 
-        if (handle_create(client_socket, query)) {
-            close(client_socket);
-            return nullptr;
-        }
-        if (handle_relate(client_socket, query)) {
-            close(client_socket);
-            return nullptr;
-        }
-        if (handle_tag(client_socket, query)) {
-            close(client_socket);
-            return nullptr;
-        }
-        if (handle_ensure(client_socket, query)) {
-            close(client_socket);
-            return nullptr;
-        }
-
-        printf("Received query: %s\n", query);
-        handle_query(client_socket, query);
+        // Parked, not dispatched: process_pending() answers on the world's
+        // own thread and closes the socket.
+        std::lock_guard<std::mutex> lock(g_pending_mutex);
+        g_pending.push_back({client_socket, std::string(query)});
+        return nullptr;
     }
 
     close(client_socket);
     return nullptr;
+}
+
+void process_pending() {
+    std::vector<PendingRequest> batch;
+    {
+        std::lock_guard<std::mutex> lock(g_pending_mutex);
+        batch.swap(g_pending);
+    }
+
+    for (PendingRequest& pending : batch) {
+        const int client_socket = pending.socket;
+        const char* query = pending.request.c_str();
+
+        if (handle_create(client_socket, query)
+            || handle_relate(client_socket, query)
+            || handle_reify(client_socket, query)
+            || handle_tag(client_socket, query)
+            || handle_ensure(client_socket, query)) {
+            close(client_socket);
+            continue;
+        }
+
+        printf("Received query: %s\n", query);
+        handle_query(client_socket, query);
+        close(client_socket);
+    }
 }
 
 // Socket server thread
@@ -1018,7 +1134,10 @@ void* socket_server_thread(void* arg) {
     struct sockaddr_in server_addr, client_addr;
     socklen_t client_len = sizeof(client_addr);
 
-    server_socket = socket(AF_INET, SOCK_STREAM, 0);
+    // CLOEXEC, or every server the host spawns inherits this listener: after
+    // the host exits, a surviving child keeps the port bound with nobody
+    // calling accept(), and clients connect into a silent black hole.
+    server_socket = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (server_socket < 0) {
         perror("Socket creation failed");
         return nullptr;
@@ -1048,7 +1167,8 @@ void* socket_server_thread(void* arg) {
 
     while (true) {
         int* client_socket = (int*)malloc(sizeof(int));
-        *client_socket = accept(server_socket, (struct sockaddr*)&client_addr, &client_len);
+        *client_socket = accept4(server_socket, (struct sockaddr*)&client_addr, &client_len,
+                                 SOCK_CLOEXEC);
 
         if (*client_socket < 0) {
             perror("Accept failed");

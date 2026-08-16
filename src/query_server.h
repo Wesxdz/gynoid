@@ -25,4 +25,10 @@ void register_spatial_handler(SpatialQueryHandler handler);
 // This function spawns a background thread and returns immediately
 void start_server(int port);
 
+// Answer every request that has arrived since the last call. Must be called
+// regularly (once per frame) from the thread that owns the world: connection
+// threads only read requests and park them -- all world access happens here,
+// so the server never races the host's own frame.
+void process_pending();
+
 } // namespace query_server

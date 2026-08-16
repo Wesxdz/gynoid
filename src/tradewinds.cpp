@@ -1,7 +1,24 @@
 #include <tradewinds.h>
 #include <sys/prctl.h>
 
+#include <unordered_set>
+
 namespace tradewinds {
+
+// Clients with a request in flight. A plain set rather than a component so
+// membership changes are visible the instant they happen -- see the header.
+static std::unordered_set<ecs_entity_t> g_inflight;
+
+bool try_reserve(flecs::entity client)
+{
+    if (!client.is_valid()) return false;
+    return g_inflight.insert(client.id()).second;
+}
+
+void release(flecs::entity client)
+{
+    g_inflight.erase(client.id());
+}
 
 module::module(flecs::world& ecs) 
 {
@@ -96,7 +113,15 @@ module::module(flecs::world& ecs)
             }
 
             zmq::message_t request(sbuf.data(), sbuf.size());
-            auto result = client.socket->send(request, zmq::send_flags::dontwait);
+            // A REQ socket in the wrong state throws EFSM, and an exception
+            // escaping an observer terminates the process -- a dropped
+            // request must never take Thornfield down with it.
+            try {
+                client.socket->send(request, zmq::send_flags::dontwait);
+            } catch (const zmq::error_t& exc) {
+                std::cerr << "[tradewinds] send on " << e.name()
+                          << " failed: " << exc.what() << std::endl;
+            }
             e.remove<SendMapRequest>();
             // TODO: AwaitRequestResult
             // if (result) {
@@ -109,13 +134,41 @@ module::module(flecs::world& ecs)
         .each([](flecs::entity e, AwaitResponse& onResponse, ZMQClient& client)
         {
             zmq::message_t reply;
-            auto res = client.socket->recv(reply, zmq::recv_flags::dontwait);
-            if (res) {
-                msgpack::object_handle oh = msgpack::unpack((const char*)reply.data(), reply.size());
-                msgpack::object obj = oh.get();
-                auto res_map = obj.as<std::map<std::string, msgpack::object>>();
-                onResponse.response_function(res_map);
+            zmq::recv_result_t res;
+            try {
+                res = client.socket->recv(reply, zmq::recv_flags::dontwait);
+            } catch (const zmq::error_t& exc) {
+                std::cerr << "[tradewinds] recv on " << e.name()
+                          << " failed: " << exc.what() << std::endl;
+                release(e);
                 e.remove<AwaitResponse>();
+                return;
+            }
+            if (res) {
+                // The wire is free again the moment the reply is in hand --
+                // released before the handler so a chained request can
+                // re-reserve the client.
+                release(e);
+                // Queue the removal before invoking the handler: inside a
+                // system these ops are deferred, so at the merge they apply in
+                // order. Remove-then-handler means a handler that chains a new
+                // request (setting a fresh AwaitResponse) is not wiped by the
+                // removal of the one it is replacing. Removed on any reply, so
+                // a bad one does not wedge the client either.
+                e.remove<AwaitResponse>();
+                // A malformed reply, or a handler that throws, must not abort
+                // Thornfield: an exception escaping here unwinds out of a system
+                // callback into flecs and terminates with no message at all,
+                // which is a miserable thing to debug.
+                try {
+                    msgpack::object_handle oh = msgpack::unpack((const char*)reply.data(), reply.size());
+                    msgpack::object obj = oh.get();
+                    auto res_map = obj.as<std::map<std::string, msgpack::object>>();
+                    onResponse.response_function(res_map);
+                } catch (const std::exception& exc) {
+                    std::cerr << "[tradewinds] response handler for " << e.name()
+                              << " failed: " << exc.what() << std::endl;
+                }
             }
         });
 

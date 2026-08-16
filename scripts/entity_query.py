@@ -32,11 +32,13 @@ import msgpack
 SOCKET_ADDR = os.environ.get(
     "THORNFIELD_QUERY_SOCKET", "ipc:///tmp/thornfield_entity_query_socket")
 
-# The headless flecs world. python_query/src/main.cpp binds 8001; Thornfield's
-# own in-process query server is on 8005, so pointing at that instead makes the
-# editor browse itself, which is a useful thing to be able to do.
+# The flecs world to browse. Thornfield's own in-process query server binds
+# 8005 (query_server::start_server in main.cpp) and is always alive while the
+# editor runs, so it is the default -- the editor browses itself. Point
+# THORNFIELD_WORLD_PORT at 8001 to browse a separately-run python_query world
+# instead; the two ends speak the identical protocol (same query_server.cpp).
 WORLD_HOST = os.environ.get("THORNFIELD_WORLD_HOST", "localhost")
-WORLD_PORT = int(os.environ.get("THORNFIELD_WORLD_PORT", "8001"))
+WORLD_PORT = int(os.environ.get("THORNFIELD_WORLD_PORT", "8005"))
 
 # The far end truncates its own response at a fixed buffer, so asking for
 # everything in one query silently loses the tail. Kept as a ceiling we can
@@ -268,6 +270,149 @@ def main():
                 reply = create_in_world(kind, " ".join(text.split("\n")))
             except Exception as exc:
                 reply = {"status": "ERROR", "error": str(exc)}
+            socket_rep.send(msgpack.packb(reply))
+            continue
+
+        if req.get("type") == "supertype":
+            # A manual lattice annotation: sub SubtypeOf sup, e.g. rat
+            # SubtypeOf rodent. SubtypeOf is the one stored direction --
+            # supertypes are the same edges read from the other end -- and it
+            # is a plain relation, NOT flecs' builtin IsA: IsA is reserved for
+            # entity-instance-of-Type, and its builtin traversal semantics
+            # (transitive, reflexive) would corrupt a direct-edge Hasse
+            # diagram anyway. Both ends ensured by name -- idempotent all the
+            # way down, so re-asserting an existing edge is a no-op.
+            sub = (req.get("sub") or "").strip()
+            sup = (req.get("sup") or "").strip()
+            if not sub or not sup:
+                socket_rep.send(msgpack.packb(
+                    {"status": "ERROR", "error": "supertype needs sub and sup"}))
+                continue
+            if " " in sub or " " in sup or sub == sup:
+                # The world's ensure parses single tokens, and a self-edge
+                # would be a cycle of length zero.
+                socket_rep.send(msgpack.packb(
+                    {"status": "ERROR",
+                     "error": "sub and sup must be distinct single tokens"}))
+                continue
+            # Differentia make the subsumption conditional, and a conditional
+            # subsumption is NOT an edge from the bare sub: pet is never a
+            # supertype of cat, only of the meet cat+domesticated+owned. So
+            # the conditioned form builds the honest structure -- the
+            # intensional node under sub, with sup above IT -- and no direct
+            # sub -> sup edge is ever asserted.
+            requires = [r.strip() for r in (req.get("requires") or "").split(",")
+                        if r.strip()]
+            if any(" " in r for r in requires):
+                socket_rep.send(msgpack.packb(
+                    {"status": "ERROR",
+                     "error": "requires must be single tokens"}))
+                continue
+            try:
+                r_sub = query_world(f"ensure Type {sub}")
+                r_sup = query_world(f"ensure Type {sup}")
+                if not r_sub.get("id") or not r_sup.get("id"):
+                    reply = {"status": "ERROR",
+                             "error": r_sub.get("error") or r_sup.get("error")
+                                      or "ensure returned no id"}
+                elif not requires:
+                    query_world(f"relate SubtypeOf {r_sub['id']} {r_sup['id']}")
+                    reply = {"status": "OK"}
+                else:
+                    name = "+".join([sub] + requires)
+                    r_meet = query_world(f"ensure Type {name}")
+                    if not r_meet.get("id"):
+                        reply = {"status": "ERROR",
+                                 "error": r_meet.get("error") or "ensure returned no id"}
+                    else:
+                        for part in [sub] + requires:
+                            r_part = query_world(f"ensure Type {part}")
+                            if r_part.get("id"):
+                                query_world(
+                                    f"relate SubtypeOf {r_meet['id']} {r_part['id']}")
+                        query_world(f"relate SubtypeOf {r_meet['id']} {r_sup['id']}")
+                        reply = {"status": "OK"}
+            except Exception as exc:
+                reply = {"status": "OFFLINE", "error": str(exc)}
+            socket_rep.send(msgpack.packb(reply))
+            continue
+
+        if req.get("type") == "triples":
+            # Committed annotation triples, one per line: "src\trel\ttgt".
+            # Ends are ensured as Entity, the pair is asserted, and the
+            # statement is reified -- so every committed fact is queryable AND
+            # referable. Idempotent throughout; re-commits are no-ops.
+            lines = [l for l in (req.get("triples") or "").split("\n") if l.strip()]
+            done, skipped = 0, 0
+            try:
+                for line in lines:
+                    parts = line.split("\t")
+                    if len(parts) != 3 or any((not p) or (" " in p) for p in parts):
+                        skipped += 1
+                        continue
+                    src, rel, tgt = parts
+                    r_src = query_world(f"ensure Entity {src}")
+                    r_tgt = query_world(f"ensure Entity {tgt}")
+                    if not r_src.get("id") or not r_tgt.get("id"):
+                        skipped += 1
+                        continue
+                    query_world(f"reify {rel} {r_src['id']} {r_tgt['id']}")
+                    done += 1
+                reply = {"status": "OK", "count": done, "skipped": skipped}
+            except Exception as exc:
+                reply = {"status": "OFFLINE", "error": str(exc)}
+            socket_rep.send(msgpack.packb(reply))
+            continue
+
+        if req.get("type") == "instance":
+            # An individual: Remy IsA Rat, stored as flecs stores it -- the
+            # named entity wearing the type as a tag. Idempotent via ensure,
+            # and the extension query (expr "Rat") is how instances read back.
+            kind = (req.get("kind") or "").strip()
+            name = (req.get("name") or "").strip()
+            if not kind or not name or " " in kind or " " in name:
+                socket_rep.send(msgpack.packb(
+                    {"status": "ERROR",
+                     "error": "instance needs single-token kind and name"}))
+                continue
+            try:
+                r = query_world(f"ensure {kind} {name}")
+                reply = ({"status": "OK"} if r.get("id")
+                         else {"status": "ERROR",
+                               "error": r.get("error") or "ensure returned no id"})
+            except Exception as exc:
+                reply = {"status": "OFFLINE", "error": str(exc)}
+            socket_rep.send(msgpack.packb(reply))
+            continue
+
+        if req.get("type") == "meet":
+            # An intension-based subtype: no invented name, the concept IS its
+            # parts. "cat" + ["domesticated"] becomes a node canonically named
+            # cat+domesticated with SubtypeOf edges to every part -- it appears
+            # in the subs band of each parent, and carries its conditions in
+            # its identity instead of on an edge.
+            base = (req.get("base") or "").strip()
+            props = [p.strip() for p in (req.get("props") or "").split(",")
+                     if p.strip()]
+            if not base or not props or " " in base or any(" " in p for p in props):
+                socket_rep.send(msgpack.packb(
+                    {"status": "ERROR",
+                     "error": "meet needs single-token base and props"}))
+                continue
+            try:
+                name = "+".join([base] + props)
+                r_meet = query_world(f"ensure Type {name}")
+                if not r_meet.get("id"):
+                    reply = {"status": "ERROR",
+                             "error": r_meet.get("error") or "ensure returned no id"}
+                else:
+                    for part in [base] + props:
+                        r_part = query_world(f"ensure Type {part}")
+                        if r_part.get("id"):
+                            query_world(f"relate SubtypeOf {r_meet['id']} {r_part['id']}")
+                    reply = {"status": "OK"}
+            except Exception as exc:
+                reply = {"status": "OFFLINE", "error": str(exc)}
             socket_rep.send(msgpack.packb(reply))
             continue
 

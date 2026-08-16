@@ -77,10 +77,21 @@ using json = nlohmann::json;
 #include "components.h"
 #include "thorn_vfx.h"
 #include "panel3d.h"
+#include "server_registry.h"
+#include "capabilities/function_library.h"
+#include "capabilities/speech.h"
+#include "capabilities/spec_strip.h"
+#include "capabilities/audio_player.h"
+#include "capabilities/spectrogram.h"
 #include "screen3d.h"
 #include "capabilities/vnc_sources.h"
+#include "capabilities/ui_metrics.h"
 #include "panels/registry.h"
 #include "panels/holodeck_panel.h"
+#include "panels/droid_panel.h"
+#include "panels/peach_core_panel.h"
+#include "panels/lattice_panel.h"
+#include "panels/typegen_panel.h"
 
 #include "tradewinds.h"
 
@@ -979,6 +990,258 @@ public:
 };
 
 flecs::world* world = nullptr;
+
+// The badge under the Interlocutor's annotation cursor: what the selected stop
+// literally displays. An entity stop is its entity's label, a relationship's
+// own stop is the relationship label, and a source/target stop resolves its
+// symbol to the bound entity. Empty when the cursor sits on plain text or
+// annotation mode is off -- plain words are not badges. Declared in
+// components.h for panels that key off the interlocutor's selection.
+std::string annotator_selected_badge()
+{
+    std::string badge;
+    if (!world) return badge;
+
+    // A symbol stop shows the entity bound to that symbol, so resolve it the
+    // same way the badges themselves were labelled.
+    auto symbol_label = [](const std::string& symbol) -> std::string {
+        std::lock_guard<std::mutex> lock(known_entities_mutex);
+        for (const KnownEntity& known : known_entities)
+            if (known.display_symbol == symbol) return known.label;
+        return {};
+    };
+
+    static flecs::query<WordAnnotationSelector> selectors =
+        world->query<WordAnnotationSelector>();
+    selectors.each([&](flecs::entity, WordAnnotationSelector& selector) {
+        if (!badge.empty() || !selector.active || selector.sentence_template.empty()) return;
+        auto tokens = parse_sentence_template(selector.sentence_template);
+        int expanded_pos = 0;
+        for (size_t ti = 0; ti < tokens.size(); ti++) {
+            int width = token_selection_width(tokens, ti);
+            if (selector.start_index >= expanded_pos
+                && selector.start_index < expanded_pos + width) {
+                const SentenceToken& token = tokens[ti];
+                if (!token.is_binding()) return;
+                if (token.type == TokenType::Relationship) {
+                    auto roles = relationship_slot_roles(tokens, ti);
+                    int role = roles[selector.start_index - expanded_pos];
+                    if (role == 0)      badge = symbol_label(token.source_symbol);
+                    else if (role == 2) badge = symbol_label(token.target_symbol);
+                    if (!badge.empty()) return;
+                }
+                badge = token.text;
+                return;
+            }
+            expanded_pos += width;
+        }
+    });
+    return badge;
+}
+
+// The on-screen identity of a named entity: the binding symbol and colour its
+// badge carries wherever it appears. Recovered from the annotated messages
+// that bound it (the {{cat, c}} templates are where symbols live) and from
+// known_entities for the fixed cast. The symbol is the point: it is the
+// entity's unique shorthand id, so a panel drawing this entity elsewhere must
+// wear the same chip and tint, not a palette of its own.
+bool entity_screen_style(const std::string& name, std::string* symbol, uint32_t* color)
+{
+    std::string found;
+
+    {
+        std::lock_guard<std::mutex> lock(known_entities_mutex);
+        for (const KnownEntity& known : known_entities) {
+            if (known.label == name) { found = known.display_symbol; break; }
+        }
+    }
+
+    // The live selector first: while a message is being annotated, its
+    // bindings exist only there -- the stored message keeps the raw draft
+    // until Tab syncs the template back.
+    auto scan = [&](const std::string& sentence_template) {
+        if (!found.empty() || sentence_template.empty()) return;
+        for (const SentenceToken& token : parse_sentence_template(sentence_template)) {
+            if (token.type == TokenType::Entity && token.text == name
+                && !token.binding_symbol.empty()) {
+                found = token.binding_symbol;
+                return;
+            }
+        }
+    };
+
+    if (found.empty() && world) {
+        static flecs::query<WordAnnotationSelector> selectors =
+            world->query<WordAnnotationSelector>();
+        selectors.each([&](flecs::entity, WordAnnotationSelector& selector) {
+            scan(selector.sentence_template);
+        });
+    }
+    for (const StoredMessage& message : g_annotatable_messages) scan(message.sentence_template);
+
+    if (found.empty()) return false;
+    if (symbol) *symbol = found;
+    // Cached for any symbol that has already rendered a badge, so this does
+    // not add a round trip of its own.
+    if (color) *color = get_entity_color(found, name);
+    return true;
+}
+
+// The symbol's bound entity within one template, falling back to the fixed
+// cast: relationship slots carry symbols, and a triple can only be named by
+// resolving them back to the entities they bind.
+static std::string template_symbol_label(const std::vector<SentenceToken>& tokens,
+                                         const std::string& symbol)
+{
+    if (symbol.empty()) return {};
+    for (const SentenceToken& token : tokens) {
+        if (token.type == TokenType::Entity && token.binding_symbol == symbol)
+            return token.text;
+    }
+    std::lock_guard<std::mutex> lock(known_entities_mutex);
+    for (const KnownEntity& known : known_entities)
+        if (known.display_symbol == symbol) return known.label;
+    return {};
+}
+
+// The relationship a token belongs to, and the role it plays there: a
+// relationship stop maps through relationship_slot_roles; an entity token
+// whose binding symbol fills a relationship's source or target IS that end,
+// joined or not. Returns 0 source, 1 relation, 2 target, -1 uninvolved, with
+// the owning relationship's token index in *rel_index.
+static int token_role_in_relationship(const std::vector<SentenceToken>& tokens,
+                                      size_t ti, int part, size_t* rel_index)
+{
+    const SentenceToken& token = tokens[ti];
+    if (token.type == TokenType::Relationship) {
+        if (rel_index) *rel_index = ti;
+        auto roles = relationship_slot_roles(tokens, ti);
+        return (part >= 0 && (size_t)part < roles.size()) ? roles[part] : -1;
+    }
+    if (token.type == TokenType::Entity && !token.binding_symbol.empty()) {
+        for (size_t ri = 0; ri < tokens.size(); ri++) {
+            if (tokens[ri].type != TokenType::Relationship) continue;
+            if (tokens[ri].source_symbol == token.binding_symbol) {
+                if (rel_index) *rel_index = ri;
+                return 0;
+            }
+            if (tokens[ri].target_symbol == token.binding_symbol) {
+                if (rel_index) *rel_index = ri;
+                return 2;
+            }
+        }
+    }
+    return -1;
+}
+
+// The relationship under the Interlocutor's annotation cursor, resolved to
+// "source\trelation\ttarget" -- and the cursor counts as "on" a relationship
+// when it sits on any of its stops OR on an entity badge bound into one of
+// its ends. Empty when the cursor is uninvolved or a symbol resolves to
+// nothing. The TypeGen panel keys off this the way the Lattice keys off
+// annotator_selected_badge().
+std::string annotator_selected_triple()
+{
+    std::string triple;
+    if (!world) return triple;
+
+    static flecs::query<WordAnnotationSelector> selectors =
+        world->query<WordAnnotationSelector>();
+    selectors.each([&](flecs::entity, WordAnnotationSelector& selector) {
+        if (!triple.empty() || !selector.active || selector.sentence_template.empty()) return;
+        auto tokens = parse_sentence_template(selector.sentence_template);
+        int expanded_pos = 0;
+        for (size_t ti = 0; ti < tokens.size(); ti++) {
+            int width = token_selection_width(tokens, ti);
+            if (selector.start_index >= expanded_pos
+                && selector.start_index < expanded_pos + width) {
+                size_t ri = 0;
+                if (token_role_in_relationship(tokens, ti,
+                                               selector.start_index - expanded_pos,
+                                               &ri) < 0) return;
+                const SentenceToken& rel = tokens[ri];
+                const std::string src = template_symbol_label(tokens, rel.source_symbol);
+                const std::string tgt = template_symbol_label(tokens, rel.target_symbol);
+                if (src.empty() || tgt.empty() || rel.text.empty()) return;
+                triple = src + "\t" + rel.text + "\t" + tgt;
+                return;
+            }
+            expanded_pos += width;
+        }
+    });
+    return triple;
+}
+
+// The role the annotation cursor itself is on -- the selection's counterpart
+// to annotator_hovered_slot(), same encoding.
+int annotator_selected_slot()
+{
+    int role = -1;
+    if (!world) return role;
+
+    static flecs::query<WordAnnotationSelector> selectors =
+        world->query<WordAnnotationSelector>();
+    selectors.each([&](flecs::entity, WordAnnotationSelector& selector) {
+        if (role >= 0 || !selector.active || selector.sentence_template.empty()) return;
+        auto tokens = parse_sentence_template(selector.sentence_template);
+        int expanded_pos = 0;
+        for (size_t ti = 0; ti < tokens.size(); ti++) {
+            int width = token_selection_width(tokens, ti);
+            if (selector.start_index >= expanded_pos
+                && selector.start_index < expanded_pos + width) {
+                role = token_role_in_relationship(tokens, ti,
+                                                  selector.start_index - expanded_pos,
+                                                  nullptr);
+                return;
+            }
+            expanded_pos += width;
+        }
+    });
+    return role;
+}
+
+bool point_in_bounds(float x, float y, UIElementBounds bounds);
+
+// Which role of an annotated relationship the mouse is over: 0 source, 1 the
+// relation itself, 2 target, -1 none. A joined entity badge counts as the
+// slot it is fused into -- visually it IS that slot. The TypeGen panel keys
+// its adornment subset off this: hovering an end shows the patterns that pin
+// that end.
+int annotator_hovered_slot()
+{
+    int role = -1;
+    if (!world) return role;
+
+    const CursorState* cursor = world->lookup("GLFWState").try_get<CursorState>();
+    if (!cursor) return role;
+    const float mx = (float)cursor->x;
+    const float my = (float)cursor->y;
+
+    static flecs::query<WordAnnotationSelector> selectors =
+        world->query<WordAnnotationSelector>();
+    selectors.each([&](flecs::entity, WordAnnotationSelector& selector) {
+        if (role >= 0 || selector.sentence_template.empty()) return;
+        auto tokens = parse_sentence_template(selector.sentence_template);
+
+        int expanded_pos = 0;
+        for (size_t ti = 0; ti < tokens.size() && role < 0; ti++) {
+            const int width = token_selection_width(tokens, ti);
+            for (int part = 0; part < width; part++) {
+                const size_t sel = (size_t)(expanded_pos + part);
+                if (sel >= selector.selection_entities.size()) break;
+                flecs::entity slot = selector.selection_entities[sel];
+                if (!slot.is_valid() || !slot.is_alive()) continue;
+                const UIElementBounds* b = slot.try_get<UIElementBounds>();
+                if (!b || !point_in_bounds(mx, my, *b)) continue;
+
+                role = token_role_in_relationship(tokens, ti, part, nullptr);
+                break;
+            }
+            expanded_pos += width;
+        }
+    });
+    return role;
+}
 
 // ============================================================================
 // LAYOUT SYSTEM PHASE HELPERS
@@ -2067,7 +2330,8 @@ static std::string ellipsize_text(const std::string& text, const char* font_face
 // Calibrated badge height. A badge that nests another grows by NEST_PAD on the
 // top and bottom, so the inner block reads as contained rather than as exactly
 // filling its parent.
-static constexpr float BADGE_HEIGHT = 25.0f;
+// BADGE_HEIGHT lives in capabilities/ui_metrics.h now -- panel modules align
+// against badge edges too.
 
 // Alpha for badge sprites. The sprite's black ground should read as a
 // semitransparent darkening of the badge fill underneath -- the surface
@@ -2279,7 +2543,11 @@ flecs::entity create_slot_image(flecs::entity parent_entity, const std::string& 
 // gradient in the given colour with the sprite on top, so the sprite's own
 // black ground reads as a darker inset region of the chip -- the depth the
 // entity badges get for free -- instead of vanishing into a dark panel.
-flecs::entity create_letter_chip(flecs::entity parent, const std::string& symbol, uint32_t color)
+// Defaults repeated from ui_kit.h's declaration deliberately: main.cpp does
+// not include ui_kit.h, so this definition is the declaration its own call
+// sites see.
+flecs::entity create_letter_chip(flecs::entity parent, const std::string& symbol, uint32_t color,
+                                 bool preserve_case = true, float scale = 0.9f)
 {
     auto UIElement = world->lookup("UIElement");
     auto chip = world->entity()
@@ -2348,7 +2616,7 @@ flecs::entity create_letter_chip(flecs::entity parent, const std::string& symbol
         return chip;
     }
 
-    create_slot_image(chip, symbol, color, true, true);
+    create_slot_image(chip, symbol, color, true, preserve_case, scale);
     return chip;
 }
 
@@ -3130,7 +3398,9 @@ std::vector<std::string> editor_types =
     "Entities",
     "Lexicon",
     "Transducer",
-    "Holodeck"
+    "Holodeck",
+    "Lattice",
+    "TypeGen"
 };
 
 // VNCData lives in capabilities/vnc_sources.h now; the pool implementation
@@ -3904,7 +4174,7 @@ void create_world_entity(const std::string& kind, const std::string& text)
     if (text.empty()) return;
 
     flecs::entity client = world->lookup("EntityCreateClient");
-    if (!client.is_valid() || client.has<AwaitResponse>()) return;
+    if (!tradewinds::try_reserve(client)) return;
 
     client.set<SendMapRequest>({{
         {"type", "create"},
@@ -3925,7 +4195,7 @@ void request_entity_query(flecs::entity leaf, EntitySet& set)
     if (set.expr == set.wanted && !set.status.empty()) return;
 
     flecs::entity client = world->lookup("EntityQueryClient");
-    if (!client.is_valid() || client.has<AwaitResponse>()) return;
+    if (!tradewinds::try_reserve(client)) return;
 
     set.requested = set.wanted;
     client.set<SendMapRequest>({{
@@ -4022,7 +4292,7 @@ void request_entity_ranking(flecs::entity leaf, EntitySelection& selection)
         && selection.ranked_query == instruct) return;
 
     flecs::entity client = world->lookup("EntitySemanticsClient");
-    if (!client.is_valid() || client.has<AwaitResponse>()) return;
+    if (!tradewinds::try_reserve(client)) return;
 
     if (set.names.empty()) return;
 
@@ -4181,81 +4451,9 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         return;
     }
 
-    if (editor_type == EditorType::PeachCore)
-    {
-
-        auto canvas = leaf.target<EditorCanvas>();
-
-        // Server icon strip. A Yoga row filling the panel: each icon stretches
-        // to the row height, takes its width from the image's native aspect
-        // ratio, and shrinks uniformly if the strip would overflow.
-        auto server_hud = world->entity("ServerHUD")
-        .is_a(UIElement)
-        .child_of(canvas)
-        .add(flecs::OrderedChildren)
-        .add<UIYoga>()
-        .set<UIFillParent>({4.0f, 4.0f, 4.0f, 4.0f})
-        .set<Position, Local>({4.0f, 4.0f})
-        .set<UIFlexContainer>({
-            YGFlexDirectionRow, YGWrapNoWrap,
-            YGJustifyCenter, YGAlignStretch, 0.0f});
-
-        // Hover description backdrop: its own Yoga root covering the panel.
-        auto panel_overlay = world->entity()
-        .is_a(UIElement)
-        .child_of(canvas)
-        .add<UIYoga>()
-        .set<UIFillParent>({})
-        .set<RectRenderable>({0.0f, 0.0f, false, 0x000000DD})
-        .add<ServerDescription>()
-        .set<ZIndex>({15});
-
-        std::vector<std::string> server_icons = {"aeri_memory", "zmq", "flecs", "x11", "parakeet", "chatterbox", "doctr", "opencv", "minilm", "dino2", "alpaca", "modal", "borg"}; // , "autodistill", "yolo",
-        // std::vector<std::string> server_icons = {"peach_core"};
-
-        for (const auto& icon : server_icons)
-        {
-            // .set<ServerScript>({"chatterbox", "chatterbox", "../chatter_server"})
-            // .add(ServerStatus::Offline)
-            // .add<AddTagOnLeftClick, SelectServer>();
-            flecs::entity server_icon = world->entity()
-            .is_a(UIElement)
-            .child_of(server_hud)
-            .add<UIYoga>()
-            // Height comes from the row's AlignStretch, width from the image
-            // aspect ratio; shrink lets the whole strip scale down to fit.
-            // Capped at 1:1 so a tall panel doesn't upscale the icons.
-            .add<UIMaxNativeImageSize>()
-            .set<UIFlexItem>({0.0f, 1.0f, YGAlignAuto})
-            // Column so the status dot sits centred along the bottom edge.
-            .set<UIFlexContainer>({
-                YGFlexDirectionColumn, YGWrapNoWrap,
-                YGJustifyFlexEnd, YGAlignCenter, 0.0f})
-            .set<UIPadding>({0.0f, 0.0f, 4.0f, 0.0f})
-            .add<ServerHUDOverlay>(panel_overlay)
-            // TODO: Replace these events with callback functions?
-            .add<AddTagOnHoverEnter, ShowServerHUDOverlay>()
-            .add<AddTagOnHoverExit, HideServerHUDOverlay>()
-            .set<ImageCreator>({"../assets/server_hud/" + icon + ".png", 1.0f, 1.0f})
-            .set<ZIndex>({10});
-
-            if (icon == "minilm")
-            {
-                server_icon.set<CallbackOnLeftClick>({clicked_minilm});
-                // TODO: OnClick
-            } else
-            {
-                world->entity()
-                .is_a(UIElement)
-                .child_of(server_icon)
-                .add<UIYoga>()
-                .add<UINativeImageSize>()
-                .set<ImageCreator>({"../assets/server_dot.png", 1.0f, 1.0f})
-                .set<ZIndex>({12});
-            }
-        }
-
-    } else if (editor_type == EditorType::Condensate)
+    // EditorType::PeachCore moved to src/panels/peach_core_panel.cpp -- the
+    // registry dispatch above handles it.
+    if (editor_type == EditorType::Condensate)
     {
         // TODO: Generate list of files/directories
         auto dir_list = world->entity()
@@ -4387,73 +4585,8 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         // create_badge(badges, UIElement, "Physical", 0x619393ff);
         
     }
-    else if (editor_type == EditorType::Droid)
-    {
-        auto canvas = leaf.target<EditorCanvas>();
-
-        auto grey_bkg = world->entity()
-        .is_a(UIElement)
-        .child_of(canvas)
-        .add<UIYoga>()
-        .set<UIFillParent>({})
-        .set<RectRenderable>({0.0f, 0.0f, false, 0x3b3b3bff})
-        .set<ZIndex>({9});
-
-        // The droid is a live render3d scene rather than a portrait bitmap: the
-        // texture behind this ImageRenderable is the offscreen viewport in
-        // panel3d.cpp, redrawn each frame before nanovg flushes. It fills the
-        // canvas, and Panel3DSyncSystem keeps the render resolution matched to
-        // whatever size Yoga gives it.
-        //
-        // UIAspectRatio with an undefined ratio opts out of the intrinsic
-        // aspect ratio images normally publish -- the viewport is whatever
-        // shape the panel is, not whatever shape the texture happens to be.
-        auto viewport = world->entity()
-        .is_a(UIElement)
-        .child_of(canvas)
-        .add<UIYoga>()
-        .set<UIFillParent>({})
-        .add<UIAspectRatio>()
-        .add<Panel3DViewport>()
-        .set<ImageRenderable>({panel3d::image_handle(), 1.0f, 1.0f, 0.0f, 0.0f})
-        .set<ZIndex>({10});
-
-        world->entity()
-        .is_a(UIElement)
-        .set<ImageCreator>({"../assets/mnist_version.png", 1.0f, 1.0f})
-        // .set<Align>({-0.5f, -0.5f, 1.0f, 0.0f})
-        .set<ZIndex>({15})
-        .child_of(grey_bkg);
-
-        // The 3D tooltip: the same badge recipe the header wears, riding the
-        // cursor over the viewport while a part is hovered. It is a plain
-        // nanovg element, so it is pure emission by construction -- the
-        // scene's lighting never touches it -- and screen-sized regardless of
-        // camera zoom. Parented to the canvas, not the viewport: the canvas's
-        // Expand locks its bounds, so parking the tooltip far off-canvas
-        // while nothing is hovered cannot inflate the bounds that
-        // Panel3DSyncSystem sizes the render target from. Amber to match the
-        // hover highlight it labels.
-        auto part_tooltip = world->entity()
-        .is_a(UIElement)
-        .child_of(canvas)
-        .add<DroidPartTooltip>()
-        .set<Position, Local>({-10000.0f, -10000.0f})
-        .set<ZIndex>({30});
-        create_badge(part_tooltip, UIElement, "3D part", 0xFAB257FF);
-
-        auto badges = world->entity()
-        .is_a(UIElement)
-        .set<LayoutBox>({LayoutBox::Horizontal, 2.0f})
-        .set<Position, Local>({84.0f, 0.0f})
-        .child_of(leaf.target<EditorHeader>());
-
-
-        // create_badge(badges, UIElement, "Heonae", 0xff75baff, false, false, {}, {0}, {"H"}, {0xff75baff});
-        create_badge(badges, UIElement, "Aeri Peach", 0xe66c25ff, false, false, {}, {0}, {"A"}, {0xe66c25ff});
-        create_badge(badges, UIElement, "Physical", 0x619393ff);
-        
-    }
+    // EditorType::Droid moved to src/panels/droid_panel.cpp -- the registry
+    // dispatch above handles it.
     else if (editor_type == EditorType::ImaginaryInterlocutor)
     {
         // TODO: Message text size...
@@ -4505,15 +4638,47 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
         // AlignStretch (not FlexStart) is what keeps each message row bound to
         // the panel width -- a FlexStart column gives children no definite
         // cross size, so they size to their content and overrun the frame.
+        // Absolutely positioned inside the history panel so the scroll offset
+        // is a style value Yoga applies, and so the list's height is its own
+        // content rather than the panel's -- the transcript is meant to
+        // overflow and be cropped. Bottom-anchored because a chat rests on its
+        // newest message; ChatScrollSystem drives the bottom edge negative to
+        // push older messages back into view.
         auto message_list = world->entity()
             .is_a(UIElement)
             .child_of(messages_panel)
             .add(flecs::OrderedChildren)
             .add<UIYoga>()
-            .set<UIFlexItem>({1.0f, 1.0f, YGAlignAuto})
+            .set<ChatScroll>({0.0f})
+            // One tag for the whole transcript: resolve_scissor walks up from
+            // each renderable, so this reaches parts built long after their
+            // message -- annotation badges, paraphrase rows, spectrogram strips.
+            .add<ScissorContainer>(messages_panel)
+            .set<UIAbsoluteEdges>({0.0f, YGUndefined, 0.0f, 0.0f})
             .set<UIFlexContainer>({
                 YGFlexDirectionColumn, YGWrapNoWrap,
                 YGJustifyFlexEnd, YGAlignStretch, 4.0f});
+
+        // Scrollbar. Absolutely positioned against the panel's right edge so it
+        // sits over the transcript rather than taking width from it, and drawn
+        // above the messages. Indicator only for now: it reports where you are
+        // and that there is more, but the wheel is what moves it.
+        auto scroll_track = world->entity()
+            .is_a(UIElement)
+            .child_of(messages_panel)
+            .add<UIYoga>()
+            .set<UIAbsoluteEdges>({YGUndefined, 4.0f, 4.0f, 4.0f})
+            .set<UISize>({4.0f, YGUndefined})
+            .set<RoundedRectRenderable>({4.0f, 0.0f, 2.0f, false, 0xFFFFFF14})
+            .set<ZIndex>({13});
+
+        world->entity()
+            .is_a(UIElement)
+            .child_of(scroll_track)
+            .add<ChatScrollbarOf>(message_list)
+            .set<Position, Local>({0.0f, 0.0f})
+            .set<RoundedRectRenderable>({4.0f, 0.0f, 2.0f, false, 0xFFFFFF4D})
+            .set<ZIndex>({14});
 
         // Sibling *after* message_list so the badge row always sits below the
         // transcript. Inside message_list it would be pinned above every
@@ -5442,7 +5607,7 @@ static void try_send_branch()
 {
     if (g_pending_branch.paraphrase.empty()) return;
     flecs::entity client = world->lookup("EntityCreateClient");
-    if (!client.is_valid() || client.has<AwaitResponse>()) return;
+    if (!tradewinds::try_reserve(client)) return;
     client.set<SendMapRequest>({{
         {"type", "branch"},
         {"message", g_pending_branch.message},
@@ -5700,6 +5865,24 @@ static void scroll_callback(GLFWwindow* window, double xoffset, double yoffset)
         // Clamped by VirtualListSystem, which is the only place that knows the
         // current viewport height and therefore the maximum scroll.
         list.scroll -= (float)yoffset * list.row_pitch * 3.0f;
+        consumed = true;
+    });
+
+    // Chat transcripts scroll the same way but are not virtualized: rows vary
+    // in height, so there is no row pitch to step by and every message is a
+    // live entity. Roughly three text lines a notch.
+    static flecs::query<ChatScroll> transcripts = world->query<ChatScroll>();
+    transcripts.each([&](flecs::entity list, ChatScroll& scroll) {
+        if (consumed) return;
+        // The panel's bounds, not the list's: the list deliberately overflows
+        // it, so its own bounds would claim the wheel outside the visible area.
+        const UIElementBounds* view = list.parent().try_get<UIElementBounds>();
+        if (!view || !point_in_bounds(cursor.x, cursor.y, *view)) return;
+
+        // Wheel up reveals older messages, which means pushing the list down
+        // and away from the newest one. Clamped by ChatScrollSystem, the only
+        // place that knows the panel height and so the maximum.
+        scroll.offset += (float)yoffset * 54.0f;
         consumed = true;
     });
 
@@ -6362,6 +6545,32 @@ static void append_annotation_record(const WordAnnotationSelector& selector)
         return out;
     };
 
+    // The committed triples also land in the world: pair asserted, statement
+    // reified (see handle_reify). Fire-and-forget over the create client;
+    // everything downstream is idempotent, so a re-commit is a no-op. Names
+    // with spaces are skipped -- the world's verbs parse single tokens.
+    {
+        auto tokens = parse_sentence_template(selector.sentence_template);
+        std::string lines;
+        for (const SentenceToken& token : tokens) {
+            if (token.type != TokenType::Relationship || token.text.empty()) continue;
+            if (token.text.find(' ') != std::string::npos) continue;
+            const std::string src = template_symbol_label(tokens, token.source_symbol);
+            const std::string tgt = template_symbol_label(tokens, token.target_symbol);
+            if (src.empty() || tgt.empty()) continue;
+            if (src.find(' ') != std::string::npos || tgt.find(' ') != std::string::npos) continue;
+            if (!lines.empty()) lines += "\n";
+            lines += src + "\t" + token.text + "\t" + tgt;
+        }
+        if (!lines.empty()) {
+            flecs::entity client = world->lookup("EntityCreateClient");
+            if (tradewinds::try_reserve(client)) {
+                client.set<SendMapRequest>({{{"type", "triples"}, {"triples", lines}}});
+                client.set<AwaitResponse>({[](std::map<std::string, msgpack::object>&) {}});
+            }
+        }
+    }
+
     // Runs from build/, so the log lands at the repo root.
     std::ofstream log("../annotations.jsonl", std::ios::app);
     if (!log) return;
@@ -6476,7 +6685,7 @@ static void try_send_false()
 {
     if (g_pending_false.first.empty()) return;
     flecs::entity client = world->lookup("EntityCreateClient");
-    if (!client.is_valid() || client.has<AwaitResponse>()) return;
+    if (!tradewinds::try_reserve(client)) return;
     client.set<SendMapRequest>({{
         {"type", "teach_false"},
         {"word", g_pending_false.first},
@@ -6497,7 +6706,7 @@ static void try_send_teach()
 {
     if (g_pending_teach.empty()) return;
     flecs::entity client = world->lookup("EntityCreateClient");
-    if (!client.is_valid() || client.has<AwaitResponse>()) return;
+    if (!tradewinds::try_reserve(client)) return;
     client.set<SendMapRequest>({{
         {"type", "teach_forms"},
         {"forms", g_pending_teach},
@@ -8470,6 +8679,23 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
             if (query.panel.is_valid() && query.panel.is_alive()) {
                 if (query.kind == EntityQuery::Flecs) {
                     query.panel.ensure<EntitySet>().wanted = query.applied;
+                } else if (query.kind == EntityQuery::Supertype) {
+                    // Parked on the panel for the lattice module to send; the
+                    // draft clears so the bar is ready for the next name.
+                    if (!query.applied.empty()) {
+                        query.panel.set<SupertypeSubmit>({query.applied});
+                        query.draft.clear();
+                    }
+                } else if (query.kind == EntityQuery::Subtype) {
+                    if (!query.applied.empty()) {
+                        query.panel.set<SubtypeSubmit>({query.applied});
+                        query.draft.clear();
+                    }
+                } else if (query.kind == EntityQuery::Instance) {
+                    if (!query.applied.empty()) {
+                        query.panel.set<InstanceSubmit>({query.applied});
+                        query.draft.clear();
+                    }
                 } else {
                     query.panel.ensure<EntitySelection>().relation = query.applied;
                 }
@@ -8513,6 +8739,32 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
         }
         else if (!chat->draft.empty())
         {
+            // A line whose first word names a registered function is a command,
+            // not conversation: it is dispatched and deliberately skips the
+            // interlocutor, entity creation and annotation, which are for
+            // things said rather than things asked for. The chat box knows
+            // nothing about which functions exist -- see
+            // src/capabilities/function_library.h.
+            functions::Result invoked;
+            if (functions::dispatch_text(chat->draft, &invoked))
+            {
+                chat->messages.push_back({"You", chat->draft});
+                flecs::entity UIElement = world->lookup("UIElement");
+                world->query<ChatPanel>()
+                    .each([&](flecs::entity leaf, ChatPanel& chat_panel) {
+                        flecs::entity box = create_message(UIElement, chat_panel,
+                                       world->lookup("Wesley"), chat->draft.c_str());
+                        // If the command produced speech, its spectrogram strip
+                        // lands under this line when the reply arrives.
+                        speech::expect_strip_on(box);
+                    });
+                if (!invoked.ok) {
+                    std::cerr << "[command] " << invoked.message << std::endl;
+                }
+                chat->draft.clear();
+                return;
+            }
+
             // Enter: send message
             chat->messages.push_back({"You", chat->draft});
 
@@ -8593,7 +8845,7 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                         // compare-and-sets, so beating it with an edit is safe.
                         {
                             flecs::entity expand_client = world->lookup("MorphologyExpandClient");
-                            if (expand_client.is_valid() && !expand_client.has<AwaitResponse>()) {
+                            if (tradewinds::try_reserve(expand_client)) {
                                 g_expand_sent = chat->draft;
                                 expand_client.set<SendMapRequest>({{
                                     {"type", "expand_text"},
@@ -8711,29 +8963,36 @@ int main(int, char *[]) {
 
     world->set<ZMQContext>({ std::make_shared<zmq::context_t>(2) });
 
+    // Every supporting process Thornfield spawns now comes from
+    // assets/config/servers.json, so the Peach Core panel can show what is
+    // running and start or stop it. Autostart there reproduces what the
+    // hardcoded SpawnRequests below used to do. Imported after ZMQContext
+    // exists: the module binds the readiness inbox servers announce on.
+    world->import<servers::module>();
+
+    // The REQ clients stay here. They are how panels talk to a server once it
+    // is up, which is independent of who started it.
+
+    // Speech is registered as a callable function rather than wired into any
+    // one panel: anything that can name it can invoke it -- the chat box, a
+    // language model emitting tool calls, or a parser of your own.
+    speech::register_capability(*world);
+
     // TODO: Multiple chats
-    flecs::entity interlocutor_server = world->entity("InterlocutorServer")
-    .set<SpawnRequest>({"python3", {"../scripts/interlocutor.py"}});
     flecs::entity interlocutor_client = world->entity("InterlocutorClient")
         .set<ZMQClient>({ "ipc:///tmp/thornfield_interlocutor_socket", zmq::socket_type::req });
 
     // Embeddings for ordering the Entities panel by semantic proximity.
-    flecs::entity entity_semantics_server = world->entity("EntitySemanticsServer")
-        .set<SpawnRequest>({"python3", {"../scripts/entity_semantics.py"}});
     flecs::entity entity_semantics_client = world->entity("EntitySemanticsClient")
         .set<ZMQClient>({ "ipc:///tmp/thornfield_entity_semantics_socket", zmq::socket_type::req });
 
     // spaCy part-of-speech tagging: the default POS tier above each chat
     // sentence, and eventually the noun gate for morphology rule constraints.
-    flecs::entity pos_server = world->entity("PosServer")
-        .set<SpawnRequest>({"python3", {"../scripts/pos.py"}});
     flecs::entity pos_client = world->entity("PosClient")
         .set<ZMQClient>({ "ipc:///tmp/thornfield_pos_socket", zmq::socket_type::req });
 
     // OpenFst plural transducer, induced live from lexicon.jsonl -- the S
     // gesture in the Lexicon panel teaches it.
-    flecs::entity morphology_server = world->entity("MorphologyServer")
-        .set<SpawnRequest>({"python3", {"../scripts/morphology.py"}});
     flecs::entity morphology_client = world->entity("MorphologyClient")
         .set<ZMQClient>({ "ipc:///tmp/thornfield_morphology_socket", zmq::socket_type::req });
     flecs::entity morphology_rules_client = world->entity("MorphologyRulesClient")
@@ -8743,8 +9002,6 @@ int main(int, char *[]) {
 
     // Bridge to a separate headless flecs world; the Entities panel's rows come
     // from whatever that world answers with.
-    flecs::entity entity_query_server = world->entity("EntityQueryServer")
-        .set<SpawnRequest>({"python3", {"../scripts/entity_query.py"}});
     flecs::entity entity_query_client = world->entity("EntityQueryClient")
         .set<ZMQClient>({ "ipc:///tmp/thornfield_entity_query_socket", zmq::socket_type::req });
 
@@ -9058,15 +9315,9 @@ int main(int, char *[]) {
         std::cerr << "[screen3d] disabled; the Holodeck panel will show only its background" << std::endl;
     }
 
-    // Panel modules. Components shared between the monolith and the modules
-    // are registered at root scope first: a module import runs inside the
-    // module's scope, and letting it perform a component's *first*
-    // registration there would fork that component into a different id than
-    // the monolith's queries use.
-    world->component<UIElementBounds>();
-    world->component<Dragging>();
-    world->component<Screen3DViewport>();
-    world->import<panels::Holodeck>();
+    // Panel modules are imported later, after boundsCalculationSystem: their
+    // OnLoad sync systems must run after it within the phase, and flecs runs
+    // same-phase systems in declaration order.
 
     auto renderQueueEntity = world->entity("RenderQueue")
         .set<RenderQueue>({});
@@ -9268,18 +9519,10 @@ int main(int, char *[]) {
         }
     });
 
-    world->observer<UIElementBounds, AddTagOnLeftClick>()
-    .term_at(1).second<SelectServer>()
-    .event<LeftClickEvent>()
-    .each([&](flecs::entity e, UIElementBounds& bounds, AddTagOnLeftClick)
-    {
-        const ServerScript* script = e.try_get<ServerScript>();
-        if (script)
-        {
-
-        }
-        std::cout << "Start chatter server here" << std::endl;
-    });
+    // The SelectServer stub that used to sit here is gone: starting and
+    // stopping a server is a CallbackOnLeftClick on the icon, wired in
+    // src/panels/peach_core_panel.cpp against the registry in
+    // src/server_registry.h.
 
     world->observer<UIElementBounds, AddTagOnLeftClick>()
     .term_at(1).second<ShowPanelState>()
@@ -9539,6 +9782,76 @@ int main(int, char *[]) {
             }
         });
 
+    // Panel modules. Two ordering constraints meet here: after
+    // boundsCalculationSystem just above, so the modules' OnLoad sync systems
+    // read this frame's bounds (same-phase systems run in declaration order),
+    // and before the editor tree below, whose layout load dispatches
+    // create_editor_content through the registry the imports populate.
+    //
+    // Components shared between the monolith and the modules are registered
+    // at root scope first: a module import runs inside the module's scope,
+    // and letting it perform a component's *first* registration there would
+    // fork that component into a different id than the monolith's queries
+    // use.
+    world->component<UIElementBounds>();
+    world->component<Dragging>();
+    world->component<Screen3DViewport>();
+    world->component<Panel3DViewport>();
+    world->component<DroidPartTooltip>();
+    world->component<ServerOf>();
+    world->component<ServerDescription>();
+    world->component<ServerHUDOverlay>();
+    world->import<panels::Holodeck>();
+    world->import<panels::Droid>();
+    world->import<panels::PeachCore>();
+    world->import<panels::Lattice>();
+    world->import<panels::TypeGen>();
+
+    // Turns ChatScroll into the list's bottom inset, clamped so the transcript
+    // can never be dragged past either end. PreFrame, so the offset it writes
+    // is the one this frame's layout uses.
+    // Sizes and places the scrollbar slider from the scroll state it points at.
+    // Hidden by height, not by position: a zero-height rect draws nothing, and
+    // a transcript that fits its panel should show no scrollbar at all.
+    world->system<RoundedRectRenderable, Position>("ChatScrollbarSystem")
+    .term_at(1).second<Local>()
+    .with<ChatScrollbarOf>(flecs::Wildcard)
+    .kind(flecs::PreFrame)
+    .each([](flecs::entity slider, RoundedRectRenderable& bar, Position& pos)
+    {
+        flecs::entity list = slider.target<ChatScrollbarOf>();
+        const ChatScroll* scroll = list.is_valid() ? list.try_get<ChatScroll>() : nullptr;
+        const UIElementSize* content = list.is_valid() ? list.try_get<UIElementSize>() : nullptr;
+        const UIElementSize* track = slider.parent().try_get<UIElementSize>();
+        if (!scroll || !content || !track || track->height <= 0.0f) return;
+
+        if (content->height <= track->height) { bar.height = 0.0f; return; }
+
+        // Proportional thumb, floored so a very long transcript still leaves
+        // something to see.
+        const float ratio = track->height / content->height;
+        bar.height = std::max(24.0f, track->height * ratio);
+
+        // offset counts up from the bottom, so a zero offset puts the thumb at
+        // the bottom of the track -- where the newest message is.
+        const float slack = std::max(1.0f, content->height - track->height);
+        const float t = std::clamp(scroll->offset / slack, 0.0f, 1.0f);
+        pos.y = (track->height - bar.height) * (1.0f - t);
+    });
+
+    world->system<ChatScroll, UIAbsoluteEdges, const UIElementSize>("ChatScrollSystem")
+    .kind(flecs::PreFrame)
+    .each([](flecs::entity list, ChatScroll& scroll, UIAbsoluteEdges& edges,
+             const UIElementSize& content)
+    {
+        const UIElementSize* view = list.parent().try_get<UIElementSize>();
+        if (!view) return;
+
+        const float slack = std::max(0.0f, content.height - view->height);
+        scroll.offset = std::clamp(scroll.offset, 0.0f, slack);
+        edges.bottom = -scroll.offset;
+    });
+
     int editor_padding = 3.0f;
     int editor_edge_hover_dist = 8.0f;
 
@@ -9764,7 +10077,7 @@ int main(int, char *[]) {
 
             if (g_transducer.stale) {
                 flecs::entity client = world->lookup("MorphologyRulesClient");
-                if (client.is_valid() && !client.has<AwaitResponse>()) {
+                if (tradewinds::try_reserve(client)) {
                     g_transducer.stale = false;   // one request per staleness
                     client.set<SendMapRequest>({{{"type", "dump"}}});
                     client.set<AwaitResponse>({transducer_dump_response});
@@ -9899,7 +10212,7 @@ int main(int, char *[]) {
             // the FST compiles in milliseconds -- so no retry machinery.
             if (!word.empty() && word != g_fst_requested) {
                 flecs::entity client = world->lookup("MorphologyClient");
-                if (client.is_valid() && !client.has<AwaitResponse>()) {
+                if (tradewinds::try_reserve(client)) {
                     g_fst_requested = word;
                     client.set<SendMapRequest>({{{"type", "analyze"}, {"word", word}}});
                     client.set<AwaitResponse>({morphology_response});
@@ -10184,7 +10497,7 @@ int main(int, char *[]) {
             if (!want_pos.empty() && !g_pos_cache.count(want_pos)
                 && g_pos_requested != want_pos) {
                 flecs::entity client = world->lookup("PosClient");
-                if (client.is_valid() && !client.has<AwaitResponse>()) {
+                if (tradewinds::try_reserve(client)) {
                     g_pos_requested = want_pos;
                     client.set<SendMapRequest>({{{"type", "tag"}, {"text", want_pos}}});
                     client.set<AwaitResponse>({pos_tags_response});
@@ -10229,7 +10542,11 @@ int main(int, char *[]) {
                 return;
             }
 
-            text->text = query.draft + (query.focused ? "|" : "");
+            // Blinks on world time; the off phase keeps a space so the text
+            // width (and a centered shell) doesn't jiggle with the cursor.
+            const bool cursor_on =
+                fmodf((float)bar.world().get_info()->world_time_total, 1.06f) < 0.53f;
+            text->text = query.draft + (!query.focused ? "" : cursor_on ? "|" : " ");
             text->color = 0xFFFFFFFF;
 
             // The flecs bar is the one that can fail, so it carries the bridge's
@@ -11493,10 +11810,12 @@ int main(int, char *[]) {
 
             float parent_width = parent_bounds->xmax - parent_bounds->xmin;
 
-            // Apply scissor if entity has ScissorContainer
-            if (e.has<ScissorContainer>(flecs::Wildcard)) {
-                flecs::entity scissorEntity = e.target<ScissorContainer>();
-                if (scissorEntity.is_valid()) {
+            // Resolved up the hierarchy, not read off this entity alone: a
+            // renderable inside a clipped container is clipped too, even though
+            // only the container carries the tag.
+            if (ecs_entity_t scissor = resolve_scissor(e)) {
+                flecs::entity scissorEntity = world->entity(scissor);
+                {
                     const UIElementBounds* scissorBounds = scissorEntity.try_get<UIElementBounds>();
                     if (scissorBounds) {
                         nvgScissor(graphics.vg, scissorBounds->xmin, scissorBounds->ymin,
@@ -11962,95 +12281,9 @@ int main(int, char *[]) {
         }
     });
 
-    // The 3D viewport is the one element whose *pixels* depend on its layout, so
-    // the size Yoga gave it has to reach the renderer before the passes run.
-    // Registered after boundsCalculationSystem (also OnLoad) so the bounds read
-    // here are this frame's, and before Panel3DInput on PreUpdate so a drag is
-    // applied in the frame it happened.
-    //
-    // With no Droid panel open the query is empty and the whole render3d chain
-    // is switched off rather than drawing a scene nothing samples.
-    auto panel3d_viewports = world->query_builder<const UIElementBounds>()
-        .with<Panel3DViewport>()
-        .cached()
-        .build();
-
-    // A split divider being dragged means the pointer belongs to panel
-    // resizing, not to the 3D scene -- without this, resizing a Droid panel
-    // with the cursor over the viewport grabs the orbit camera and spins the
-    // model as a side effect of the resize gesture.
-    auto panel3d_split_drags = world->query_builder()
-        .with<Dragging>()
-        .build();
-
-    world->system("Panel3DSyncSystem")
-    .kind(flecs::OnLoad)
-    .run([panel3d_viewports, panel3d_split_drags, window](flecs::iter& it)
-    {
-        flecs::world w = it.world();
-        bool live = false;
-
-        panel3d_viewports.each([&](flecs::entity e, const UIElementBounds& bounds)
-        {
-            if (live) return;   // one scene, so the first laid-out panel wins
-            int panel_w = (int)std::lround(bounds.xmax - bounds.xmin);
-            int panel_h = (int)std::lround(bounds.ymax - bounds.ymin);
-            if (panel_w <= 0 || panel_h <= 0) return;
-            live = true;
-
-            panel3d::set_active(true);
-            panel3d::resize(w, panel_w, panel_h);
-
-            // The image handle is minted per viewport allocation, so a resize
-            // invalidates whatever the panel was created with.
-            ImageRenderable& img = e.ensure<ImageRenderable>();
-            img.imageHandle = panel3d::image_handle();
-
-            double cursor_x = 0.0, cursor_y = 0.0;
-            if (const CursorState* cursor = w.lookup("GLFWState").try_get<CursorState>()) {
-                cursor_x = cursor->x;
-                cursor_y = cursor->y;
-            }
-            const bool left_down = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
-            // While a divider drag is live the viewport sees no pointer at
-            // all: no orbit grab, no hover highlight flicker as the divider
-            // sweeps across the 3D image.
-            const bool ui_drag = panel3d_split_drags.count() > 0;
-            panel3d::set_pointer(cursor_x, cursor_y, left_down && !ui_drag,
-                                 !ui_drag && point_in_bounds(cursor_x, cursor_y, bounds),
-                                 bounds.xmin, bounds.ymin);
-        });
-
-        if (!live) panel3d::set_active(false);
-    });
-
-    // Screen3DSyncSystem moved to src/panels/holodeck_panel.cpp, registered
-    // when the Holodeck module is imported.
-
-    // The Droid panel's tooltip badge rides the cursor: bottom-left corner on
-    // the pointer, extending up-right, while a part is hovered. PreFrame, so
-    // the position flows through this frame's world-position and bounds
-    // propagation -- and the cursor read here is this frame's, polled before
-    // the pipeline ran, so the badge tracks live with no trailing. Only the
-    // shown/hidden state is the pick's, one frame behind like the highlight.
-    // The cursor is window-space and the holder canvas-local, so the canvas's
-    // bounds origin (stable outside panel rearranges) converts between them.
-    world->system<Position, const UIElementBounds>("Droid3DTooltipSystem")
-    .term_at(0).second<Local>()
-    .term_at(1).parent()
-    .with<DroidPartTooltip>()
-    .kind(flecs::PreFrame)
-    .each([](flecs::entity e, Position& pos, const UIElementBounds& canvas_bounds)
-    {
-        const CursorState* cursor = world->lookup("GLFWState").try_get<CursorState>();
-        if (panel3d::has_hover() && cursor) {
-            pos.x = (float)cursor->x - canvas_bounds.xmin;
-            pos.y = (float)cursor->y - canvas_bounds.ymin - BADGE_HEIGHT;
-        } else {
-            pos.x = -10000.0f;
-            pos.y = -10000.0f;
-        }
-    });
+    // Panel3DSyncSystem and Droid3DTooltipSystem moved to
+    // src/panels/droid_panel.cpp, registered when the Droid module is
+    // imported; Screen3DSyncSystem likewise lives in holodeck_panel.cpp.
 
     // Sync mel spec position during fill phase only
     // After fill, mel spec stays anchored at rightmost position (no texture offset)
@@ -12615,6 +12848,11 @@ int main(int, char *[]) {
 
         nvgBeginFrame(vg, graphics.uiWidth, graphics.uiHeight, 1.0f);
 
+        // Query-server requests parked by its connection threads. Answered
+        // here, outside progress() and outside any deferral, so handlers see
+        // the world exactly as a single-threaded caller would.
+        query_server::process_pending();
+
         world->defer_begin();
         glfwPollEvents();
         world->defer_end();
@@ -12740,6 +12978,14 @@ int main(int, char *[]) {
     cleanup3DRendering(graphics);
     screen3d::shutdown();
     panel3d::shutdown(*world);
+
+    // Before the world (and with it the ZMQContext) goes away: the readiness
+    // inbox is not a component, so nothing else closes it, and zmq_ctx_term()
+    // blocks on an open socket. The servers themselves are killed by the
+    // LinuxProcess OnRemove hook as the world tears down.
+    servers::shutdown();
+    audio::shutdown();
+    spectrogram::shutdown(vg);
 
     nvgDeleteGL2(vg);
 
