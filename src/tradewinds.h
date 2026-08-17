@@ -53,6 +53,16 @@ struct SendMapRequest
     std::map<std::string, std::string> data;
 };
 
+// A stream a client listens to rather than asks for. A subscription has no
+// reply and no reservation: the publisher talks while it works, messages arrive
+// whenever they arrive, and every one is delivered to the handler as its topic
+// and its payload. Used for a solver reporting progress it would be useless to
+// have to ask for.
+struct AwaitPublished
+{
+    std::function<void(const std::string& topic, const std::string& payload)> on_message;
+};
+
 struct SpawnRequest {
     std::string command;
     std::vector<std::string> args;

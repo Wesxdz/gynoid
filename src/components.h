@@ -401,6 +401,12 @@ struct PanelScroll { float offset = 0.0f; };
 // needs no fixed hierarchy between the two.
 struct PanelScrollbarOf {};
 
+// The same, for a list that virtualizes. A VirtualList keeps its offset and its
+// extent in its own fields -- the rows below the window do not exist, so there
+// is no content box to measure -- and its scrollbar has to read those rather
+// than the geometry.
+struct VirtualListScrollbarOf {};
+
 // The slider of a transcript's scrollbar. Points at the ChatScroll it reports,
 // so the system that sizes it needs no fixed hierarchy between the two.
 struct ChatScrollbarOf {};
@@ -1145,6 +1151,12 @@ enum class EditorType
     ArcTask,
     // The solver's scene graph for the task in context, as an indented tree.
     VarRegistry,
+    // What the abduction network predicts is relevant to the task in context.
+    NeuralAbduction,
+    // Every task in the set, the open one outlined.
+    Dataset,
+    // Runs the solver on the task in context and shows it working.
+    Solve,
     // SystemNavigator,
 
     // Bookshelf,

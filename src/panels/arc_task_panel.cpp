@@ -19,6 +19,7 @@
 #include "../components.h"
 #include "../tradewinds.h"
 #include "../server_registry.h"
+#include "../capabilities/arc_palette.h"
 #include "../capabilities/function_library.h"
 #include "../capabilities/query_contexts.h"
 #include "../capabilities/ui_kit.h"
@@ -46,23 +47,8 @@ constexpr const char* kMorphologyServerId = "morphology";
 constexpr const char* kArcDataDir =
     "/home/wesxdz/arc/editor/jane_eyre/ARC-AGI/data/training";
 
-// Canonical ARC palette, RRGGBBAA like every color in components.h.
-constexpr uint32_t kArcPalette[10] = {
-    0x555555FF, // 0 slate
-    0x0074D9FF, // 1 zen
-    0xFF4136FF, // 2 rose
-    0x2ECC40FF, // 3 grass
-    0xFFDC00FF, // 4 sun
-    0xAAAAAAFF, // 5 grey
-    0xF012BEFF, // 6 purse
-    0xFF851BFF, // 7 tang
-    0x7FDBFFFF, // 8 sky
-    0x985898FF, // 9 space
-};
-constexpr const char* kArcColorNames[10] = {
-    "slate", "zen", "rose", "grass", "sun",
-    "grey", "purse", "tang", "sky", "space",
-};
+// The palette and colour names live in one place: a Sun cell here and a Sun
+// badge in the Interlocutor have to be the same yellow.
 
 // Heatshield's taskset layout knobs, kept as constants: one panel, one look.
 constexpr float kMinCell          =  2.0f;
@@ -142,9 +128,15 @@ struct ArcTaskView {
     // morphology transducer, which is what turns "polyominoes" into
     // "polyomino". `inductive` records that some word arrived inflected --
     // the plural is the sentence saying it means every such thing, not one.
-    std::vector<std::string> pending_words;
-    std::string resolving;                   // word currently at the transducer
-    std::vector<std::string> resolved_terms;
+    // The query being assembled, in the order it was said. Word order carries
+    // meaning -- "Slate to Sun" is a transition and "Sun to Slate" is a
+    // different one, and a set of terms cannot tell them apart -- so parts are
+    // held in place and a word still at the transducer leaves a hole rather
+    // than being appended when it comes back.
+    std::vector<std::string> query_parts;
+    std::vector<std::pair<std::string, size_t>> pending;   // word, its slot
+    std::string resolving;                                 // word at the transducer
+    size_t resolving_slot = 0;
     std::vector<std::string> unresolved_words;
     bool inductive = false;
 
@@ -169,6 +161,13 @@ flecs::world* g_world = nullptr;
 // translation and evaluation to the server.
 std::vector<std::string> g_vocab;
 bool g_vocab_inflight = false;
+// Which task the terms in hand were declared for, and which one is being asked
+// about right now. Abstraction tags are task dependent -- the clusters, shapes
+// and transitions of THIS task -- so a vocabulary fetched once at startup goes
+// quietly wrong the moment the task changes: a word the open task knows stays
+// unrecognised because a task nobody is looking at any more had never heard it.
+std::string g_vocab_task;
+std::string g_vocab_request;
 
 // Defined with the rest of the context handling below; needed here because the
 // vocabulary is imported scoped to it.
@@ -225,6 +224,18 @@ std::string lowered(const std::string& s)
 // type named in one path but not the other is how "Rose RectPolygon" ends up
 // counting pixels.
 std::string enumerate_type_of(const std::string& query);
+
+// Words the solver's grammar reads itself: connectives, and the infix that
+// makes an elementary pair. Passed through untouched rather than resolved,
+// because they are not terms -- dropping them turned "Slate to Sun" into the
+// two colours conjoined, which is a different question with a different answer.
+bool is_connective(const std::string& word)
+{
+    const std::string lower = lowered(word);
+    return lower == "to" || lower == "from"
+        || lower == "and" || lower == "or" || lower == "not"
+        || lower == "(" || lower == ")";
+}
 
 // The kind a context declared for a term ("color", "state", "type", ...), or
 // empty when nothing declares the word.
@@ -344,9 +355,9 @@ bool load_task(ArcTaskView& view, const std::string& task_id)
     view.server_selection = false;
     view.structured.clear();
     view.sets.clear();
-    view.resolved_terms.clear();
+    view.query_parts.clear();
     view.unresolved_words.clear();
-    view.pending_words.clear();
+    view.pending.clear();
     view.inductive = false;
 
     // Position in the dataset, so the status line reads as a place you can
@@ -503,7 +514,7 @@ void draw_task(NVGcontext* vg, const RenderCommand*, const CustomRenderable&)
         }
 
         for (uint8_t color_idx = 0; color_idx < 10; color_idx++) {
-            const uint32_t col = kArcPalette[color_idx];
+            const uint32_t col = arc_palette[color_idx];
             const uint8_t rf = (col >> 24) & 0xFF;
             const uint8_t gf = (col >> 16) & 0xFF;
             const uint8_t bf = (col >>  8) & 0xFF;
@@ -825,7 +836,7 @@ void nlp_query_response(std::map<std::string, msgpack::object>& res)
                 for (const msgpack::object& o : it->second.as<std::vector<msgpack::object>>()) {
                     const int c = msg_int(o);
                     txt += " " + std::to_string(c);
-                    if (c >= 0 && c < 10) txt += std::string(" (") + kArcColorNames[c] + ")";
+                    if (c >= 0 && c < 10) txt += std::string(" (") + arc_color_names[c] + ")";
                 }
             }
         } catch (const std::exception&) { /* partial list is still an answer */ }
@@ -852,8 +863,9 @@ void vocabulary_response(std::map<std::string, msgpack::object>& res)
     if (field_str(res, "status") != "ok") {
         const std::string message = field_str(res, "message");
         view.status = message.empty() ? "vocabulary request failed" : message;
-        return;
+        return;                          // still holding the old task's terms
     }
+    g_vocab_task = g_vocab_request;
 
     flecs::entity context = context_entity(*g_world);
 
@@ -888,7 +900,7 @@ void vocabulary_response(std::map<std::string, msgpack::object>& res)
             // The declarer's index is what makes a colour term wear the colour
             // it selects: index 4 is the same 4 the cells are painted from.
             const uint32_t color = (kind == "color" && index >= 0 && index < 10)
-                ? kArcPalette[index] : 0u;
+                ? arc_palette[index] : 0u;
 
             g_world->entity()
                 .child_of(context)          // namespaced: no collision with a word
@@ -914,9 +926,10 @@ void finish_resolution(flecs::entity panel, ArcTaskView& view)
     view.resolving.clear();
 
     std::string query;
-    for (const std::string& term : view.resolved_terms) {
+    for (const std::string& part : view.query_parts) {
+        if (part.empty()) continue;          // a word nothing could resolve
         if (!query.empty()) query += " ";
-        query += term;
+        query += part;
     }
 
     // What the panel could not read is worth saying plainly: these are the
@@ -957,14 +970,15 @@ void analyze_response(std::map<std::string, msgpack::object>& res)
     const std::string term = lemma.empty() ? std::string() : vocab_term(lemma);
 
     if (!term.empty()) {
-        view.resolved_terms.push_back(term);
+        if (view.resolving_slot < view.query_parts.size())
+            view.query_parts[view.resolving_slot] = term;
         if (lemma != lowered(word)) view.inductive = true;
     } else {
         view.unresolved_words.push_back(word);
     }
 
     view.resolving.clear();
-    if (view.pending_words.empty()) finish_resolution(ve, view);
+    if (view.pending.empty()) finish_resolution(ve, view);
 }
 
 // --------------------------------------------------------- query as syntax
@@ -1013,8 +1027,8 @@ void rebuild_query_row(ArcTaskView& view)
         uint32_t color = 0x0074D9FF;
         const std::string lower = lowered(term);
         for (int i = 0; i < 10; i++) {
-            if (lower == kArcColorNames[i]) {
-                color = kArcPalette[i];
+            if (lower == arc_color_names[i]) {
+                color = arc_palette[i];
                 break;
             }
         }
@@ -1157,6 +1171,25 @@ bool arc_task_step(int delta)
     return true;
 }
 
+bool arc_task_open(const std::string& task_id)
+{
+    flecs::entity ve = view_entity();
+    if (!ve.is_valid() || task_id.empty()) return false;
+
+    const std::vector<std::string>& ids = dataset_ids();
+    if (std::find(ids.begin(), ids.end(), task_id) == ids.end()) return false;
+
+    return load_task(ve.ensure<ArcTaskView>(), task_id);
+}
+
+std::string arc_task_current()
+{
+    flecs::entity ve = view_entity();
+    if (!ve.is_valid()) return {};
+    const ArcTaskView* view = ve.try_get<ArcTaskView>();
+    return view ? view->task_id : std::string{};
+}
+
 ArcTask::ArcTask(flecs::world& world)
 {
     world.module<ArcTask>();
@@ -1205,8 +1238,9 @@ ArcTask::ArcTask(flecs::world& world)
     world.system<ArcTaskView>("ArcVocabularySystem")
     .kind(flecs::PreFrame)
     .each([](flecs::entity, ArcTaskView& view) {
-        if (!g_vocab.empty() || g_vocab_inflight) return;
+        if (g_vocab_inflight) return;
         if (view.task_id.empty()) return;
+        if (!g_vocab.empty() && g_vocab_task == view.task_id) return;
 
         // Says so on the panel rather than only in a log nobody is reading:
         // with no vocabulary, a word the solver would recognise stays a plain
@@ -1221,6 +1255,7 @@ ArcTask::ArcTask(flecs::world& world)
                          vocabulary_response))
             return;                      // client busy: try again next frame
         g_vocab_inflight = true;
+        g_vocab_request = view.task_id;
         view.status = "reading the solver's vocabulary...";
         view.dirty = true;
     });
@@ -1232,23 +1267,24 @@ ArcTask::ArcTask(flecs::world& world)
     world.system<ArcTaskView>("ArcTermResolveSystem")
     .kind(flecs::PreFrame)
     .each([](flecs::entity panel, ArcTaskView& view) {
-        if (view.pending_words.empty() || !view.resolving.empty()) return;
+        if (view.pending.empty() || !view.resolving.empty()) return;
 
         flecs::entity client = g_world->lookup(kMorphologyClient);
         if (!client.is_valid() || !server_running(kMorphologyServerId)) {
             // Without the transducer an inflected word simply cannot be read.
             // Reported as unread rather than stripped down by hand: what
             // "polyominoes" reduces to is something the Lexicon teaches.
-            for (const std::string& word : view.pending_words)
+            for (const auto& [word, slot] : view.pending)
                 view.unresolved_words.push_back(word);
-            view.pending_words.clear();
+            view.pending.clear();
             finish_resolution(panel, view);
             return;
         }
         if (!tradewinds::try_reserve(client)) return;   // Lexicon has it; next frame
 
-        view.resolving = view.pending_words.front();
-        view.pending_words.erase(view.pending_words.begin());
+        view.resolving = view.pending.front().first;
+        view.resolving_slot = view.pending.front().second;
+        view.pending.erase(view.pending.begin());
         client.set<SendMapRequest>({{{"type", "analyze"}, {"word", view.resolving}}});
         client.set<AwaitResponse>({analyze_response});
     });
@@ -1306,6 +1342,7 @@ ArcTask::ArcTask(flecs::world& world)
                 if (!send_solver({{"command", "vocabulary"}, {"task_id", view.task_id}},
                                  vocabulary_response))
                     return {false, "solver client busy -- try again"};
+                g_vocab_request = view.task_id;
                 return {true, "schema requested; tags land in the panel status line"};
             }
             if (line.empty())
@@ -1349,9 +1386,9 @@ ArcTask::ArcTask(flecs::world& world)
                 return {false, "the solver's vocabulary is not loaded yet "
                                "(start ARC Solver in Peach Core)"};
 
-            view.resolved_terms.clear();
+            view.query_parts.clear();
             view.unresolved_words.clear();
-            view.pending_words.clear();
+            view.pending.clear();
             view.inductive = false;
 
             // Roles are read as a flat conjunction here because jane_eyre's
@@ -1361,15 +1398,20 @@ ArcTask::ArcTask(flecs::world& world)
             // or this one, once the solver can -- has them without the
             // annotation changing.
             for (const std::string& word : query.words()) {
+                const size_t slot = view.query_parts.size();
+                if (is_connective(word)) {
+                    view.query_parts.push_back(lowered(word));
+                    continue;
+                }
                 const std::string term = vocab_term(word);
-                if (!term.empty()) view.resolved_terms.push_back(term);
-                else view.pending_words.push_back(word);   // ask the transducer
+                view.query_parts.push_back(term);          // empty = a hole
+                if (term.empty()) view.pending.push_back({word, slot});
             }
 
-            if (view.pending_words.empty()) {
+            if (view.pending.empty()) {
                 finish_resolution(ve, view);
             } else {
-                view.status = "reading " + std::to_string(view.pending_words.size()) +
+                view.status = "reading " + std::to_string(view.pending.size()) +
                               " word(s) through morphology...";
                 view.dirty = true;
             }

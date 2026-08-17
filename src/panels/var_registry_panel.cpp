@@ -56,10 +56,17 @@ struct VarRegistryView {
     std::vector<std::string> collapsed;     // paths the reader has folded shut
 
     std::string status;
-    flecs::entity list;                     // rows live here
+    flecs::entity list;                     // carries the VirtualList
     flecs::entity status_text;
     bool dirty = true;
     bool inflight = false;
+
+    // Which nodes are currently visible, flattened in reading order. A tree
+    // whose folds change is still a list once you know what is open, and a list
+    // is what can be windowed -- 607 nodes is 1800 entities standing in the
+    // editor otherwise, walked by the layout pass every frame whether or not
+    // you can see them.
+    std::vector<size_t> visible;
 };
 
 // Marks a row so a click knows which node it is on.
@@ -135,6 +142,9 @@ bool ancestors_open(const VarRegistryView& view, const std::string& path)
     return true;
 }
 
+// Defined below, once VirtualList's row builder is in scope.
+void recompute_visible(VarRegistryView& view);
+
 void scene_graph_response(std::map<std::string, msgpack::object>& res)
 {
     flecs::entity ve = view_entity();
@@ -197,9 +207,81 @@ void toggle_row(flecs::entity row)
     auto at = std::find(view.collapsed.begin(), view.collapsed.end(), info->path);
     if (at != view.collapsed.end()) view.collapsed.erase(at);
     else view.collapsed.push_back(info->path);
-    view.dirty = true;
+    recompute_visible(view);
 
     row.world().ensure<UIInputDispatch>().consumed = true;
+}
+
+void recompute_visible(VarRegistryView& view)
+{
+    view.visible.clear();
+    for (size_t i = 0; i < view.nodes.size(); i++)
+        if (ancestors_open(view, view.nodes[i].path)) view.visible.push_back(i);
+
+    if (view.list.is_valid() && view.list.is_alive()) {
+        VirtualList& list = view.list.ensure<VirtualList>();
+        list.item_count = view.visible.size();
+        list.dirty = true;             // the same window now holds other rows
+    }
+}
+
+// One row, by position in the visible set. VirtualListSystem decides which
+// positions exist.
+void build_row(flecs::entity list, size_t index, VarRegistryView& view)
+{
+    flecs::world world = list.world();
+    flecs::entity UIElement = world.lookup("UIElement");
+    if (!UIElement.is_valid() || index >= view.visible.size()) return;
+
+    const VarNode& node = view.nodes[view.visible[index]];
+
+    // Zebra by visible position, so folding a subtree cannot leave the banding
+    // broken.
+    auto row = world.entity()
+        .is_a(UIElement)
+        .child_of(list)
+        .add(flecs::OrderedChildren)
+        .add<UIYoga>()
+        .set<VarRow>({node.path})
+        .set<UIFlexItem>({0.0f, 0.0f, YGAlignAuto})
+        .set<UISize>({YGUndefined, kRowHeight})
+        .set<UIFlexContainer>({YGFlexDirectionRow, YGWrapNoWrap,
+                               YGJustifyFlexStart, YGAlignCenter, 6.0f})
+        .set<UIPadding>({0.0f, 8.0f, 0.0f,
+                         8.0f + depth_of(node.path) * kIndentStep})
+        .set<RectRenderable>({0.0f, kRowHeight, false,
+                              (index % 2) ? kZebraB : kZebraA})
+        .set<ZIndex>({12});
+    if (node.is_object) row.set<CallbackOnLeftClick>({toggle_row});
+
+    if (node.is_object) {
+        world.entity()
+            .is_a(UIElement)
+            .child_of(row)
+            .add<UIYoga>()
+            .add<UINativeImageSize>()
+            .set<ImageCreator>({is_collapsed(view, node.path) ? "arrow_right.png"
+                                                              : "arrow_down.png",
+                                1.0f, 1.0f, nvgRGBA(0x9A, 0x9A, 0x9A, 0xFF)})
+            .set<ZIndex>({13});
+    }
+
+    world.entity()
+        .is_a(UIElement)
+        .child_of(row)
+        .add<UIYoga>()
+        .set<TextRenderable>({leaf_of(node.path), "JetBrainsMono", kFontSize,
+                              node.highlighted ? kHighlight : kNameColor})
+        .set<ZIndex>({13});
+
+    if (!node.value.empty()) {
+        world.entity()
+            .is_a(UIElement)
+            .child_of(row)
+            .add<UIYoga>()
+            .set<TextRenderable>({node.value, "JetBrainsMono", kFontSize, kValueColor})
+            .set<ZIndex>({13});
+    }
 }
 
 void rebuild(VarRegistryView& view)
@@ -209,69 +291,10 @@ void rebuild(VarRegistryView& view)
     flecs::entity UIElement = world.lookup("UIElement");
     if (!UIElement.is_valid()) return;
 
-    std::vector<flecs::entity> old;
-    view.list.children([&](flecs::entity c) { old.push_back(c); });
-    for (flecs::entity c : old) c.destruct();
-
     if (view.status_text.is_valid() && view.status_text.is_alive())
         view.status_text.ensure<TextRenderable>().text = view.status;
 
-    int drawn = 0;
-    for (const VarNode& node : view.nodes) {
-        if (!ancestors_open(view, node.path)) continue;
-
-        // Zebra by drawn position, not by index in the list: the stripes have to
-        // alternate down the rows you can actually see, or folding a subtree
-        // leaves the banding broken.
-        auto row = world.entity()
-            .is_a(UIElement)
-            .child_of(view.list)
-            .add(flecs::OrderedChildren)
-            .add<UIYoga>()
-            .set<VarRow>({node.path})
-            .set<UIFlexItem>({0.0f, 0.0f, YGAlignAuto})
-            .set<UISize>({YGUndefined, kRowHeight})
-            .set<UIFlexContainer>({YGFlexDirectionRow, YGWrapNoWrap,
-                                   YGJustifyFlexStart, YGAlignCenter, 6.0f})
-            .set<UIPadding>({0.0f, 8.0f, 0.0f,
-                             8.0f + depth_of(node.path) * kIndentStep})
-            .set<RectRenderable>({0.0f, kRowHeight, false,
-                                  (drawn % 2) ? kZebraB : kZebraA})
-            .set<ZIndex>({12});
-        if (node.is_object) row.set<CallbackOnLeftClick>({toggle_row});
-        drawn++;
-
-        if (node.is_object) {
-            // The arrow is the state: pointing down when the subtree is open,
-            // right when it is folded away.
-            world.entity()
-                .is_a(UIElement)
-                .child_of(row)
-                .add<UIYoga>()
-                .add<UINativeImageSize>()
-                .set<ImageCreator>({is_collapsed(view, node.path) ? "arrow_right.png"
-                                                                  : "arrow_down.png",
-                                    1.0f, 1.0f, nvgRGBA(0x9A, 0x9A, 0x9A, 0xFF)})
-                .set<ZIndex>({13});
-        }
-
-        world.entity()
-            .is_a(UIElement)
-            .child_of(row)
-            .add<UIYoga>()
-            .set<TextRenderable>({leaf_of(node.path), "JetBrainsMono", kFontSize,
-                                  node.highlighted ? kHighlight : kNameColor})
-            .set<ZIndex>({13});
-
-        if (!node.value.empty()) {
-            world.entity()
-                .is_a(UIElement)
-                .child_of(row)
-                .add<UIYoga>()
-                .set<TextRenderable>({node.value, "JetBrainsMono", kFontSize, kValueColor})
-                .set<ZIndex>({13});
-        }
-    }
+    recompute_visible(view);
 }
 
 void create_content(flecs::entity leaf, flecs::entity UIElement)
@@ -321,10 +344,9 @@ void create_content(flecs::entity leaf, flecs::entity UIElement)
     .child_of(viewport)
     .add(flecs::OrderedChildren)
     .add<UIYoga>()
-    // Absolute, so it is free to be taller than the viewport; PanelScrollSystem
-    // writes the top edge and clamps to the overflow.
+    // Absolute, so VirtualListSystem can nudge its top edge for sub-row
+    // scrolling; the scissor crops whatever hangs past the viewport.
     .set<UIAbsoluteEdges>({0.0f, 0.0f, 0.0f, YGUndefined})
-    .set<PanelScroll>({0.0f})
     .add<ScissorContainer>(viewport)
     .set<UIFlexContainer>({YGFlexDirectionColumn, YGWrapNoWrap,
                            YGJustifyFlexStart, YGAlignStretch, 0.0f})
@@ -345,7 +367,7 @@ void create_content(flecs::entity leaf, flecs::entity UIElement)
     world.entity()
     .is_a(UIElement)
     .child_of(scroll_track)
-    .add<PanelScrollbarOf>(list)
+    .add<VirtualListScrollbarOf>(list)
     .set<Position, Local>({0.0f, 0.0f})
     .set<RoundedRectRenderable>({4.0f, 0.0f, 2.0f, false, 0xFFFFFF4D})
     .set<ZIndex>({15});
@@ -355,6 +377,17 @@ void create_content(flecs::entity leaf, flecs::entity UIElement)
     initial.status_text = status_text;
     initial.status = "waiting for an ARC context";
     column.set<VarRegistryView>(initial);
+
+    VirtualList rows;
+    rows.viewport = viewport;
+    rows.row_pitch = kRowHeight;
+    rows.pad = 0.0f;
+    rows.item_count = 0;
+    rows.build_row = [column](flecs::entity host, size_t index) {
+        if (!column.is_valid() || !column.is_alive()) return;
+        build_row(host, index, column.ensure<VarRegistryView>());
+    };
+    list.set<VirtualList>(rows);
 
     auto badges = world.entity()
     .is_a(UIElement)

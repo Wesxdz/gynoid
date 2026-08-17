@@ -97,7 +97,55 @@ module::module(flecs::world& ecs)
             auto ctx_comp = e.world().ensure<ZMQContext>();
 
             server.socket = std::make_unique<zmq::socket_t>(*(ctx_comp.ctx), server.type);
+
+            // A SUB socket that has not subscribed receives nothing at all --
+            // the filter defaults to matching no topic, so the socket connects,
+            // reports healthy, and stays silent forever. An empty prefix takes
+            // everything and lets the handler sort topics out.
+            if (server.type == zmq::socket_type::sub)
+                server.socket->set(zmq::sockopt::subscribe, "");
+
             server.socket->connect(server.addr);
+        });
+
+    // Drains everything a subscription has waiting, rather than one message per
+    // frame: a solver emits progress far faster than the editor draws, and a
+    // one-per-frame drain would fall further behind the longer it ran.
+    ecs.system<AwaitPublished, ZMQClient>()
+        .each([](flecs::entity e, AwaitPublished& awaiting, ZMQClient& client)
+        {
+            if (!client.socket || !awaiting.on_message) return;
+            for (int drained = 0; drained < 256; drained++) {
+                zmq::message_t topic;
+                zmq::recv_result_t got;
+                try {
+                    got = client.socket->recv(topic, zmq::recv_flags::dontwait);
+                } catch (const zmq::error_t& exc) {
+                    std::cerr << "[tradewinds] recv on " << e.name()
+                              << " failed: " << exc.what() << std::endl;
+                    return;
+                }
+                if (!got) return;
+
+                // Multipart by convention: [topic, payload]. A publisher that
+                // sends only one frame still reports, with an empty payload.
+                std::string payload;
+                if (client.socket->get(zmq::sockopt::rcvmore)) {
+                    zmq::message_t body;
+                    try {
+                        if (client.socket->recv(body, zmq::recv_flags::none))
+                            payload.assign((const char*)body.data(), body.size());
+                    } catch (const zmq::error_t&) { return; }
+                }
+
+                try {
+                    awaiting.on_message(
+                        std::string((const char*)topic.data(), topic.size()), payload);
+                } catch (const std::exception& exc) {
+                    std::cerr << "[tradewinds] published handler threw: "
+                              << exc.what() << std::endl;
+                }
+            }
         });
 
     ecs.observer<SendMapRequest, ZMQClient>()

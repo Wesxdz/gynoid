@@ -95,6 +95,9 @@ using json = nlohmann::json;
 #include "panels/typegen_panel.h"
 #include "panels/arc_task_panel.h"
 #include "panels/var_registry_panel.h"
+#include "panels/neural_abduction_panel.h"
+#include "panels/dataset_panel.h"
+#include "panels/solve_panel.h"
 
 #include "tradewinds.h"
 
@@ -1319,12 +1322,31 @@ static bool selected_comprehension_detail(query_contexts::Comprehension* out)
         out->extension_symbol = tokens[frame_start].reified_symbol;
         out->source_text.clear();
 
+        // Whose names the relationships in this frame already speak. An entity
+        // filling a slot is reported once, in the role it plays there -- listing
+        // it again as a bare member would say "Slate" twice for one Slate, and a
+        // context reading the words in order would receive "Slate Slate to Sun
+        // Sun" for a sentence that says Slate to Sun.
+        std::set<std::string> spoken_by_relationship;
+        for (int i = frame_start + 1; i < frame_end; i++) {
+            if (tokens[i].type != TokenType::Relationship) continue;
+            if (!tokens[i].source_symbol.empty())
+                spoken_by_relationship.insert(tokens[i].source_symbol);
+            if (!tokens[i].target_symbol.empty())
+                spoken_by_relationship.insert(tokens[i].target_symbol);
+        }
+
         for (int i = frame_start + 1; i < frame_end; i++) {
             const SentenceToken& token = tokens[i];
             if (token.text.empty()) continue;
 
             if (!out->source_text.empty()) out->source_text += " ";
             out->source_text += token.text;
+
+            if (token.type == TokenType::Entity
+                && !token.binding_symbol.empty()
+                && spoken_by_relationship.count(token.binding_symbol))
+                continue;
 
             if (token.type == TokenType::Relationship) {
                 // A relationship contributes all three of its slots, each
@@ -3218,12 +3240,26 @@ flecs::entity create_badge_impl(flecs::entity parent, flecs::entity UIElement,
 flecs::entity create_triple_block(flecs::entity parent, const SentenceToken& token,
                                   flecs::entity* out_content = nullptr,
                                   const SentenceToken* joined_src = nullptr,
-                                  const SentenceToken* joined_tgt = nullptr) {
+                                  const SentenceToken* joined_tgt = nullptr,
+                                  const std::string& src_label = std::string(),
+                                  const std::string& tgt_label = std::string()) {
     auto UIElement = world->lookup("UIElement");
 
     // The bridge takes a colour from both ends, since it belongs to neither.
-    uint32_t src_color = get_entity_color(token.source_symbol, "");
-    uint32_t tgt_color = get_entity_color(token.target_symbol, "");
+    //
+    // Asked with the joined end's TEXT, not its symbol alone: colour follows
+    // what a thing IS, and a symbol is per-sentence shorthand that the colour
+    // cache hands out per digit. Passing "" here meant a badge changed colour
+    // the moment it snapped into a relationship -- Sun stopped being yellow and
+    // became whatever colour digit 1 was holding, which is the same entity
+    // wearing two colours depending on where it stands.
+    // A slot standing apart from its badge is still that entity, so it is asked
+    // for the same colour by the same name -- src_label/tgt_label carry the word
+    // the symbol is bound to when the badge is elsewhere in the sentence.
+    uint32_t src_color = get_entity_color(token.source_symbol,
+                                          joined_src ? joined_src->text : src_label);
+    uint32_t tgt_color = get_entity_color(token.target_symbol,
+                                          joined_tgt ? joined_tgt->text : tgt_label);
     uint32_t bridge_color = (scale_color(src_color, 0.5f) & 0xFFFFFF00)
                           | (scale_color(tgt_color, 0.5f) & 0xFFFFFF00) | 0xFF;
 
@@ -3900,7 +3936,10 @@ std::vector<std::string> editor_types =
     "Lattice",
     "TypeGen",
     "ArcTask",
-    "VarRegistry"
+    "VarRegistry",
+    "NeuralAbduction",
+    "Dataset",
+    "Solve"
 };
 
 // VNCData lives in capabilities/vnc_sources.h now; the pool implementation
@@ -8291,6 +8330,11 @@ static void append_lexicon_record(const std::string& word, const std::string& le
 
 void sync_representation_grounding(WordAnnotationSelector& selector, const std::string& template_str)
 {
+    // TEMP: the template is the ground truth for what binds to what. A
+    // relationship reads {{to, R:<src>:<tgt>}}, and it joins its neighbours only
+    // when those two symbols equal the binding symbols of the tokens either
+    // side of it. Remove once the binding question is settled.
+
     // This function destroys UI and immediately reads back the structure it
     // rebuilds -- content rows are walked to fill the selection map. Under
     // command deferral (key callbacks run inside world->progress()), those
@@ -8401,9 +8445,11 @@ void sync_representation_grounding(WordAnnotationSelector& selector, const std::
             const SentenceToken* joined_tgt = tgt_joined ? &tokens[rel_idx + 1] : nullptr;
 
             flecs::entity content = flecs::entity::null();
+            const std::string src_label = template_symbol_label(tokens, rel.source_symbol);
+            const std::string tgt_label = template_symbol_label(tokens, rel.target_symbol);
             flecs::entity block = create_triple_block(insert_parent, rel, &content,
                                                       src_joined ? &token : nullptr,
-                                                      joined_tgt);
+                                                      joined_tgt, src_label, tgt_label);
 
             std::vector<flecs::entity> parts;
             if (content.is_valid()) {
@@ -8413,8 +8459,8 @@ void sync_representation_grounding(WordAnnotationSelector& selector, const std::
             flecs::entity tgt_slot = parts.size() > 2 ? parts[2] : block;
 
             if (insert_parent != container) {
-                if (!rel.source_symbol.empty()) member_colors.push_back(get_entity_color(rel.source_symbol, ""));
-                if (!rel.target_symbol.empty()) member_colors.push_back(get_entity_color(rel.target_symbol, ""));
+                if (!rel.source_symbol.empty()) member_colors.push_back(get_entity_color(rel.source_symbol, src_label));
+                if (!rel.target_symbol.empty()) member_colors.push_back(get_entity_color(rel.target_symbol, tgt_label));
             }
 
             if (src_joined) symbol_anchors[rel.source_symbol] = src_slot;
@@ -9397,6 +9443,30 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                 }
                 if (start_tok < 0) return;
                 if (end_tok < start_tok) end_tok = start_tok;
+
+                // A frame may not cut a join in half. A joined badge and the
+                // relationship it sits inside are one thing on screen and one
+                // selection stop, so a boundary between them would both unsnap
+                // the badge -- leaving it outside, wired back in by an arc --
+                // and ask the context about a relationship missing an end:
+                // "Slate to Sun" would run as "to Sun". The span grows to the
+                // whole triple instead.
+                bool grew = true;
+                while (grew) {
+                    grew = false;
+                    if (start_tok > 0
+                        && (relationship_src_joined(tokens, start_tok)
+                            || relationship_tgt_joined(tokens, start_tok - 1))) {
+                        start_tok--;
+                        grew = true;
+                    }
+                    if (end_tok + 1 < (int)tokens.size()
+                        && (relationship_tgt_joined(tokens, end_tok)
+                            || relationship_src_joined(tokens, end_tok + 1))) {
+                        end_tok++;
+                        grew = true;
+                    }
+                }
 
                 // No nesting or overlap in v1: a marker anywhere in the span
                 // means this comprehension would cross another's boundary.
@@ -10660,6 +10730,12 @@ int main(int, char *[]) {
     flecs::entity arc_solver_client = world->entity("ArcSolverClient")
         .set<ZMQClient>({ "ipc:///tmp/arc_solver_req", zmq::socket_type::req });
 
+    // The solver's progress stream. Its own socket rather than the request
+    // client's: a search runs for tens of seconds and reports as it goes, and a
+    // REQ socket held open that long could answer nothing else in the meantime.
+    flecs::entity arc_solver_stream = world->entity("ArcSolverStream")
+        .set<ZMQClient>({ "ipc:///tmp/arc_solver_pub", zmq::socket_type::sub });
+
     // Initialize spatial index manager
     spatial::SpatialIndexManager spatial_manager(world);
 
@@ -11498,6 +11574,9 @@ int main(int, char *[]) {
     world->import<panels::TypeGen>();
     world->import<panels::ArcTask>();
     world->import<panels::VarRegistry>();
+    world->import<panels::NeuralAbduction>();
+    world->import<panels::Dataset>();
+    world->import<panels::Solve>();
 
     // Turns ChatScroll into the list's bottom inset, clamped so the transcript
     // can never be dragged past either end. PreFrame, so the offset it writes
@@ -11529,6 +11608,39 @@ int main(int, char *[]) {
         const float slack = std::max(1.0f, content->height - track->height);
         const float t = std::clamp(scroll->offset / slack, 0.0f, 1.0f);
         pos.y = (track->height - bar.height) * (1.0f - t);
+    });
+
+    // A virtualized list's scrollbar. The content it reports is the whole set,
+    // most of which has no entities -- item_count * row_pitch IS the extent, and
+    // the visible height is the viewport the list was given, inset by its pad.
+    // Measuring the container instead would report only the realized window and
+    // draw a thumb that filled the track no matter how long the list was.
+    world->system<RoundedRectRenderable, Position>("VirtualListScrollbarSystem")
+    .term_at(1).second<Local>()
+    .with<VirtualListScrollbarOf>(flecs::Wildcard)
+    .kind(flecs::PreFrame)
+    .each([](flecs::entity slider, RoundedRectRenderable& bar, Position& pos)
+    {
+        flecs::entity list_entity = slider.target<VirtualListScrollbarOf>();
+        const VirtualList* list = list_entity.is_valid()
+            ? list_entity.try_get<VirtualList>() : nullptr;
+        const UIElementSize* track = slider.parent().try_get<UIElementSize>();
+        if (!list || !track || track->height <= 0.0f) return;
+
+        const UIElementSize* viewport = list->viewport.is_valid()
+            ? list->viewport.try_get<UIElementSize>() : nullptr;
+        if (!viewport) return;
+
+        const float view = std::max(0.0f, viewport->height - list->pad * 2.0f);
+        const float content = (float)list->item_count * list->row_pitch;
+        if (content <= view || view <= 0.0f) { bar.height = 0.0f; return; }
+
+        const float ratio = view / content;
+        bar.height = std::max(24.0f, track->height * ratio);
+
+        const float slack = std::max(1.0f, content - view);
+        const float t = std::clamp(list->scroll / slack, 0.0f, 1.0f);
+        pos.y = (track->height - bar.height) * t;
     });
 
     // Same as ChatScrollbarSystem, read the other way up: offset counts down

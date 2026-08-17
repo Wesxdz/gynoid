@@ -1,0 +1,29 @@
+// How the representations group when you are choosing among them, ported from
+// Heatshield's items panel. Read at runtime by the NeuralAbduction panel's
+// category view -- edit and reopen the panel, no rebuild.
+//
+// Order is the reading order of the boxes. An item named here that has no icon
+// in assets/items simply draws its name; an item in representation_vector.txt
+// that appears in no category is collected into "UNFILED" so nothing a model
+// can predict becomes unreachable to annotate.
+[
+  { "name": "SYMBOLIC REGRESSION", "items": ["varpad"] },
+  { "name": "ABSTRACTION TOOLS",   "items": ["polyomino_pickaxe", "symmetry_shovel", "vector_hammer", "partition_axe", "letters_book", "query_pickaxe"] },
+
+  { "name": "STANDARD OPERATORS",  "items": ["paint_operator", "move_operator", "copy_operator", "flip_operator", "rotate_operator", "scale_operator"] },
+  { "name": "MATRIX OPERATORS",    "items": ["query_select", "create_state", "expand"] },
+
+  { "name": "SPATIAL GRAPHS",      "items": ["measuring_rod", "visual_hierarchy", "occlusion_grain", "slope_horn"] },
+  { "name": "STATE SPACE SEARCH",  "items": ["intermediate_states"] },
+  { "name": "PBE TRAINING",        "items": ["elementary_pairs", "match_color", "episodic_color_behavior", "static_memory_crystal"] },
+  { "name": "TASK TAGS",           "items": ["bkg", "noise", "pathfinder"] },
+  { "name": "CONTROL FLOW",        "items": ["propagation", "boolean_branch", "world_progress"] },
+
+  { "name": "DECOMPOSITION",       "items": ["sequence", "subgraph_index", "mask", "range"] },
+  { "name": "GENERALIZATION",      "items": ["color_bottle", "isomorphic_hash", "congruency"] },
+  { "name": "FUNCTIONAL GROUPS",   "items": ["merge", "sort_group", "graphpad", "outline"] },
+  { "name": "MAPPING",             "items": ["list_to_list", "list_to_matrix", "diagonal_proj"] },
+  { "name": "SHAPE PROPERTIES",    "items": ["shape_index", "negative_space"] },
+
+  { "name": "CARDINALITY MODEL",   "items": ["one_to_one", "one_to_many", "many_to_one", "multiple_entity"] }
+]

@@ -602,7 +602,9 @@ void create_content(flecs::entity leaf, flecs::entity UIElement)
         .child_of(shell)
         .add<UIYoga>()
         .add<ScissorContainer>(shell)
-        .set<TextRenderable>({"", "CharisSIL", 16.0f, 0xFFFFFFFF})
+        // Text entry is JetBrainsMono, the same face as the Interlocutor's
+        // input box -- typing surfaces share one register, badges another.
+        .set<TextRenderable>({"", "JetBrainsMono", 16.0f, 0xFFFFFFFF})
         .set<ZIndex>({14});
 
         EntityQuery entry;

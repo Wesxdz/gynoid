@@ -1,0 +1,371 @@
+{
+  "intermediate_states": {
+    "title": "Intermediate States",
+    "description": "Use sequential states to arrive at the solution.",
+    "inputs": [],
+    "outputs": []
+  },
+  "varpad": {
+    "title": "Variable Pad",
+    "description": "Find an equation to determine an unknown variable from a set of possible variables",
+    "inputs": [
+      "variables: [[(name, int)]]",
+      "target_values: [int]"
+    ],
+    "outputs": [
+      "equation: str"
+    ]
+  },
+  "mask": {
+    "title": "Mask",
+    "description": "From matrix layers: determine pixel transform rules",
+    "inputs": [
+      "input_stack: [matrix]",
+      "output: matrix"
+    ],
+    "outputs": [
+      "ruleset: [str]"
+    ]
+  },
+  "outline": {
+    "title": "Outline",
+    "description": "Function to get pixels around or within a selection",
+    "inputs": [
+      "input_stack: [matrix]",
+      "output: matrix"
+    ],
+    "outputs": [
+      "ruleset: [[pixel]->pixel]"
+    ]
+  },
+  "paint_operator": {
+    "title": "Paint Operator",
+    "description": "Change color of selected pixels",
+    "inputs": [
+      "state: matrix",
+      "coords: [vec2]",
+      "color: Color"
+    ],
+    "outputs": [
+      "state: matrix"
+    ]
+  },
+  "move_operator": {
+    "title": "Move Operator",
+    "description": "Move selected pixels, replacing with background",
+    "inputs": [
+      "state: matrix",
+      "coords: [vec2]",
+      "x: int",
+      "y: int",
+      "bkg: Color"
+    ],
+    "outputs": [
+      "state: matrix"
+    ]
+  },
+  "copy_operator": {
+    "title": "Copy Operator",
+    "description": "Copy selected pixels",
+    "inputs": [
+      "state: matrix",
+      "coords: [vec2]",
+      "x: int",
+      "y: int"
+    ],
+    "outputs": [
+      "state: matrix"
+    ]
+  },
+  "flip_operator": {
+    "title": "Flip Operator",
+    "description": "",
+    "inputs": [
+      "state: matrix",
+      "coords: [vec2]",
+      "axis: Axis",
+      "anchor: int"
+    ],
+    "outputs": [
+      "state: matrix"
+    ]
+  },
+  "rotate_operator": {
+    "title": "Rotate Operator",
+    "description": "",
+    "inputs": [
+      "state: matrix",
+      "coords: [vec2]",
+      "z_group: int",
+      "anchor: vec2"
+    ],
+    "outputs": [
+      "state: matrix"
+    ]
+  },
+  "scale_operator": {
+    "title": "Scale Operator",
+    "description": "",
+    "inputs": [
+      "state: matrix",
+      "coords: [vec2]",
+      "scale_x: int",
+      "scale_y: int"
+    ],
+    "outputs": [
+      "substate: matrix"
+    ]
+  },
+  "polyomino_pickaxe": {
+    "title": "Polyomino Pickaxe",
+    "description": "Mines same-value-adjacent polyominoes from matrix (or monochrome query mask)",
+    "inputs": [
+      "state: matrix",
+      "diagonal: bool"
+    ],
+    "outputs": [
+      "polyominoes: [(sparse_matrix, x, y)]"
+    ]
+  },
+  "query_pickaxe": {
+    "title": "Query Pickaxe",
+    "description": "Mines adjacent polys from query sparse matrix mask.",
+    "inputs": [
+      "mask: matrix",
+      "diagonal: bool"
+    ],
+    "outputs": [
+      "polys: [(sparse_matrix, x, y)]"
+    ]
+  },
+  "symmetry_shovel": {
+    "title": "Symmetry Shovel",
+    "description": "Identifies regions and axes of symmetry",
+    "inputs": [
+      "state: matrix"
+    ],
+    "outputs": [
+      "polyominoes: [[vec2]]"
+    ]
+  },
+  "vector_hammer": {
+    "title": "Vector Hammer",
+    "description": "Iterates through rows and columns as entities",
+    "inputs": [
+      "state: matrix"
+    ],
+    "outputs": [
+      "[lines]"
+    ]
+  },
+  "partition_axe": {
+    "title": "Partition Axe",
+    "description": "Separates a matrix into discrete cell regions",
+    "inputs": [
+      "state: matrix"
+    ],
+    "outputs": [
+      "cells: matrix"
+    ]
+  },
+  "letters_book": {
+    "title": "Book of Letters",
+    "description": "Strides a matrix with a fixed window shape, identifying unique submatrices and io patterns",
+    "inputs": [
+      "state: matrix",
+      "width: int",
+      "height: int"
+    ],
+    "outputs": [
+      "letters: [matrix]"
+    ]
+  },
+  "query_select": {
+    "title": "Submatrix Crop",
+    "description": "Creates a new state from the bounds of a selection",
+    "inputs": [
+      "state: matrix",
+      "coords: [vec2]"
+    ],
+    "outputs": [
+      "state: matrix"
+    ]
+  },
+  "create_state": {
+    "title": "Create State",
+    "description": "Creates an empty state of a particular size",
+    "inputs": [
+      "width: int, height: int"
+    ],
+    "outputs": [
+      "state: matrix"
+    ]
+  },
+  "expand": {
+    "title": "Fold State",
+    "description": "Expands or reduces an existing state in a particular direction",
+    "inputs": [
+      "state: matrix",
+      "direction: Direction",
+      "distance: int"
+    ],
+    "outputs": [
+      "state: matrix"
+    ]
+  },
+  "measuring_rod": {
+    "title": "Measuring Rod",
+    "description": "Measure prepositions between polyominoes",
+    "inputs": [
+      "[polyomino]"
+    ],
+    "outputs": [
+      "state: matrix"
+    ]
+  },
+  "visual_hierarchy": {
+    "title": "Visual Hierarchy",
+    "description": "Create a graph of visual hierarchy relationships",
+    "inputs": [
+      "polyominoes [poly]"
+    ],
+    "outputs": [
+      "state: matrix"
+    ]
+  },
+  "occlusion_grain": {
+    "title": "Occlusion Layers",
+    "description": "There is a z-index where some polyominoes might occlude others.",
+    "inputs": [
+      "polyominoes: [poly]"
+    ],
+    "outputs": []
+  },
+  "slope_horn": {
+    "title": "Edge Slope Detector",
+    "description": "Detects edges and their rise/run slopes in lines and rectilinear lattice polygons. Sparse matrix should be a single shape.",
+    "inputs": [
+      "state: sparse_matrix",
+      "coords: [vec2]"
+    ],
+    "outputs": [
+      "edges: [slope]"
+    ]
+  },
+  "sequence": {
+    "title": "Sequence Detector",
+    "description": "Identifies a repeating sequence.",
+    "inputs": [
+      "state: sparse_matrix",
+      "coords: [vec2]"
+    ],
+    "outputs": [
+      "edges: [slope]"
+    ]
+  },
+  "subgraph_index": {
+    "title": "Submatrix Detector",
+    "description": "Finds a matrix as a probabalistic or repeated submatrix of another matrix.",
+    "inputs": [
+      "source: matrix",
+      "target: matrix"
+    ],
+    "outputs": [
+      "submatrix: [vec2]"
+    ]
+  },
+  "bkg": {
+    "title": "Background",
+    "description": "This task has Background and Foreground layers",
+    "inputs": [],
+    "outputs": []
+  },
+  "noise": {
+    "title": "Noise",
+    "description": "This task has noise obscuring a pattern or object",
+    "inputs": [],
+    "outputs": []
+  },
+  "pathfinder": {
+    "title": "Pathfinding",
+    "description": "This task has Obstacles and a Pathfinder agent",
+    "inputs": [],
+    "outputs": []
+  },
+  "color_bottle": {
+    "title": "Wildcard Color",
+    "description": "Select a set of colors using EcsWildcard with exclusion",
+    "inputs": [
+      "exclude_colors: [Color]"
+    ],
+    "outputs": [
+      "terms: [str]"
+    ]
+  },
+  "isomorphic_hash": {
+    "title": "Behavior Set",
+    "description": "There are multiple unknown colors with distinct behaviors.",
+    "inputs": [
+      ""
+    ],
+    "outputs": [
+      "terms: [str]"
+    ]
+  },
+  "congruency": {
+    "title": "Congruency",
+    "description": "Above move down is to left-of move right, etc",
+    "inputs": [],
+    "outputs": []
+  },
+  "shape_index": {
+    "title": "Shape Index",
+    "description": "Use shape index in query",
+    "inputs": [],
+    "outputs": []
+  },
+  "negative_space": {
+    "title": "Negative Space",
+    "description": "Use Hole or Bound in query",
+    "inputs": [],
+    "outputs": []
+  },
+  "propagation": {
+    "title": "Propagation",
+    "description": "A letter should iteratively spread",
+    "inputs": [],
+    "outputs": []
+  },
+  "boolean_branch": {
+    "title": "Boolean Branch",
+    "description": "Branch hypothesis on if/else",
+    "inputs": [],
+    "outputs": []
+  },
+  "world_progress": {
+    "title": "World Progress",
+    "description": "There are multiple iterative programs that should progress in a loop together",
+    "inputs": [],
+    "outputs": []
+  },
+  "merge": {
+    "title": "Merge",
+    "description": "Treat an entire query as a single sparse matrix entity",
+    "inputs": [
+      "query_output: [pixel]"
+    ],
+    "outputs": [
+      "merged: sparse_matrix"
+    ]
+  },
+  "graphpad": {
+    "title": "Graphpad",
+    "description": "Compose nearest neighbor polyominoes together",
+    "inputs": [
+      "polyominoes: [polyomino]"
+    ],
+    "outputs": [
+      "composites: [sparse_matrix]"
+    ]
+  }
+}

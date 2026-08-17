@@ -1,0 +1,20 @@
+// Which sprite stands for which operator in the search's readouts.
+//
+// Presentation, so it lives here rather than in the solver: jane_eyre names its
+// operators, Thornfield decides what they look like. Names beyond the four the
+// registry holds today are listed so a new operator picks up its icon the moment
+// it exists; an operator with no entry falls back to its name in text, which is
+// how you notice it needs one.
+{
+  "paint":         "paint_operator",
+  "rotate":        "rotate_operator",
+  "scale_up":      "scale_operator",
+  "crop":          "query_select",
+
+  "move":          "move_operator",
+  "copy":          "copy_operator",
+  "flip":          "flip_operator",
+  "scale":         "scale_operator",
+  "create_matrix": "create_state",
+  "expand":        "expand"
+}
