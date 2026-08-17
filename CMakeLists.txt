@@ -12,7 +12,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # add_definitions(AOTInductor_CUDA)
-add_executable(${PROJECT_NAME} src/main.cpp src/mel_spec_render.cpp src/glad.c src/vision_processor.cpp src/x11_outline.cpp src/dino_embedder.cpp src/thorn_vfx.cpp src/tradewinds.cpp src/stl_mesh.cpp src/panel3d.cpp src/screen3d.cpp src/panels/registry.cpp src/panels/holodeck_panel.cpp src/panels/droid_panel.cpp src/panels/peach_core_panel.cpp src/panels/lattice_panel.cpp src/panels/typegen_panel.cpp src/server_registry.cpp src/capabilities/function_library.cpp src/capabilities/speech.cpp src/capabilities/audio_player.cpp src/capabilities/spectrogram.cpp src/capabilities/spec_strip.cpp)
+add_executable(${PROJECT_NAME} src/main.cpp src/mel_spec_render.cpp src/glad.c src/vision_processor.cpp src/x11_outline.cpp src/dino_embedder.cpp src/thorn_vfx.cpp src/tradewinds.cpp src/stl_mesh.cpp src/panel3d.cpp src/screen3d.cpp src/panels/registry.cpp src/panels/holodeck_panel.cpp src/panels/droid_panel.cpp src/panels/peach_core_panel.cpp src/panels/lattice_panel.cpp src/panels/typegen_panel.cpp src/panels/arc_task_panel.cpp src/server_registry.cpp src/capabilities/function_library.cpp src/capabilities/query_contexts.cpp src/capabilities/speech.cpp src/capabilities/audio_player.cpp src/capabilities/spectrogram.cpp src/capabilities/spec_strip.cpp)
 # deps/tracy-0.13.1/public/TracyClient.cpp
 
 target_include_directories(${PROJECT_NAME} PRIVATE "deps/cppzmq")
@@ -191,3 +191,32 @@ if(LibVNCServer_FOUND)
 endif()
 
 set_property(TARGET ${PROJECT_NAME} PROPERTY CXX_STANDARD 20)
+
+# Precompiled headers. Panel TUs are ~95% header parsing (flecs/json/msgpack),
+# so this takes an incremental panel rebuild from ~4.3s to ~1s. Deliberately
+# excluded: nanovg_gl.h (NANOVG_GL2_IMPLEMENTATION is PUBLIC on the nanovg
+# target, so precompiling it would emit the GL backend into every TU) and
+# glad/GLFW (order-sensitive with that define, and cheap to parse anyway).
+# glad.c is C and can't consume a C++ PCH.
+set_source_files_properties(src/glad.c PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
+target_precompile_headers(${PROJECT_NAME} PRIVATE
+    <vector>
+    <string>
+    <unordered_map>
+    <map>
+    <algorithm>
+    <memory>
+    <functional>
+    <sstream>
+    <fstream>
+    <chrono>
+    <filesystem>
+    <thread>
+    <flecs.h>
+    <nanovg.h>
+    <raymath.h>
+    <yoga/Yoga.h>
+    <nlohmann/json.hpp>
+    <msgpack.hpp>
+    <tracy/Tracy.hpp>
+)

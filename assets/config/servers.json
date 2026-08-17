@@ -91,13 +91,48 @@
     {
       "id": "chatterbox",
       "label": "Chatterbox TTS",
-      "icon": "chatterbox",
+      "icon": "chatterbox_delphi",
       "description": "Speech synthesis. Announces READY once the CUDA model is loaded.",
       "script": "../servers/chatter_zmq_server.py",
       "env": "chatterbox",
       "launch": "direct",
       "socket": "ipc:///tmp/thornfield_chatter_socket",
       "autostart": false
+    },
+
+    // OCR: docTR reading text (with pixel boxes) out of screenshots and VNC
+    // frames. Lives in droid_slam, the env that has doctr installed. Same
+    // readiness pattern as chatterbox; off by default for the same GPU reason.
+    {
+      "id": "doctr",
+      "label": "docTR OCR",
+      "icon": "doctr_reader",
+      "description": "Text recognition. Announces READY once the predictor is loaded.",
+      "script": "../servers/doctr_zmq_server.py",
+      "env": "droid_slam",
+      "launch": "direct",
+      "socket": "ipc:///tmp/thornfield_doctr_socket",
+      "autostart": false
+    },
+
+    // Jane Eyre ARC solver: nlp_query cell selections and the tag schema for
+    // the ArcTask panel. cwd matters twice -- solver_server.py resolves
+    // ./ARC-AGI/data/training/<id>.json against it and imports gp/query_lang
+    // from its own directory. Off by default: importing gp pulls the whole
+    // synthesis stack.
+    {
+      "id": "arc_solver",
+      "label": "ARC Solver",
+      "icon": "graphics_programmer",
+      "description": "Jane Eyre bridge. Answers ArcTask cell queries; announces READY once gp is imported.",
+      "script": "solver_server.py",
+      "cwd": "/home/wesxdz/arc/editor/jane_eyre",
+      "socket": "ipc:///tmp/arc_solver_req",
+      "match": "solver_server.py",
+      // On by default: without it there is no declared vocabulary, so typing
+      // "Grass" in an ArcTask context cannot be recognised and the word stays
+      // plain text. The ARC work needs it up more than boot needs the second.
+      "autostart": true
     }
 
     // Other servers elsewhere on the system go here. parakeet is the remaining

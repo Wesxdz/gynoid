@@ -35,5 +35,15 @@ struct MelSpecConfig {
 // Initialize mel_spec rendering module
 void MelSpecRenderModule(flecs::world& world);
 
+// Whether the audio capture children (microphone and system audio) are
+// running. They are NOT started by initialization: opening the microphone
+// changes the machine's audio profile -- speaker quality drops for everything
+// else on the system -- so Thornfield must not hold the mic merely because it
+// booted. The capture follows the panels that display it; see
+// AudioCaptureGateSystem in main.cpp. Calls that don't change the state are
+// free, so a per-frame gate can call this unconditionally.
+void MelSpecSetCaptureEnabled(bool enabled);
+bool MelSpecCaptureEnabled();
+
 // Cleanup function
 void CleanupMelSpec();

@@ -79,6 +79,7 @@ using json = nlohmann::json;
 #include "panel3d.h"
 #include "server_registry.h"
 #include "capabilities/function_library.h"
+#include "capabilities/query_contexts.h"
 #include "capabilities/speech.h"
 #include "capabilities/spec_strip.h"
 #include "capabilities/audio_player.h"
@@ -92,6 +93,7 @@ using json = nlohmann::json;
 #include "panels/peach_core_panel.h"
 #include "panels/lattice_panel.h"
 #include "panels/typegen_panel.h"
+#include "panels/arc_task_panel.h"
 
 #include "tradewinds.h"
 
@@ -166,6 +168,18 @@ TextSize measureText(NVGcontext* vg,
     }
 
     return { w, h };
+}
+
+// Advance width, not ink extent. measureText reports bounds[2]-bounds[0], which
+// is where the glyphs actually mark -- trailing spaces contribute nothing to it,
+// so a caret measured that way stops moving the moment you type a space and
+// snaps back once you type past it. nvgTextBounds' RETURN value is the advance,
+// which is where the next glyph would land: the caret's whole question.
+static float text_advance(NVGcontext* vg, const std::string& text)
+{
+    if (!vg || text.empty()) return 0.0f;
+    float bounds[4];
+    return nvgTextBounds(vg, 0, 0, text.c_str(), text.c_str() + text.size(), bounds);
 }
 
 static const char* VNC_SURFACE_TAG = "vnc_surface";
@@ -469,6 +483,15 @@ struct ChatPanel {
     flecs::entity input_panel;
     flecs::entity input_text;
     flecs::entity message_list;
+    // The row under the transcript where the conversation's provenance is worn:
+    // the context badge showing what is being spoken about.
+    flecs::entity meta_input;
+    // Overlay caret bar, created lazily by the input-sync system. An overlay
+    // rather than a '|' in the string, so the caret never displaces text.
+    flecs::entity caret;
+    // Selection highlight rects, one per hard line of selected text, pooled
+    // and recycled by the same system.
+    std::vector<flecs::entity> sel_rects;
 };
 
 // Async interpretation of chat messages
@@ -1170,6 +1193,188 @@ std::string annotator_selected_triple()
         }
     });
     return triple;
+}
+
+// Everything `scoped` is within, most specific first: its own contexts, then
+// what those sit inside, and so on. Contexts compose, so the effective scope of
+// a conversation is a closure rather than a single entity -- and a context in the
+// middle of a chain may be pure containment, carrying no evaluator of its own.
+//
+// Breadth-first so specificity survives as order, cycle-safe because a context
+// graph is authored by hand, and depth-capped for the same reason.
+static std::vector<flecs::entity> context_chain(flecs::entity scoped)
+{
+    std::vector<flecs::entity> chain;
+    if (!scoped.is_valid() || !scoped.is_alive()) return chain;
+
+    std::set<uint64_t> seen;
+    std::vector<flecs::entity> frontier;
+
+    auto push_targets = [&](flecs::entity from) {
+        for (int i = 0;; i++) {
+            flecs::entity target = from.target<Context>(i);
+            if (!target.is_valid()) break;
+            if (!seen.insert(target.id()).second) continue;
+            frontier.push_back(target);
+        }
+    };
+
+    push_targets(scoped);
+    for (int depth = 0; depth < 16 && !frontier.empty(); depth++) {
+        std::vector<flecs::entity> next;
+        for (flecs::entity context : frontier) {
+            chain.push_back(context);
+            for (int i = 0;; i++) {
+                flecs::entity parent = context.target<Context>(i);
+                if (!parent.is_valid()) break;
+                if (!seen.insert(parent.id()).second) continue;
+                next.push_back(parent);
+            }
+        }
+        frontier = std::move(next);
+    }
+    return chain;
+}
+
+// The comprehension under the cursor, with everything the annotation knows
+// about it: each member's role and binding, plus the frame's own two ids. Built
+// here rather than in the registry because this is where the tokens live, and
+// handed over as one struct so publishing more of the annotation later does not
+// change any context's signature.
+//
+// Returns false when the cursor is not in a frame. Frames do not nest in v1, so
+// one linear pass finds the enclosing pair; the cursor counts as inside when it
+// is on the frame's own stop, which is exactly where Q leaves it.
+static bool selected_comprehension_detail(query_contexts::Comprehension* out)
+{
+    if (!world || !out) return false;
+
+    bool found = false;
+    static flecs::query<WordAnnotationSelector> selectors =
+        world->query<WordAnnotationSelector>();
+    selectors.each([&](flecs::entity, WordAnnotationSelector& selector) {
+        if (found || !selector.active || selector.sentence_template.empty()) return;
+        auto tokens = parse_sentence_template(selector.sentence_template);
+
+        int cursor_token = -1;
+        int expanded_pos = 0;
+        for (size_t ti = 0; ti < tokens.size(); ti++) {
+            const int width = token_selection_width(tokens, ti);
+            if (selector.start_index >= expanded_pos
+                && selector.start_index < expanded_pos + width) {
+                cursor_token = (int)ti;
+                break;
+            }
+            expanded_pos += width;
+        }
+        if (cursor_token < 0) return;
+
+        int frame_start = -1, frame_end = -1, open = -1;
+        for (size_t ti = 0; ti < tokens.size(); ti++) {
+            if (tokens[ti].type == TokenType::Concept) {
+                open = (int)ti;
+            } else if (tokens[ti].type == TokenType::ConceptEnd && open >= 0) {
+                if (cursor_token >= open && cursor_token <= (int)ti) {
+                    frame_start = open;
+                    frame_end = (int)ti;
+                    break;
+                }
+                open = -1;
+            }
+        }
+        if (frame_start < 0) return;
+
+        out->terms.clear();
+        out->intension_symbol = tokens[frame_start].binding_symbol;
+        out->extension_symbol = tokens[frame_start].reified_symbol;
+        out->source_text.clear();
+
+        for (int i = frame_start + 1; i < frame_end; i++) {
+            const SentenceToken& token = tokens[i];
+            if (token.text.empty()) continue;
+
+            if (!out->source_text.empty()) out->source_text += " ";
+            out->source_text += token.text;
+
+            if (token.type == TokenType::Relationship) {
+                // A relationship contributes all three of its slots, each
+                // labelled, so a context that can express directed relations
+                // has what it needs and a flat one can still read the words.
+                const std::string src = template_symbol_label(tokens, token.source_symbol);
+                const std::string tgt = template_symbol_label(tokens, token.target_symbol);
+                if (!src.empty())
+                    out->terms.push_back({src, token.source_symbol,
+                                          query_contexts::Term::Role::Source});
+                out->terms.push_back({token.text, token.binding_symbol,
+                                      query_contexts::Term::Role::Relation});
+                if (!tgt.empty())
+                    out->terms.push_back({tgt, token.target_symbol,
+                                          query_contexts::Term::Role::Target});
+                continue;
+            }
+
+            out->terms.push_back({token.text, token.binding_symbol,
+                                  query_contexts::Term::Role::Member});
+        }
+
+        found = true;
+    });
+    return found;
+}
+
+// The comprehension the cursor sits in, as its member words. Frames do not
+// nest in v1, so one linear pass finds the enclosing pair; the cursor counts as
+// inside when it is on the frame's own stop, which is exactly where the Q
+// gesture leaves it.
+std::string annotator_selected_comprehension()
+{
+    std::string members;
+    if (!world) return members;
+
+    static flecs::query<WordAnnotationSelector> selectors =
+        world->query<WordAnnotationSelector>();
+    selectors.each([&](flecs::entity, WordAnnotationSelector& selector) {
+        if (!members.empty() || !selector.active || selector.sentence_template.empty()) return;
+        auto tokens = parse_sentence_template(selector.sentence_template);
+
+        // Which token the cursor is on.
+        int cursor_token = -1;
+        int expanded_pos = 0;
+        for (size_t ti = 0; ti < tokens.size(); ti++) {
+            const int width = token_selection_width(tokens, ti);
+            if (selector.start_index >= expanded_pos
+                && selector.start_index < expanded_pos + width) {
+                cursor_token = (int)ti;
+                break;
+            }
+            expanded_pos += width;
+        }
+        if (cursor_token < 0) return;
+
+        // The frame containing it.
+        int frame_start = -1, frame_end = -1;
+        int open = -1;
+        for (size_t ti = 0; ti < tokens.size(); ti++) {
+            if (tokens[ti].type == TokenType::Concept) {
+                open = (int)ti;
+            } else if (tokens[ti].type == TokenType::ConceptEnd && open >= 0) {
+                if (cursor_token >= open && cursor_token <= (int)ti) {
+                    frame_start = open;
+                    frame_end = (int)ti;
+                    break;
+                }
+                open = -1;
+            }
+        }
+        if (frame_start < 0) return;
+
+        for (int i = frame_start + 1; i < frame_end; i++) {
+            if (tokens[i].text.empty()) continue;
+            if (!members.empty()) members += "\t";
+            members += tokens[i].text;
+        }
+    });
+    return members;
 }
 
 // The role the annotation cursor itself is on -- the selection's counterpart
@@ -2327,6 +2532,250 @@ static std::string ellipsize_text(const std::string& text, const char* font_face
     return text.substr(0, lo) + suffix;
 }
 
+// --- Transcript text selection ----------------------------------------------
+//
+// Discord-style: any SelectableText (message bubbles, prose) can be swept
+// with the mouse and copied with Ctrl+C. One selection exists at a time,
+// scoped to a single text element; its highlight rects are children of the
+// text entity so they scroll and clip with it. Hit-testing replicates the
+// renderer's wrapping via nvgTextBreakLines, so soft-wrapped rows resolve
+// exactly -- no hard-newline approximation here.
+
+// A selection endpoint is (element, byte index); the range flows through
+// every selectable between its two elements in reading order.
+struct TranscriptSelection {
+    flecs::entity a_el, c_el;   // anchor and caret elements
+    int a_idx = 0, c_idx = 0;
+    std::vector<flecs::entity> rects;
+    std::string sig;            // what the rects were built for
+};
+static TranscriptSelection g_text_sel;
+
+// Whether the pointer is over selectable text this frame. The selection
+// system only computes the wish; the editor's region-cursor system is the
+// single writer of glfwSetCursor, or two per-frame writers flicker-fight.
+static bool g_want_ibeam = false;
+static GLFWcursor* ibeam_cursor()
+{
+    static GLFWcursor* c = nullptr;
+    if (!c) c = glfwCreateStandardCursor(GLFW_IBEAM_CURSOR);
+    return c;
+}
+
+static void text_sel_clear()
+{
+    for (flecs::entity r : g_text_sel.rects)
+        if (r.is_alive()) r.destruct();
+    g_text_sel.rects.clear();
+    g_text_sel.a_el = g_text_sel.c_el = flecs::entity::null();
+    g_text_sel.a_idx = g_text_sel.c_idx = 0;
+    g_text_sel.sig.clear();
+}
+
+// Byte index of the character nearest a point in the text's local space.
+static int text_hit_index(const TextRenderable& tr, float lx, float ly)
+{
+    if (!g_yoga_vg || tr.text.empty()) return 0;
+    nvgFontSize(g_yoga_vg, tr.fontSize);
+    nvgFontFace(g_yoga_vg, tr.fontFace.c_str());
+    float asc, desc, lineh;
+    nvgTextMetrics(g_yoga_vg, &asc, &desc, &lineh);
+
+    const char* base = tr.text.c_str();
+    const char* end = base + tr.text.size();
+    const float wrap = tr.wrapWidth > 0.0f ? tr.wrapWidth : 1e6f;
+    int want = (int)(ly / lineh);
+    if (want < 0) want = 0;
+
+    NVGtextRow rows[16];
+    const char* p = base;
+    int row_index = 0;
+    while (int n = nvgTextBreakLines(g_yoga_vg, p, end, wrap, rows, 16)) {
+        for (int i = 0; i < n; i++) {
+            const bool last = rows[i].next >= end;
+            if (row_index == want || (last && row_index < want)) {
+                static NVGglyphPosition pos[512];
+                const int count = nvgTextGlyphPositions(
+                    g_yoga_vg, 0, 0, rows[i].start, rows[i].end, pos, 512);
+                for (int k = 0; k < count; k++) {
+                    if (lx < (pos[k].minx + pos[k].maxx) * 0.5f)
+                        return (int)(pos[k].str - base);
+                }
+                return (int)(rows[i].end - base);
+            }
+            row_index++;
+        }
+        p = rows[n - 1].next;
+        if (p >= end) break;
+    }
+    return (int)tr.text.size();
+}
+
+// The selected byte range as local-space rects, one per wrapped row touched.
+struct TextSpan { float x, y, w, h; };
+// tail_nub: the selection continues beyond this element, so its final row
+// gets a small nub past the last glyph -- the visual cue browsers give that
+// the newline itself is selected and the highlight flows on.
+static std::vector<TextSpan> text_selection_spans(const TextRenderable& tr,
+                                                  int lo, int hi,
+                                                  bool tail_nub = false)
+{
+    std::vector<TextSpan> out;
+    if (!g_yoga_vg || tr.text.empty() || lo >= hi) return out;
+    nvgFontSize(g_yoga_vg, tr.fontSize);
+    nvgFontFace(g_yoga_vg, tr.fontFace.c_str());
+    float asc, desc, lineh;
+    nvgTextMetrics(g_yoga_vg, &asc, &desc, &lineh);
+
+    const char* base = tr.text.c_str();
+    const char* end = base + tr.text.size();
+    const float wrap = tr.wrapWidth > 0.0f ? tr.wrapWidth : 1e6f;
+
+    NVGtextRow rows[16];
+    const char* p = base;
+    int row_index = 0;
+    while (int n = nvgTextBreakLines(g_yoga_vg, p, end, wrap, rows, 16)) {
+        for (int i = 0; i < n; i++, row_index++) {
+            const int rs = (int)(rows[i].start - base);
+            const int re = (int)(rows[i].end - base);
+            const int s = lo > rs ? lo : rs;
+            const int e = hi < re ? hi : re;
+            if (s >= e) continue;
+
+            static NVGglyphPosition pos[512];
+            const int count = nvgTextGlyphPositions(
+                g_yoga_vg, 0, 0, rows[i].start, rows[i].end, pos, 512);
+            auto x_of = [&](int idx, float fallback) {
+                for (int k = 0; k < count; k++)
+                    if ((int)(pos[k].str - base) == idx) return pos[k].minx;
+                return fallback;
+            };
+            const float x0 = s == rs ? 0.0f : x_of(s, 0.0f);
+            float x1 = e == re ? rows[i].width : x_of(e, rows[i].width);
+            if (e == re && (hi > re || tail_nub)) x1 += 6.0f;
+            out.push_back({x0, row_index * lineh, x1 - x0, lineh});
+        }
+        p = rows[n - 1].next;
+        if (p >= end) break;
+    }
+    return out;
+}
+
+// Where the caret sits for a byte index, in the text's local space --
+// wrap-aware via the same row machinery as hit-testing.
+static bool text_caret_pos(const TextRenderable& tr, int idx, float* out_x, float* out_y)
+{
+    *out_x = 0.0f;
+    *out_y = 0.0f;
+    if (!g_yoga_vg) return false;
+    if (tr.text.empty()) return true;
+    nvgFontSize(g_yoga_vg, tr.fontSize);
+    nvgFontFace(g_yoga_vg, tr.fontFace.c_str());
+    float asc, desc, lineh;
+    nvgTextMetrics(g_yoga_vg, &asc, &desc, &lineh);
+
+    const char* base = tr.text.c_str();
+    const char* end = base + tr.text.size();
+    const float wrap = tr.wrapWidth > 0.0f ? tr.wrapWidth : 1e6f;
+
+    NVGtextRow rows[16];
+    const char* p = base;
+    int row_index = 0;
+    while (int n = nvgTextBreakLines(g_yoga_vg, p, end, wrap, rows, 16)) {
+        for (int i = 0; i < n; i++, row_index++) {
+            const int rs = (int)(rows[i].start - base);
+            const int re = (int)(rows[i].end - base);
+            const bool last = rows[i].next >= end;
+            if (idx <= re || last) {
+                *out_y = row_index * lineh;
+                if (idx <= rs) return true;
+                if (idx >= re) { *out_x = rows[i].width; return true; }
+                static NVGglyphPosition pos[512];
+                const int count = nvgTextGlyphPositions(
+                    g_yoga_vg, 0, 0, rows[i].start, rows[i].end, pos, 512);
+                for (int k = 0; k < count; k++)
+                    if ((int)(pos[k].str - base) == idx) { *out_x = pos[k].minx; return true; }
+                *out_x = rows[i].width;
+                return true;
+            }
+        }
+        p = rows[n - 1].next;
+        if (p >= end) break;
+    }
+    return true;
+}
+
+// The reading-order flow a selection can run through: every selectable whose
+// x-range overlaps the anchor's -- the same column of layout, i.e. the same
+// transcript -- ordered top to bottom. Column overlap is what keeps a drag in
+// the chat from leaking into an unrelated panel beside it.
+static std::vector<flecs::entity> selection_flow(flecs::entity anchor_el)
+{
+    std::vector<flecs::entity> out;
+    const UIElementBounds* ab = anchor_el.try_get<UIElementBounds>();
+    if (!ab) return out;
+
+    static flecs::query<const SelectableText, const UIElementBounds> texts =
+        world->query<const SelectableText, const UIElementBounds>();
+    std::vector<std::pair<float, flecs::entity>> found;
+    texts.each([&](flecs::entity e, const SelectableText&, const UIElementBounds& b) {
+        if (b.xmax <= ab->xmin || b.xmin >= ab->xmax) return;
+        found.push_back({b.ymin, e});
+    });
+    std::sort(found.begin(), found.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+    out.reserve(found.size());
+    for (const auto& [y, e] : found) out.push_back(e);
+    return out;
+}
+
+// Normalize the selection against a flow: element positions and indices of
+// the earlier and later endpoint. False when either endpoint is not in the
+// flow (stale entities, cleared state).
+static bool selection_normalized(const std::vector<flecs::entity>& flow,
+                                 size_t* lo_i, int* lo_idx,
+                                 size_t* hi_i, int* hi_idx)
+{
+    size_t ai = flow.size(), ci = flow.size();
+    for (size_t i = 0; i < flow.size(); i++) {
+        if (flow[i] == g_text_sel.a_el) ai = i;
+        if (flow[i] == g_text_sel.c_el) ci = i;
+    }
+    if (ai == flow.size() || ci == flow.size()) return false;
+
+    const bool forward = ai < ci || (ai == ci && g_text_sel.a_idx <= g_text_sel.c_idx);
+    *lo_i  = forward ? ai : ci;
+    *lo_idx = forward ? g_text_sel.a_idx : g_text_sel.c_idx;
+    *hi_i  = forward ? ci : ai;
+    *hi_idx = forward ? g_text_sel.c_idx : g_text_sel.a_idx;
+    return true;
+}
+
+// The selected content across the whole flow, message boundaries as newlines.
+static std::string selection_text()
+{
+    if (!g_text_sel.a_el.is_valid() || !g_text_sel.a_el.is_alive()
+        || !g_text_sel.c_el.is_valid() || !g_text_sel.c_el.is_alive()) return {};
+    auto flow = selection_flow(g_text_sel.a_el);
+    size_t lo_i, hi_i;
+    int lo_idx, hi_idx;
+    if (!selection_normalized(flow, &lo_i, &lo_idx, &hi_i, &hi_idx)) return {};
+
+    std::string out;
+    for (size_t i = lo_i; i <= hi_i; i++) {
+        const TextRenderable* tr = flow[i].try_get<TextRenderable>();
+        if (!tr) continue;
+        const int len = (int)tr->text.size();
+        int s = i == lo_i ? lo_idx : 0;
+        int e = i == hi_i ? hi_idx : len;
+        if (s < 0) s = 0;
+        if (e > len) e = len;
+        if (s < e) out += tr->text.substr((size_t)s, (size_t)(e - s));
+        if (i < hi_i) out += "\n";
+    }
+    return out;
+}
+
 // Calibrated badge height. A badge that nests another grows by NEST_PAD on the
 // top and bottom, so the inner block reads as contained rather than as exactly
 // filling its parent.
@@ -3400,7 +3849,8 @@ std::vector<std::string> editor_types =
     "Transducer",
     "Holodeck",
     "Lattice",
-    "TypeGen"
+    "TypeGen",
+    "ArcTask"
 };
 
 // VNCData lives in capabilities/vnc_sources.h now; the pool implementation
@@ -3857,6 +4307,33 @@ static constexpr float BADGE_LONGFORM_WIDTH = 300.0f;
 // one inverts that: width is fixed, the text wraps inside it, and the height
 // follows from however many lines that takes. Used for entities whose identity
 // *is* prose -- a chat message has no short name to show instead.
+// Prose wears the Interlocutor's message dress wherever it appears: rounded
+// dark bubble, JetBrainsMono, padded. The same string is the same object in
+// every panel, so it keeps the same clothes.
+flecs::entity create_prose_bubble(flecs::entity parent, flecs::entity UIElement,
+                                  const std::string& text)
+{
+    auto bubble = world->entity()
+        .is_a(UIElement)
+        .child_of(parent)
+        .add(flecs::OrderedChildren)
+        .add<UIYoga>()
+        .set<UIFlexItem>({0.0f, 1.0f, YGAlignAuto})
+        .set<UIFlexContainer>({YGFlexDirectionColumn, YGWrapNoWrap,
+                               YGJustifyFlexStart, YGAlignFlexStart, 0.0f})
+        .set<UIPadding>({6.0f, 8.0f, 6.0f, 8.0f})
+        .set<RoundedRectRenderable>({100.0f, 16.0f, 2.0f, false, 0x121212FF})
+        .set<ZIndex>({15});
+    world->entity()
+        .is_a(UIElement)
+        .child_of(bubble)
+        .add<UIYoga>()
+        .add<SelectableText>()
+        .set<TextRenderable>({text, "JetBrainsMono", 16.0f, 0xFFFFFFFF})
+        .set<ZIndex>({17});
+    return bubble;
+}
+
 flecs::entity create_longform_badge(flecs::entity parent, flecs::entity UIElement,
                                     const std::string& text, uint32_t color)
 {
@@ -4351,7 +4828,7 @@ void update_entity_inspector(flecs::entity leaf, EntitySelection& selection)
         bool is_prose = entity_is_prose(set, selection.selected)
                         || name.size() > ENTITY_SPRITE_NAME_LIMIT;
         if (is_prose) {
-            create_longform_badge(selection.inspector, UIElement, name, color)
+            create_prose_bubble(selection.inspector, UIElement, name)
                 .add<ScissorContainer>(selection.inspector);
         }
 
@@ -4412,6 +4889,18 @@ void update_entity_inspector(flecs::entity leaf, EntitySelection& selection)
             std::vector<std::pair<std::string, std::string>> members;
             for (size_t i = 1; i + 1 < fields.size(); i += 2) {
                 members.emplace_back(fields[i], fields[i + 1]);
+            }
+
+            // A Text component's value IS prose -- it renders as the message
+            // it is, not as a component block quoting it.
+            if (fields[0] == "Text") {
+                std::string value;
+                for (const auto& m : members) if (m.first == "value") value = m.second;
+                if (!value.empty()) {
+                    create_prose_bubble(selection.inspector, UIElement, value)
+                        .add<ScissorContainer>(selection.inspector);
+                    continue;
+                }
             }
 
             create_component_badge(selection.inspector, UIElement, fields[0], members)
@@ -4634,6 +5123,11 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
             .set<RoundedRectRenderable>({100.0f, 100.0f, 4.0f, false, 0x050505FF})
             .set<ZIndex>({11});
 
+        // Where a context badge lands. Dropping one here says that what is said
+        // in this conversation is said In that context -- the transcript is the
+        // conversation, so the transcript is the thing you drop onto.
+        messages_panel.set<ContextDropTarget>({leaf, 0x050505FF});
+
         // Messages stack upward from the bottom of the history panel.
         // AlignStretch (not FlexStart) is what keeps each message row bound to
         // the panel width -- a FlexStart column gives children no definite
@@ -4719,13 +5213,8 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
             .set<TextRenderable>({"", "JetBrainsMono", 16.0f, 0xFFFFFFFF})
             .set<ZIndex>({12});
 
-        create_badge(meta_input, UIElement, "Wesley", 0x6df0ffff, true, false, {}, {0}, {"W"}, {0x6df0ffff});
-        create_badge(meta_input, UIElement, "advises", 0xa34d1aff, false, true);
-        create_badge(meta_input, UIElement, "Heonae", 0xff75baff, true, false, {}, {0}, {"H"}, {0xff75baff});
-
-
-
-        leaf.set<ChatPanel>({messages_panel, input_panel, input_text, message_list});
+        leaf.set<ChatPanel>({messages_panel, input_panel, input_text, message_list,
+                             meta_input});
     }
     else if (editor_type == EditorType::Entities)
     {
@@ -4912,14 +5401,32 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
                 row.set<RoundedRectRenderable>({0.0f, 0.0f, 4.0f, false, 0x2A2A2AFF});
             }
 
-            // A message is not named by its first letter, so the symbol sprite
-            // is dropped for prose -- it would be labelling content as if it
-            // were an identifier.
-            std::vector<std::string> postfix_ids;
-            std::vector<uint32_t> postfix_tints;
-            if (!prose) {
-                postfix_ids.push_back(name.substr(0, 1));
-                postfix_tints.push_back(color);
+            // Prose renders exactly as it does in the chat: the message
+            // bubble dress -- rounded dark rect, JetBrainsMono -- not a
+            // badge. It IS quoted speech, and the same content should wear
+            // the same clothes in every panel.
+            if (prose) {
+                std::string row_label = ellipsize_text(name, "JetBrainsMono", 16.0f,
+                                                       BADGE_MAX_TEXT_WIDTH);
+                auto bubble = world->entity()
+                    .is_a(UIElement)
+                    .child_of(row)
+                    .add(flecs::OrderedChildren)
+                    .add<UIYoga>()
+                    .set<UIFlexContainer>({YGFlexDirectionRow, YGWrapNoWrap,
+                                           YGJustifyFlexStart, YGAlignCenter, 0.0f})
+                    .set<UIPadding>({3.0f, 8.0f, 3.0f, 8.0f})
+                    .set<RoundedRectRenderable>({100.0f, 16.0f, 2.0f, false, 0x121212FF})
+                    .set<EntityBadge>({name, index, leaf})
+                    .set<CallbackOnLeftClick>({clicked_entity_badge})
+                    .set<ZIndex>({16});
+                world->entity()
+                    .is_a(UIElement)
+                    .child_of(bubble)
+                    .add<UIYoga>()
+                    .set<TextRenderable>({row_label, "JetBrainsMono", 16.0f, 0xFFFFFFFF})
+                    .set<ZIndex>({17});
+                return;
             }
 
             // The only place truncation is right: the list's index<->y
@@ -4930,8 +5437,9 @@ void create_editor_content(flecs::entity leaf, EditorType editor_type, flecs::en
                                                    BADGE_MAX_TEXT_WIDTH);
 
             create_badge_impl(row, UIElement, row_label.c_str(), color,
-                              false, false, {}, {}, postfix_ids, postfix_tints, nullptr,
-                              prose ? BadgeStyle::String : BadgeStyle::Symbol)
+                              false, false, {}, {},
+                              {name.substr(0, 1)}, {color}, nullptr,
+                              BadgeStyle::Symbol)
                 .set<EntityBadge>({name, index, leaf})
                 .set<CallbackOnLeftClick>({clicked_entity_badge});
         };
@@ -6071,6 +6579,31 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
                 if (world->ensure<UIInputDispatch>().consumed) break;
             }
 
+            // A click that lands on nothing which wants the keyboard releases
+            // it: clicking away from the Interlocutor's box, or a query bar, is
+            // as much a way out as Escape. Decided from the hit list rather
+            // than inside the focus observers, because those fire during
+            // dispatch above -- clearing there would undo the focus a click on
+            // the box had just taken.
+            {
+                bool focus_click = false;
+                for (const ClickTarget& target : targets) {
+                    if (!target.entity.is_alive()) continue;
+                    if (target.entity.has<AddTagOnLeftClick, FocusChatInput>()
+                        || target.entity.has<AddTagOnLeftClick, FocusEntityQuery>()
+                        || target.entity.has<AddTagOnLeftClick, SendChatMessage>()) {
+                        focus_click = true;
+                        break;
+                    }
+                }
+                if (!focus_click) {
+                    if (ChatState* chat = world->try_get_mut<ChatState>())
+                        chat->input_focused = false;
+                    world->query<EntityQuery>().each(
+                        [](flecs::entity, EntityQuery& query) { query.focused = false; });
+                }
+            }
+
             world->event<LeftClickEvent>()
             .id<CursorState>()
             .entity(glfw_state)
@@ -6145,6 +6678,95 @@ static flecs::entity focused_entity_query()
     return focused;
 }
 
+// The word around byte index `at` (alnum runs plus the joiners words carry).
+// A click on whitespace or punctuation snaps to the NEAREST word rather than
+// selecting the gap; false only when there is no word anywhere near.
+static bool word_bounds_at(const std::string& text, int at, int* out_s, int* out_e)
+{
+    auto wordy = [](char c) {
+        return std::isalnum((unsigned char)c) || c == '_' || c == '\'';
+    };
+    const int len = (int)text.size();
+    if (len == 0) return false;
+    if (at >= len) at = len - 1;
+    if (at < 0) at = 0;
+
+    if (!wordy(text[(size_t)at])) {
+        int l = at, r = at;
+        while (l > 0 && !wordy(text[(size_t)l])) l--;
+        while (r < len - 1 && !wordy(text[(size_t)r])) r++;
+        const bool lw = wordy(text[(size_t)l]);
+        const bool rw = wordy(text[(size_t)r]);
+        if (lw && rw) at = (at - l) <= (r - at) ? l : r;
+        else if (lw)  at = l;
+        else if (rw)  at = r;
+        else return false;
+    }
+
+    int s = at, e = at;
+    while (s > 0 && wordy(text[(size_t)(s - 1)])) s--;
+    while (e < len && wordy(text[(size_t)e])) e++;
+    *out_s = s;
+    *out_e = e;
+    return true;
+}
+
+// Deletes the selected range if one exists, leaving the caret at its start.
+// Returns whether anything was deleted. Stale anchors self-degrade to none.
+static bool chat_erase_selection(ChatState& chat)
+{
+    const int len = (int)chat.draft.size();
+    int cur = chat.cursor;
+    if (cur < 0) cur = 0;
+    if (cur > len) cur = len;
+    const int anc = chat.sel_anchor;
+    if (anc < 0 || anc > len || anc == cur) { chat.sel_anchor = -1; return false; }
+    const int lo = anc < cur ? anc : cur;
+    const int hi = anc < cur ? cur : anc;
+    chat.draft.erase((size_t)lo, (size_t)(hi - lo));
+    chat.cursor = lo;
+    chat.sel_anchor = -1;
+    return true;
+}
+
+// The draft index nearest to a point given in text-local coordinates: hard
+// newlines pick the line, then a prefix-width walk picks the column. Soft
+// wrapping is not modelled -- same approximation as the caret's own placement.
+static int chat_draft_index_at(const std::string& draft, float x, float y)
+{
+    std::vector<std::string> lines;
+    size_t start = 0;
+    while (true) {
+        const size_t nl = draft.find('\n', start);
+        if (nl == std::string::npos) { lines.push_back(draft.substr(start)); break; }
+        lines.push_back(draft.substr(start, nl - start));
+        start = nl + 1;
+    }
+
+    int line = (int)(y / 18.0f);
+    if (line < 0) line = 0;
+    if (line >= (int)lines.size()) line = (int)lines.size() - 1;
+
+    int base = 0;
+    for (int i = 0; i < line; i++) base += (int)lines[(size_t)i].size() + 1;
+
+    const std::string& seg = lines[(size_t)line];
+    if (!g_yoga_vg || seg.empty() || x <= 0.0f) return base;
+    nvgFontSize(g_yoga_vg, 16.0f);
+    nvgFontFace(g_yoga_vg, "JetBrainsMono");
+
+    // Advances, so a click lands on the character the caret would sit before --
+    // ink extents ignore spaces and put every index after a space off by a
+    // space's width.
+    float prev = 0.0f;
+    for (size_t i = 1; i <= seg.size(); i++) {
+        const float w = text_advance(g_yoga_vg, seg.substr(0, i));
+        if (x < (prev + w) * 0.5f) return base + (int)i - 1;
+        prev = w;
+    }
+    return base + (int)seg.size();
+}
+
 static void char_callback(GLFWwindow* window, unsigned int codepoint)
 {
     // WASD held during a Holodeck walk must not type into whatever text field
@@ -6190,7 +6812,12 @@ static void char_callback(GLFWwindow* window, unsigned int codepoint)
     ChatState* chat = world->try_get_mut<ChatState>();
     if (chat && chat->input_focused)
     {
-        chat->draft.push_back(static_cast<char>(codepoint));
+        chat_erase_selection(*chat);   // typing replaces a selection
+        int cur = chat->cursor;
+        if (cur < 0) cur = 0;
+        if (cur > (int)chat->draft.size()) cur = (int)chat->draft.size();
+        chat->draft.insert((size_t)cur, 1, static_cast<char>(codepoint));
+        chat->cursor = cur + 1;
     }
 }
 
@@ -6453,8 +7080,16 @@ flecs::entity create_message(flecs::entity& UIElement, ChatPanel& chat_panel, fl
     .add(flecs::OrderedChildren)
     .add<UIYoga>()
     .set<UIFlexContainer>({
+        // Everything left-aligned, Discord-style: a transcript is one column
+        // of voices, not a tennis match. Who spoke is carried by the message
+        // itself, not by which wall it hugs.
         YGFlexDirectionRow, YGWrapNoWrap,
-        is_self ? YGJustifyFlexEnd : YGJustifyFlexStart, YGAlignCenter, 4.0f});
+        YGJustifyFlexStart, YGAlignCenter, 4.0f})
+    // Full-width hover surface under the bubble (z15): invisible until the
+    // ChatHoverSystem lights it.
+    .add<ChatHoverRow>()
+    .set<RoundedRectRenderable>({0.0f, 0.0f, 4.0f, false, 0xFFFFFF00})
+    .set<ZIndex>({12});
 
     // The background bubble is the text's flex container, so it auto-sizes to
     // the message plus padding. flexShrink lets it give way at the panel edge,
@@ -6478,6 +7113,7 @@ flecs::entity create_message(flecs::entity& UIElement, ChatPanel& chat_panel, fl
         .is_a(UIElement)
         .child_of(example_message_bkg)
         .add<UIYoga>()
+        .add<SelectableText>()
         .set<TextRenderable>({message, "JetBrainsMono", 16.0f, 0xFFFFFFFF})
         .set<ZIndex>({17});
 
@@ -6521,6 +7157,489 @@ void interlocutor_response(std::map<std::string, msgpack::object>& res_map)
 // noise. Context rides along because the template alone is unlearnable: "I"
 // binding to Wesley needs the speaker, "her" binding to 0 needs the discourse
 // entity table, and both need the sentences that came before.
+// --- Chat history persistence ----------------------------------------------
+//
+// Conversations survive Thornfield restarts, LLM-client style: each chat is
+// its own file under runtime/chats/ (author, raw text, latest annotation
+// template per line, rewritten wholesale on change -- files are
+// conversation-sized), runtime/chats/current names the active one, and a
+// one-shot system replays it into the first Interlocutor panel to appear.
+// The chats/newchat/openchat functions switch between them from the input
+// box. Annotated sentences restore lazily: the template rides into
+// g_annotatable_messages and the message switcher rebuilds badges on
+// navigation. Repopulating the *world* is deliberately not done here -- that
+// belongs to the verb log, so the two mechanisms never double-create.
+
+static const char* kChatsDir = "../runtime/chats";
+static std::string g_chat_name;
+static bool g_chat_reloading = false;
+
+// Discord-style IN-PLACE edit: the message's own bubble becomes the editor.
+// g_editing_message is the index being rewritten (-1 when composing normally);
+// g_edit_target is the bubble's text element, mirrored live from the draft
+// with its own caret. Enter applies, Escape restores.
+static int g_editing_message = -1;
+static flecs::entity g_edit_target;
+static flecs::entity g_edit_caret;
+
+static void add_message_actions(flecs::entity host, int index);
+
+// First selectable text beneath `host` -- the message bubble's own words.
+static flecs::entity find_selectable_text(flecs::entity host)
+{
+    flecs::entity found;
+    host.children([&](flecs::entity c) {
+        if (found.is_valid()) return;
+        if (c.has<SelectableText>() && c.has<TextRenderable>()) { found = c; return; }
+        found = find_selectable_text(c);
+    });
+    return found;
+}
+
+static void end_inplace_edit()
+{
+    if (g_edit_caret.is_valid() && g_edit_caret.is_alive()) g_edit_caret.destruct();
+    g_edit_caret = flecs::entity::null();
+    if (g_edit_target.is_valid() && g_edit_target.is_alive()) {
+        // Restore the bubble's resting dress.
+        flecs::entity bkg = g_edit_target.parent();
+        if (bkg.is_valid()) {
+            if (auto* rr = bkg.try_get_mut<RoundedRectRenderable>())
+                rr->color = 0x121212FF;
+        }
+    }
+    g_edit_target = flecs::entity::null();
+    g_editing_message = -1;
+}
+
+static std::string chat_file_path()
+{
+    return std::string(kChatsDir) + "/" + g_chat_name + ".tsv";
+}
+
+static std::string fresh_chat_name()
+{
+    char buf[32];
+    std::time_t now = std::time(nullptr);
+    std::strftime(buf, sizeof(buf), "chat_%Y%m%d_%H%M%S", std::localtime(&now));
+    return buf;
+}
+
+static std::string tsv_escape(const std::string& in)
+{
+    std::string out;
+    out.reserve(in.size());
+    for (char c : in) {
+        switch (c) {
+            case '\\': out += "\\\\"; break;
+            case '\t': out += "\\t"; break;
+            case '\n': out += "\\n"; break;
+            default:   out += c;
+        }
+    }
+    return out;
+}
+
+static std::string tsv_unescape(const std::string& in)
+{
+    std::string out;
+    out.reserve(in.size());
+    for (size_t i = 0; i < in.size(); i++) {
+        if (in[i] == '\\' && i + 1 < in.size()) {
+            const char n = in[++i];
+            out += n == 't' ? '\t' : n == 'n' ? '\n' : n;
+        } else {
+            out += in[i];
+        }
+    }
+    return out;
+}
+
+// Recognition: a draft rewritten as an annotation template, with every word some
+// context in scope declares a term for already bound.
+//
+// This is what makes typing "Sun" inside an ArcTask spawn a bound badge in the
+// ARC yellow rather than a plain word: the term exists as an entity because the
+// solver declared it, the context puts it in scope, and the binding is written
+// before the sentence is ever rendered. Outside any context nothing is
+// recognised and the draft is returned untouched -- the same words in a
+// conversation about something else are just words.
+//
+// Symbols are the sentence's own digits, one per distinct term, so two mentions
+// of Sun are two badges wearing one identity. The colour the term declared is
+// seeded against that digit, because that is where the annotator's renderer
+// looks for it.
+static std::string recognize_draft(flecs::entity chat_leaf, const std::string& draft)
+{
+    if (draft.empty()) return draft;
+
+    const std::vector<flecs::entity> chain = context_chain(chat_leaf);
+    if (chain.empty()) {
+        // Says which precondition is missing rather than quietly doing nothing:
+        // recognition needs a context on the conversation AND a vocabulary
+        // declared by it, and failing either looks identical on screen.
+        std::cout << "[recognize] no context on this conversation -- drag a "
+                     "panel's badge onto the transcript" << std::endl;
+        return draft;
+    }
+
+    // Terms in scope, longest text first so a multi-word term would win over a
+    // shorter one once such terms exist.
+    struct Recognized { std::string lower; const VocabTerm* term; };
+    std::vector<Recognized> in_scope;
+    static flecs::query<VocabTerm> terms = world->query<VocabTerm>();
+    terms.each([&](flecs::entity term_entity, VocabTerm& term) {
+        for (flecs::entity context : chain) {
+            if (!term_entity.has<Context>(context)) continue;
+            std::string lower = term.text;
+            for (char& c : lower) c = (char)std::tolower((unsigned char)c);
+            in_scope.push_back({lower, &term});
+            break;
+        }
+    });
+    if (in_scope.empty()) {
+        std::cout << "[recognize] " << chain.size()
+                  << " context(s) in scope, but none has declared a vocabulary -- "
+                     "start ARC Solver in Peach Core" << std::endl;
+        return draft;
+    }
+
+    std::string out;
+    std::map<std::string, std::string> symbol_for;   // term text -> digit
+    int next_digit = 0;
+    size_t at = 0;
+
+    while (at <= draft.size()) {
+        const size_t space = draft.find(' ', at);
+        const std::string word = draft.substr(
+            at, space == std::string::npos ? std::string::npos : space - at);
+
+        // Compared without the punctuation that would be carried along, but the
+        // word is written back exactly as it was typed: the surface is never
+        // rewritten, only annotated.
+        std::string bare;
+        for (char c : word)
+            if (c != ',' && c != '.' && c != '?' && c != '!' && c != ';' && c != ':')
+                bare += (char)std::tolower((unsigned char)c);
+
+        const VocabTerm* matched = nullptr;
+        for (const Recognized& candidate : in_scope)
+            if (candidate.lower == bare) { matched = candidate.term; break; }
+
+        if (matched && !word.empty()) {
+            std::string& symbol = symbol_for[matched->text];
+            if (symbol.empty() && next_digit <= 9) {
+                symbol = std::to_string(next_digit++);
+                // The declarer's colour, put where the badge renderer reads it.
+                // Only when the term has an opinion: a term with none keeps
+                // whatever colour the editor would have given any new entity.
+                if (matched->color != 0)
+                    entity_color_cache[symbol] = matched->color;
+            }
+            if (!symbol.empty()) out += "{{" + word + ", " + symbol + "}}";
+            else out += word;
+        } else {
+            out += word;
+        }
+
+        if (space == std::string::npos) break;
+        out += " ";
+        at = space + 1;
+    }
+
+    std::cout << "[recognize] " << in_scope.size() << " terms in scope, bound "
+              << symbol_for.size() << std::endl;
+    return out;
+}
+
+void save_chat_history()
+{
+    if (g_chat_reloading || !world) return;
+    const ChatState* chat = world->try_get<ChatState>();
+    if (!chat) return;
+    if (g_chat_name.empty()) g_chat_name = fresh_chat_name();
+
+    std::error_code ec;
+    std::filesystem::create_directories(kChatsDir, ec);
+    std::ofstream out(chat_file_path(), std::ios::trunc);
+    for (const ChatMessage& msg : chat->messages) {
+        std::string tmpl;
+        if (msg.annotatable >= 0 && msg.annotatable < (int)g_annotatable_messages.size())
+            tmpl = g_annotatable_messages[(size_t)msg.annotatable].sentence_template;
+        out << tsv_escape(msg.author) << '\t' << tsv_escape(msg.text) << '\t'
+            << tsv_escape(tmpl) << '\n';
+    }
+    std::ofstream(std::string(kChatsDir) + "/current", std::ios::trunc) << g_chat_name;
+}
+
+void sync_representation_grounding(WordAnnotationSelector& selector,
+                                   const std::string& template_str);
+
+// One saved line back into the panel: the bubble, and -- when the message was
+// annotatable -- the same stack/row scaffolding the send path builds, rendered
+// through the shared sentence renderer so the badges are visible immediately.
+static void reload_chat_message(const std::string& author, const std::string& text,
+                                const std::string& tmpl)
+{
+    ChatState& chat = world->ensure<ChatState>();
+    chat.messages.push_back({author, text});
+
+    flecs::entity UIElement = world->lookup("UIElement");
+    world->query<ChatPanel>().each([&](flecs::entity, ChatPanel& panel) {
+        // Query iteration defers structural changes, and OrderedChildren only
+        // tracks insertion order for children added while it is actually ON
+        // the parent -- anything built deferred lands in archetype order at
+        // the merge. The suspension must cover the WHOLE message: bubble and
+        // annotation stack alike, or the two populations of message_list
+        // children sort apart instead of interleaving. Same suspension the
+        // send path does.
+        const bool was_deferred = world->is_deferred() && !world->is_readonly();
+        if (was_deferred) world->defer_suspend();
+
+        // Replies keep their side: "You" spoke as Wesley; anything else sits
+        // left, under its own author entity.
+        flecs::entity speaker = author == "You" ? world->lookup("Wesley")
+                                                : world->entity(author.c_str());
+        flecs::entity bubble = create_message(UIElement, panel, speaker, text);
+        if (tmpl.empty()) {
+            add_message_actions(bubble, (int)chat.messages.size() - 1);
+            if (was_deferred) world->defer_resume();
+            return;
+        }
+
+        // Same one-surface grouping the send path builds.
+        auto message_group = world->entity()
+            .is_a(UIElement)
+            .add(flecs::OrderedChildren)
+            .add<UIYoga>()
+            .set<UIFlexContainer>({YGFlexDirectionColumn, YGWrapNoWrap,
+                                   YGJustifyFlexStart, YGAlignStretch, 4.0f})
+            .add<ChatHoverRow>()
+            .set<RoundedRectRenderable>({0.0f, 0.0f, 4.0f, false, 0xFFFFFF00})
+            .set<ZIndex>({12})
+            .child_of(panel.message_list);
+
+        bubble.child_of(message_group);
+        bubble.remove<ChatHoverRow>();
+
+        auto message_stack = world->entity()
+            .is_a(UIElement)
+            .add(flecs::OrderedChildren)
+            .add<UIYoga>()
+            .set<UIFlexContainer>({YGFlexDirectionColumn, YGWrapNoWrap,
+                                   YGJustifyFlexStart, YGAlignStretch, 4.0f})
+            .child_of(message_group);
+
+        auto representation_ux = world->entity()
+            .is_a(UIElement)
+            .add(flecs::OrderedChildren)
+            .add<UIYoga>()
+            .set<UIFlexContainer>({YGFlexDirectionRow, YGWrapWrap,
+                                   YGJustifyFlexStart, YGAlignCenter, 2.0f})
+            .set<UIMargin>({POS_TIER_HEIGHT, 0.0f, 0.0f, 0.0f})
+            .child_of(message_stack);
+
+        g_annotatable_messages.push_back({tmpl, representation_ux});
+        chat.messages.back().annotatable = (int)g_annotatable_messages.size() - 1;
+        g_current_message_idx = (int)g_annotatable_messages.size() - 1;
+
+        // Render the annotated sentence now rather than lazily: a restored
+        // transcript should look exactly as it was left. A throwaway selector
+        // drives the shared renderer, and what it builds is stored on the
+        // message the way the Tab switcher expects to find it.
+        WordAnnotationSelector render{};
+        render.sentence_template = tmpl;
+        render.parent_entity = representation_ux;
+        render.highlight_color = 0x4488FFAA;
+        sync_representation_grounding(render, tmpl);
+
+        StoredMessage& stored = g_annotatable_messages.back();
+        stored.ui_entities = render.ui_entities;
+        stored.selection_entities = render.selection_entities;
+        stored.token_count = render.token_count;
+
+        add_message_actions(message_group, (int)chat.messages.size() - 1);
+
+        if (was_deferred) world->defer_resume();
+    });
+}
+
+static void load_chat_file(const std::string& path)
+{
+    std::ifstream in(path);
+    if (!in.is_open()) return;
+
+    g_chat_reloading = true;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty()) continue;
+        const auto t1 = line.find('\t');
+        if (t1 == std::string::npos) continue;
+        const auto t2 = line.find('\t', t1 + 1);
+        if (t2 == std::string::npos) continue;
+        reload_chat_message(tsv_unescape(line.substr(0, t1)),
+                            tsv_unescape(line.substr(t1 + 1, t2 - t1 - 1)),
+                            tsv_unescape(line.substr(t2 + 1)));
+    }
+    g_chat_reloading = false;
+}
+
+// Empties the panel and every piece of per-conversation state, ready for a
+// switch or a fresh chat. The UI children die with the message list; the
+// selector is parked so no system reaches into the entities being destroyed.
+static void clear_chat_transcript()
+{
+    ChatState& chat = world->ensure<ChatState>();
+    chat.messages.clear();
+    chat.draft.clear();
+    g_annotatable_messages.clear();
+    g_current_message_idx = -1;
+
+    world->query<WordAnnotationSelector>().each([](flecs::entity, WordAnnotationSelector& s) {
+        s.active = false;
+        s.sentence_template.clear();
+        s.ui_entities.clear();
+        s.selection_entities.clear();
+        s.parent_entity = flecs::entity::null();
+    });
+    world->query<ChatPanel>().each([](flecs::entity, ChatPanel& panel) {
+        std::vector<flecs::entity> old;
+        panel.message_list.children([&](flecs::entity c) { old.push_back(c); });
+        for (flecs::entity c : old) c.destruct();
+    });
+}
+
+// Startup path: continue whatever conversation was active last session.
+static void reload_chat_history()
+{
+    std::string name;
+    std::ifstream current(std::string(kChatsDir) + "/current");
+    if (current.is_open()) std::getline(current, name);
+    if (name.empty()) {
+        g_chat_name = fresh_chat_name();
+        return;
+    }
+    g_chat_name = name;
+    load_chat_file(chat_file_path());
+}
+
+// Rebuild the whole transcript UI from in-memory state. Edits and deletions
+// go through here: mutate the data, replay it, save once. Transcripts are
+// conversation-sized, so wholesale is simpler than surgery and cannot drift.
+static void rebuild_chat_transcript()
+{
+    ChatState& chat = world->ensure<ChatState>();
+    struct Line { std::string author, text, tmpl; };
+    std::vector<Line> lines;
+    for (const ChatMessage& m : chat.messages) {
+        std::string tmpl;
+        if (m.annotatable >= 0 && m.annotatable < (int)g_annotatable_messages.size())
+            tmpl = g_annotatable_messages[(size_t)m.annotatable].sentence_template;
+        lines.push_back({m.author, m.text, tmpl});
+    }
+
+    clear_chat_transcript();
+    g_chat_reloading = true;
+    for (const Line& l : lines) reload_chat_message(l.author, l.text, l.tmpl);
+    g_chat_reloading = false;
+    save_chat_history();
+}
+
+static void delete_chat_message(int index)
+{
+    ChatState& chat = world->ensure<ChatState>();
+    if (index < 0 || index >= (int)chat.messages.size()) return;
+
+    const int annot = chat.messages[(size_t)index].annotatable;
+    chat.messages.erase(chat.messages.begin() + index);
+    if (annot >= 0 && annot < (int)g_annotatable_messages.size()) {
+        g_annotatable_messages.erase(g_annotatable_messages.begin() + annot);
+        for (ChatMessage& m : chat.messages)
+            if (m.annotatable > annot) m.annotatable--;
+        if (g_current_message_idx == annot) g_current_message_idx = -1;
+        else if (g_current_message_idx > annot) g_current_message_idx--;
+    }
+    if (g_editing_message == index) end_inplace_edit();
+    else if (g_editing_message > index) g_editing_message--;
+
+    rebuild_chat_transcript();
+}
+
+static void begin_edit_chat_message(int index, flecs::entity host)
+{
+    ChatState& chat = world->ensure<ChatState>();
+    if (index < 0 || index >= (int)chat.messages.size()) return;
+    chat.draft = chat.messages[(size_t)index].text;
+    chat.cursor = (int)chat.draft.size();
+    chat.sel_anchor = -1;
+    // Focused for key routing only -- the bubble itself is the visible
+    // editor; the bottom box goes inert while an edit is in flight.
+    chat.input_focused = true;
+    g_editing_message = index;
+    g_edit_target = find_selectable_text(host);
+    world->query<EntityQuery>().each([](flecs::entity, EntityQuery& q) { q.focused = false; });
+}
+
+static void chat_action_clicked(flecs::entity chip)
+{
+    const ChatMessageAction* action = chip.try_get<ChatMessageAction>();
+    if (!action) return;
+
+    // Invisible chips must not act: visible means the host row is hovered,
+    // so re-derive that from the cursor rather than trusting a colour.
+    const CursorState* cursor = world->lookup("GLFWState").try_get<CursorState>();
+    const UIElementBounds* host_bounds =
+        action->host.is_valid() ? action->host.try_get<UIElementBounds>() : nullptr;
+    if (!cursor || !host_bounds
+        || !point_in_bounds((float)cursor->x, (float)cursor->y, *host_bounds)) return;
+
+    if (action->erase) delete_chat_message(action->index);
+    else begin_edit_chat_message(action->index, action->host);
+    consume_ui_click();
+}
+
+// The hover chips: permanently present, zero-alpha until their row is
+// hovered. Top-right of the message, Discord's spot for them.
+static void add_message_actions(flecs::entity host, int index)
+{
+    auto UIElement = world->lookup("UIElement");
+    auto actions = world->entity()
+        .is_a(UIElement)
+        .child_of(host)
+        .add(flecs::OrderedChildren)
+        .add<UIYoga>()
+        .set<UIAbsoluteEdges>({YGUndefined, 2.0f, 6.0f, YGUndefined})
+        .set<UIFlexContainer>({YGFlexDirectionRow, YGWrapNoWrap,
+                               YGJustifyFlexEnd, YGAlignCenter, 4.0f})
+        .set<ZIndex>({30});
+
+    // Pen and trash can, Discord's own verbs. Drawn white and tinted by the
+    // hover system, so hidden and shown are the same texture.
+    auto chip = [&](const char* icon, bool erase) {
+        auto c = world->entity()
+            .is_a(UIElement)
+            .child_of(actions)
+            .add(flecs::OrderedChildren)
+            .add<UIYoga>()
+            .set<UIFlexContainer>({YGFlexDirectionRow, YGWrapNoWrap,
+                                   YGJustifyCenter, YGAlignCenter, 0.0f})
+            .set<UIPadding>({3.0f, 4.0f, 3.0f, 4.0f})
+            .set<RoundedRectRenderable>({0.0f, 0.0f, 4.0f, false, 0x2b2b3100})
+            .set<CallbackOnLeftClick>({chat_action_clicked})
+            .set<ZIndex>({30});
+        auto label = world->entity()
+            .is_a(UIElement)
+            .child_of(c)
+            .add<UIYoga>()
+            .add<UINativeImageSize>()
+            .set<ImageCreator>({icon, 1.0f, 1.0f, nvgRGBA(0, 0, 0, 0)})
+            .set<ZIndex>({31});
+        c.set<ChatMessageAction>({index, erase, host, label});
+    };
+    chip("pen.png", false);
+    chip("trash.png", true);
+}
+
 static void append_annotation_record(const WordAnnotationSelector& selector)
 {
     if (selector.sentence_template.empty()) return;
@@ -6529,6 +7648,17 @@ static void append_annotation_record(const WordAnnotationSelector& selector)
     static std::string last_logged;
     if (selector.sentence_template == last_logged) return;
     last_logged = selector.sentence_template;
+
+    // Keep the stored message's template current, then persist the transcript:
+    // Tab is otherwise the only sync point, and the chat history file reads
+    // templates from the stored messages -- without this an annotation made
+    // and left uncommitted would miss the save.
+    if (g_current_message_idx >= 0
+        && g_current_message_idx < (int)g_annotatable_messages.size()) {
+        g_annotatable_messages[(size_t)g_current_message_idx].sentence_template =
+            selector.sentence_template;
+    }
+    save_chat_history();
 
     auto escape = [](const std::string& in) {
         std::string out;
@@ -6726,12 +7856,21 @@ void expand_text_response(std::map<std::string, msgpack::object>& res_map)
         ? res_map["text"].as<std::string>() : std::string();
     if (expanded.empty()) { g_expand_sent.clear(); return; }
 
-    // Compare-and-set: only rewrite a template that is still exactly the text
-    // we preprocessed. If annotation began in the gap, the user's state wins.
+    // Expansion rewrites the surface, so whatever the context recognised has to
+    // be found again in the new wording -- otherwise the two preprocessors
+    // cancel each other and only the last one to land is visible.
+    flecs::entity chat_leaf;
+    world->query<ChatPanel>().each([&](flecs::entity leaf, ChatPanel&) {
+        if (!chat_leaf.is_valid()) chat_leaf = leaf;
+    });
+    const std::string recognized = recognize_draft(chat_leaf, expanded);
+
+    // Compare-and-set: only rewrite a template that is still exactly the one we
+    // preprocessed. If annotation began in the gap, the user's state wins.
     world->query<WordAnnotationSelector>().each(
         [&](flecs::entity, WordAnnotationSelector& selector) {
             if (selector.sentence_template == g_expand_sent) {
-                selector.sentence_template = expanded;
+                selector.sentence_template = recognized;
                 selector.dirty = true;
             }
         });
@@ -7260,6 +8399,20 @@ static void toggle_fullscreen(GLFWwindow* window)
     fullscreen = !fullscreen;
 }
 
+// Cursor-aware erase: a selection deletes whole, otherwise the character
+// before the caret goes.
+static void chat_draft_backspace(ChatState& chat)
+{
+    if (chat_erase_selection(chat)) return;
+    if (chat.draft.empty()) return;
+    int cur = chat.cursor;
+    if (cur < 0) cur = 0;
+    if (cur > (int)chat.draft.size()) cur = (int)chat.draft.size();
+    if (cur == 0) return;
+    chat.draft.erase((size_t)(cur - 1), 1);
+    chat.cursor = cur - 1;
+}
+
 static void key_callback(GLFWwindow* window, int key, int scancode, int action, int mods)
 {
     // Before anything else, so it works regardless of which text field or panel
@@ -7340,6 +8493,64 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
         return;
     }
 
+    // Held Backspace repeats into whichever text field owns the keyboard.
+    // Everything else below is press-only, but deletion by held key is how
+    // every text box in the world behaves. Characters already repeat -- GLFW
+    // fires the char callback on key repeat -- so this evens the two out.
+    if (action == GLFW_REPEAT && key == GLFW_KEY_BACKSPACE)
+    {
+        if (flecs::entity query_leaf = focused_entity_query())
+        {
+            EntityQuery& query = query_leaf.ensure<EntityQuery>();
+            if (!query.draft.empty()) query.draft.pop_back();
+            return;
+        }
+        ChatState* chat = world->try_get_mut<ChatState>();
+        if (chat && chat->input_focused && !chat->draft.empty())
+        {
+            chat_draft_backspace(*chat);
+            return;
+        }
+    }
+
+    // Caret movement in the chat draft, press and repeat alike. Annotation
+    // arrows are unaffected: annotation mode and input focus are exclusive.
+    if ((action == GLFW_PRESS || action == GLFW_REPEAT)
+        && (key == GLFW_KEY_LEFT || key == GLFW_KEY_RIGHT))
+    {
+        ChatState* chat = world->try_get_mut<ChatState>();
+        if (chat && chat->input_focused)
+        {
+            const int len = (int)chat->draft.size();
+            int cur = chat->cursor;
+            if (cur < 0) cur = 0;
+            if (cur > len) cur = len;
+            const int anc = chat->sel_anchor;
+            const bool has_sel = anc >= 0 && anc <= len && anc != cur;
+
+            if (mods & GLFW_MOD_SHIFT) {
+                // Shift extends: anchor stays put, caret walks.
+                if (!has_sel) chat->sel_anchor = cur;
+                cur += key == GLFW_KEY_LEFT ? -1 : 1;
+                if (cur < 0) cur = 0;
+                if (cur > len) cur = len;
+                chat->cursor = cur;
+                if (chat->sel_anchor == chat->cursor) chat->sel_anchor = -1;
+            } else if (has_sel) {
+                // A bare arrow collapses the selection to its edge.
+                chat->cursor = key == GLFW_KEY_LEFT ? (anc < cur ? anc : cur)
+                                                    : (anc > cur ? anc : cur);
+                chat->sel_anchor = -1;
+            } else {
+                cur += key == GLFW_KEY_LEFT ? -1 : 1;
+                if (cur < 0) cur = 0;
+                if (cur > len) cur = len;
+                chat->cursor = cur;
+            }
+            return;
+        }
+    }
+
     if (action == GLFW_PRESS)
     {
         if (key == GLFW_KEY_S && mods & GLFW_MOD_CONTROL)
@@ -7347,6 +8558,63 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
             flecs::entity editor_root = world->lookup("editor_root");
             if (editor_root.is_valid()) {
                 save_editor_layout(editor_root);
+            }
+            return;
+        }
+
+        if (key == GLFW_KEY_C && (mods & GLFW_MOD_CONTROL))
+        {
+            // Transcript selection outranks the input's own: sweeping the
+            // history is the more deliberate act. selection_text() walks the
+            // whole flow, so a multi-message sweep copies every message it
+            // crossed, newline-joined.
+            std::string copied = selection_text();
+            if (copied.empty()) {
+                ChatState* chat = world->try_get_mut<ChatState>();
+                if (chat && chat->input_focused) {
+                    const int len = (int)chat->draft.size();
+                    int cur = chat->cursor;
+                    if (cur < 0) cur = 0;
+                    if (cur > len) cur = len;
+                    const int anc = chat->sel_anchor;
+                    if (anc >= 0 && anc <= len && anc != cur) {
+                        const int lo = anc < cur ? anc : cur;
+                        const int hi = anc < cur ? cur : anc;
+                        copied = chat->draft.substr((size_t)lo, (size_t)(hi - lo));
+                    }
+                }
+            }
+            if (!copied.empty()) glfwSetClipboardString(window, copied.c_str());
+            return;
+        }
+
+        if (key == GLFW_KEY_A && (mods & GLFW_MOD_CONTROL))
+        {
+            ChatState* chat = world->try_get_mut<ChatState>();
+            if (chat && chat->input_focused && !chat->draft.empty()) {
+                chat->sel_anchor = 0;
+                chat->cursor = (int)chat->draft.size();
+                return;
+            }
+        }
+
+        if (key == GLFW_KEY_V && (mods & GLFW_MOD_CONTROL))
+        {
+            ChatState* chat = world->try_get_mut<ChatState>();
+            if (chat && chat->input_focused) {
+                const char* clip = glfwGetClipboardString(window);
+                if (clip && *clip) {
+                    chat_erase_selection(*chat);
+                    int cur = chat->cursor;
+                    if (cur < 0) cur = 0;
+                    if (cur > (int)chat->draft.size()) cur = (int)chat->draft.size();
+                    // Same filter the char callback applies, newlines kept.
+                    std::string ins;
+                    for (const char* c = clip; *c; ++c)
+                        if ((*c >= 32 && *c < 127) || *c == '\n') ins += *c;
+                    chat->draft.insert((size_t)cur, ins);
+                    chat->cursor = cur + (int)ins.size();
+                }
             }
             return;
         }
@@ -7884,6 +9152,52 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
         // renderings; only a [[Qn ... ]] pair is inserted around them.
         if (key == GLFW_KEY_Q)
         {
+            // Q on a frame that already exists RUNS it. Declaring the query and
+            // evaluating it are two acts -- an intension means something on its
+            // own -- and wrapping a span that is already wrapped was a no-op
+            // anyway (v1 forbids nesting), so the second press is free to be
+            // the execution. The terms go out as they were said; the context
+            // owns what they mean.
+            {
+                query_contexts::Comprehension query;
+                if (selected_comprehension_detail(&query)) {
+                    // Where it runs is not in the query and was never typed: it
+                    // is the scope of the conversation the query was declared in.
+                    // Drop a context badge on a transcript and every
+                    // comprehension after it is asked there.
+                    //
+                    // Asked of EVERY context in scope, most specific first: with
+                    // several in play the same comprehension is a question for
+                    // each of them, and the ones that are pure containment
+                    // (no evaluator) are simply passed over.
+                    std::vector<std::string> evaluators;
+                    world->query<ChatPanel>().each([&](flecs::entity leaf, ChatPanel&) {
+                        for (flecs::entity context : context_chain(leaf)) {
+                            const ContextInfo* info = context.try_get<ContextInfo>();
+                            if (!info || info->evaluator.empty()) continue;
+                            if (std::find(evaluators.begin(), evaluators.end(),
+                                          info->evaluator) == evaluators.end())
+                                evaluators.push_back(info->evaluator);
+                        }
+                    });
+
+                    if (evaluators.empty()) {
+                        std::cout << "[query] " << query.source_text
+                                  << " -- not run: this conversation is not within "
+                                     "any context; drag a panel's badge onto the "
+                                     "transcript" << std::endl;
+                        return;
+                    }
+                    for (const std::string& id : evaluators) {
+                        query_contexts::Result ran = query_contexts::execute(id, query);
+                        std::cout << "[query] " << query.source_text << " -- " << id
+                                  << (ran.ok ? ": " : " not run: ") << ran.message
+                                  << std::endl;
+                    }
+                    return;
+                }
+            }
+
             bool handled = false;
             annotation_query.each([&](flecs::entity e, WordAnnotationSelector& selector) {
                 if (!selector.active || selector.sentence_template.empty()) return;
@@ -8728,14 +10042,51 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
     {
     if (key == GLFW_KEY_BACKSPACE)
     {
-        if (!chat->draft.empty()) chat->draft.pop_back();
+        chat_draft_backspace(*chat);
+    }
+    else if (key == GLFW_KEY_ESCAPE && g_editing_message >= 0)
+    {
+        // Escape abandons an edit in flight, Discord-style: the bubble
+        // snaps back to what the message actually says.
+        if (g_edit_target.is_valid() && g_edit_target.is_alive()
+            && g_editing_message < (int)chat->messages.size()) {
+            if (auto* tr = g_edit_target.try_get_mut<TextRenderable>())
+                tr->text = chat->messages[(size_t)g_editing_message].text;
+        }
+        end_inplace_edit();
+        chat->draft.clear();
+        chat->sel_anchor = -1;
+        chat->input_focused = false;
     }
     else if (key == GLFW_KEY_ENTER || key == GLFW_KEY_KP_ENTER)
     {
         if (mods & GLFW_MOD_SHIFT)
         {
-            // Shift+Enter: insert newline
-            chat->draft.push_back('\n');
+            // Shift+Enter: insert newline at the caret
+            int cur = chat->cursor;
+            if (cur < 0) cur = 0;
+            if (cur > (int)chat->draft.size()) cur = (int)chat->draft.size();
+            chat->draft.insert((size_t)cur, 1, '\n');
+            chat->cursor = cur + 1;
+        }
+        else if (g_editing_message >= 0 && !chat->draft.empty())
+        {
+            // An edit in flight replaces its message rather than sending a
+            // new one. The old annotation template described the old words,
+            // so interpretation resets to the raw sentence.
+            if (g_editing_message < (int)chat->messages.size()) {
+                ChatMessage& m = chat->messages[(size_t)g_editing_message];
+                m.text = chat->draft;
+                if (m.annotatable >= 0
+                    && m.annotatable < (int)g_annotatable_messages.size())
+                    g_annotatable_messages[(size_t)m.annotatable].sentence_template =
+                        chat->draft;
+            }
+            end_inplace_edit();
+            chat->draft.clear();
+            chat->sel_anchor = -1;
+            chat->input_focused = false;
+            rebuild_chat_transcript();
         }
         else if (!chat->draft.empty())
         {
@@ -8757,11 +10108,25 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                         // If the command produced speech, its spectrogram strip
                         // lands under this line when the reply arrives.
                         speech::expect_strip_on(box);
+                        add_message_actions(box, (int)chat->messages.size() - 1);
                     });
+                // The result becomes a visible reply rather than a stderr
+                // whisper -- "chats" listing conversations in the transcript
+                // is the whole point of asking there.
+                if (!invoked.message.empty()) {
+                    chat->messages.push_back({"Thornfield", invoked.message});
+                    world->query<ChatPanel>()
+                        .each([&](flecs::entity, ChatPanel& chat_panel) {
+                            flecs::entity reply = create_message(UIElement, chat_panel,
+                                           world->entity("Heonae"), invoked.message);
+                            add_message_actions(reply, (int)chat->messages.size() - 1);
+                        });
+                }
                 if (!invoked.ok) {
                     std::cerr << "[command] " << invoked.message << std::endl;
                 }
                 chat->draft.clear();
+                save_chat_history();
                 return;
             }
 
@@ -8803,6 +10168,25 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                     // rows live here BESIDE the sentence container, not
                     // inside it, so rebuilding the sentence (which destroys
                     // its children) leaves committed branches standing.
+                    // One utterance, one hover surface: the bubble and its
+                    // interpretation live inside a single group whose fill is
+                    // the contiguous Discord-style highlight -- gap included.
+                    auto message_group = world->entity()
+                        .is_a(UIElement)
+                        .add(flecs::OrderedChildren)
+                        .add<UIYoga>()
+                        .set<UIFlexContainer>({
+                            YGFlexDirectionColumn, YGWrapNoWrap,
+                            YGJustifyFlexStart, YGAlignStretch, 4.0f})
+                        .add<ChatHoverRow>()
+                        .set<RoundedRectRenderable>({0.0f, 0.0f, 4.0f, false, 0xFFFFFF00})
+                        .set<ZIndex>({12})
+                        .child_of(chat_panel.message_list);
+
+                    messageBox.child_of(message_group);
+                    messageBox.remove<ChatHoverRow>();
+                    add_message_actions(message_group, (int)chat->messages.size() - 1);
+
                     auto message_stack = world->entity()
                         .is_a(UIElement)
                         .add(flecs::OrderedChildren)
@@ -8810,7 +10194,7 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                         .set<UIFlexContainer>({
                             YGFlexDirectionColumn, YGWrapNoWrap,
                             YGJustifyFlexStart, YGAlignStretch, 4.0f})
-                        .child_of(chat_panel.message_list);
+                        .child_of(message_group);
 
                     auto representation_ux = world->entity()
                         .is_a(UIElement)
@@ -8827,8 +10211,16 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
 
                         // Register message in global list
                         
-                        g_annotatable_messages.push_back({chat->draft, representation_ux});
+                        // Recognition runs before the sentence exists as a
+                        // template, so a word the context knows is already bound
+                        // when the badges are first drawn -- there is no moment
+                        // where "Sun" is plain text that then changes its mind.
+                        const std::string recognized =
+                            recognize_draft(leaf, chat->draft);
+
+                        g_annotatable_messages.push_back({recognized, representation_ux});
                         int msg_idx = (int)g_annotatable_messages.size() - 1;
+                        chat->messages.back().annotatable = msg_idx;
                         // The selector now shows this message; without this,
                         // the first Up/Down saved the fresh message's state
                         // into whatever slot was current before -- so coming
@@ -8846,7 +10238,10 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                         {
                             flecs::entity expand_client = world->lookup("MorphologyExpandClient");
                             if (tradewinds::try_reserve(expand_client)) {
-                                g_expand_sent = chat->draft;
+                                // What the selector actually holds now, so the
+                                // reply's compare-and-set recognises its own
+                                // work rather than the raw surface.
+                                g_expand_sent = recognized;
                                 expand_client.set<SendMapRequest>({{
                                     {"type", "expand_text"},
                                     {"text", chat->draft},
@@ -8856,7 +10251,7 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                         }
 
                         interlocutorAnnotator.set<WordAnnotationSelector>({
-                            chat->draft,           // sentence_template
+                            recognized,            // sentence_template
                             {},                       // ui_entities
                             {},                       // selection_entities
                             representation_ux,       // parent_entity
@@ -8872,14 +10267,35 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
                         .set<ZIndex>({15});
                         world->defer_resume();
                         
-                        sync_representation_grounding(interlocutorAnnotator.ensure<WordAnnotationSelector>(), chat->draft);
+                        // The recognized template, not the raw draft: rendering
+                        // the surface here would throw away the bindings
+                        // recognition just made and draw every word as plain
+                        // text.
+                        sync_representation_grounding(
+                            interlocutorAnnotator.ensure<WordAnnotationSelector>(),
+                            recognized);
                 });
 
             chat->draft.clear();
+            save_chat_history();
         }
     }
-    } 
     }
+    }
+    // Left/right step through the ARC dataset. Last in line on the arrows:
+    // the chat caret, the Lexicon's chip selection and the annotation word
+    // selector all claim them above and return, so reaching here means nobody
+    // is typing or annotating. The text-focus guards are belt and braces --
+    // a focused query bar swallows its own keys before this point.
+    if ((action == GLFW_PRESS || action == GLFW_REPEAT)
+        && (key == GLFW_KEY_LEFT || key == GLFW_KEY_RIGHT))
+    {
+        const ChatState* chat = world->try_get<ChatState>();
+        const bool typing = (chat && chat->input_focused) || focused_entity_query();
+        if (!typing && panels::arc_task_step(key == GLFW_KEY_RIGHT ? 1 : -1))
+            return;
+    }
+
     // TODO: Check for focused VNC Stream...
     // Use static cached query to avoid creating new query on every key press
     static auto vnc_query = world->query<VNCClientHandle>();
@@ -8978,6 +10394,56 @@ int main(int, char *[]) {
     // language model emitting tool calls, or a parser of your own.
     speech::register_capability(*world);
 
+    // Conversation management, LLM-client style: multiple named chats under
+    // runtime/chats/, listed and switched from the input box itself.
+    functions::register_function({
+        "chats", "List saved conversations; the active one is bracketed.", {},
+        [](const functions::Args&) -> functions::Result {
+            std::string names;
+            std::error_code ec;
+            for (const auto& entry : std::filesystem::directory_iterator(kChatsDir, ec)) {
+                if (entry.path().extension() != ".tsv") continue;
+                if (!names.empty()) names += ", ";
+                const std::string stem = entry.path().stem().string();
+                names += stem == g_chat_name ? "[" + stem + "]" : stem;
+            }
+            return {true, names.empty() ? "no saved chats" : names};
+        },
+        nullptr});
+
+    functions::register_function({
+        "newchat", "Start a fresh conversation, saving the current one.",
+        {{"name", "string", "name for the new chat; a timestamp when omitted", false}},
+        [](const functions::Args& args) -> functions::Result {
+            save_chat_history();
+            clear_chat_transcript();
+            auto it = args.find("name");
+            g_chat_name = (it != args.end() && !it->second.empty())
+                ? it->second : fresh_chat_name();
+            save_chat_history();
+            return {true, "started " + g_chat_name};
+        },
+        nullptr});
+
+    functions::register_function({
+        "openchat", "Switch to a saved conversation by name.",
+        {{"name", "string", "chat to open (see chats)", true}},
+        [](const functions::Args& args) -> functions::Result {
+            auto it = args.find("name");
+            if (it == args.end() || it->second.empty())
+                return {false, "openchat needs a name"};
+            const std::string path = std::string(kChatsDir) + "/" + it->second + ".tsv";
+            if (!std::filesystem::exists(path))
+                return {false, "no such chat: " + it->second};
+            save_chat_history();
+            clear_chat_transcript();
+            g_chat_name = it->second;
+            load_chat_file(path);
+            save_chat_history();   // re-point runtime/chats/current
+            return {true, "opened " + g_chat_name};
+        },
+        nullptr});
+
     // TODO: Multiple chats
     flecs::entity interlocutor_client = world->entity("InterlocutorClient")
         .set<ZMQClient>({ "ipc:///tmp/thornfield_interlocutor_socket", zmq::socket_type::req });
@@ -9010,6 +10476,12 @@ int main(int, char *[]) {
     // mid-query would otherwise be silently dropped.
     flecs::entity entity_create_client = world->entity("EntityCreateClient")
         .set<ZMQClient>({ "ipc:///tmp/thornfield_entity_query_socket", zmq::socket_type::req });
+
+    // Jane Eyre ARC solver bridge: nlp_query cell selections and the tag
+    // schema for the ArcTask panel. The server is roster-managed (arc_solver
+    // in servers.json); this is only its REQ socket.
+    flecs::entity arc_solver_client = world->entity("ArcSolverClient")
+        .set<ZMQClient>({ "ipc:///tmp/arc_solver_req", zmq::socket_type::req });
 
     // Initialize spatial index manager
     spatial::SpatialIndexManager spatial_manager(world);
@@ -9222,9 +10694,23 @@ int main(int, char *[]) {
 
     world->component<ChatMessage>();
     world->component<ChatMessageView>();
+    world->component<ChatHoverRow>();
+    world->component<ChatMessageAction>();
+    world->component<SelectableText>();
     world->component<ChatState>().add(flecs::Singleton);
     world->component<ChatPanel>();
     world->component<FocusChatInput>();
+    // Provenance and the badge you drag to establish it. Context is a
+    // relationship, so it shows up in the Entities panel beside every other
+    // relation a conversation has. Transitive because contexts nest -- a query
+    // asked within a task is also asked within whatever the task sits inside --
+    // and traversable so a query can reach up a chain. Deliberately not
+    // exclusive: several contexts at once is the normal case, not an error.
+    world->component<Context>().add(flecs::Transitive).add(flecs::Traversable);
+    world->component<ContextInfo>();
+    world->component<ContextBadge>();
+    world->component<ContextDropTarget>();
+    world->component<ContextDrag>();
     world->component<SendChatMessage>();
     world->set<ChatState>({std::vector<ChatMessage>{}, "", false});
 
@@ -9329,6 +10815,26 @@ int main(int, char *[]) {
 
     // Initialize mel spectrogram rendering module (must be after Graphics entity is created)
     MelSpecRenderModule(*world);
+
+    // Audio capture follows the panels that show it. The microphone is a
+    // system-wide resource -- holding it open re-profiles the audio device and
+    // degrades playback everywhere else -- so the capture children only run
+    // while a Hearing or Episodic panel is actually open, and are released the
+    // moment the last one closes. A task (no query terms), so it decides once
+    // per frame rather than once per matched entity.
+    flecs::query<const EditorLeafData> audio_panel_query =
+        world->query<const EditorLeafData>();
+    world->system("AudioCaptureGateSystem")
+        .kind(flecs::PreFrame)
+        .run([audio_panel_query](flecs::iter&) {
+            bool wanted = false;
+            audio_panel_query.each([&](flecs::entity, const EditorLeafData& leaf) {
+                if (leaf.editor_type == EditorType::Hearing ||
+                    leaf.editor_type == EditorType::Episodic)
+                    wanted = true;
+            });
+            MelSpecSetCaptureEnabled(wanted);
+        });
 
     auto UIElement = world->prefab("UIElement")
         .set<Position, Local>({0.0f, 0.0f})
@@ -9486,6 +10992,9 @@ int main(int, char *[]) {
     .each([&](flecs::entity e, UIElementBounds&, AddTagOnLeftClick)
     {
         ChatState& chat = world->ensure<ChatState>();
+        // Always focus: a click inside a focused box now PLACES the caret
+        // (see the input-sync system), so it cannot double as a dismissal.
+        // Escape is the way out.
         chat.input_focused = true;
         // Only one text field can own the keyboard.
         world->query<EntityQuery>().each([](flecs::entity, EntityQuery& q) { q.focused = false; });
@@ -9498,10 +11007,13 @@ int main(int, char *[]) {
     {
         // EntityQuery lives on the bar itself, so the clicked entity *is* the
         // one to focus. Everything else loses focus, including the
-        // Interlocutor's chat draft.
+        // Interlocutor's chat draft. Clicking the bar that is already focused
+        // releases it -- the second click is a dismissal.
         world->ensure<ChatState>().input_focused = false;
+        const EntityQuery* clicked = e.try_get<EntityQuery>();
+        const bool was_focused = clicked && clicked->focused;
         world->query<EntityQuery>().each([&](flecs::entity bar, EntityQuery& query) {
-            query.focused = (bar == e);
+            query.focused = !was_focused && bar == e;
         });
         consume_ui_click();
     });
@@ -9516,6 +11028,7 @@ int main(int, char *[]) {
         {
             chat.messages.push_back({"You", chat.draft});
             chat.draft.clear();
+            save_chat_history();
         }
     });
 
@@ -9806,6 +11319,7 @@ int main(int, char *[]) {
     world->import<panels::PeachCore>();
     world->import<panels::Lattice>();
     world->import<panels::TypeGen>();
+    world->import<panels::ArcTask>();
 
     // Turns ChatScroll into the list's bottom inset, clamped so the transcript
     // can never be dragged past either end. PreFrame, so the offset it writes
@@ -10529,12 +12043,395 @@ int main(int, char *[]) {
     // Keeps the relation bar's text in sync with what has been typed, and shows
     // a prompt when it is empty so the field reads as something to type into
     // rather than as an empty strip.
+    // Replays the saved transcript into the first Interlocutor panel to
+    // appear. One-shot; waits because panels are built from the saved layout
+    // after startup, and a session without an Interlocutor never replays.
+    // immediate(): the replay builds UI and reads it straight back through
+    // sync_representation_grounding, which staged systems cannot do.
+    world->system<>("ChatHistoryReloadSystem")
+        .kind(flecs::PreFrame)
+        .immediate()
+        .run([](flecs::iter&) {
+            static bool done = false;
+            if (done) return;
+            bool have_panel = false;
+            world->query<ChatPanel>().each([&](flecs::entity, ChatPanel&) { have_panel = true; });
+            if (!have_panel) return;
+            done = true;
+            reload_chat_history();
+        });
+
+    // Discord-style sweep selection over any SelectableText. Press begins on
+    // the text under the cursor (clearing any previous selection), drag moves
+    // the selection's caret end, release keeps it; a press on nothing clears.
+    // Highlight rects are pooled children of the target text, so they scroll
+    // and clip with it.
+    // immediate(): the rebuild destroys and recreates highlight rects, and
+    // staged those changes merge after this frame's render -- the rects would
+    // exist only on frames where the drag DIDN'T move, a per-frame flicker.
+    world->system<>("TranscriptSelectionSystem")
+        .kind(flecs::PreFrame)
+        .immediate()
+        .run([](flecs::iter&) {
+            const Window* win = world->lookup("GLFWState").try_get<Window>();
+            const CursorState* mouse = world->lookup("GLFWState").try_get<CursorState>();
+            if (!win || !win->handle || !mouse) return;
+
+            static bool was_down = false;
+            static bool dragging = false;
+            static bool word_drag = false;   // double-click then keep dragging
+            static int word_s = 0, word_e = 0;
+            static float last_press_time = -10.0f;
+            static flecs::entity last_press_el;
+            static int last_press_idx = -1;
+            const bool down =
+                glfwGetMouseButton(win->handle, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
+            static flecs::query<const SelectableText, const TextRenderable,
+                                const UIElementBounds> texts =
+                world->query<const SelectableText, const TextRenderable,
+                             const UIElementBounds>();
+
+            const float mx = (float)mouse->x, my = (float)mouse->y;
+
+            // The I-beam over anything selectable (or the input box) -- half
+            // of what makes text feel like text. Computed here, applied by
+            // the editor's cursor system (the one glfwSetCursor writer).
+            {
+                bool over = false;
+                texts.each([&](flecs::entity, const SelectableText&,
+                               const TextRenderable&, const UIElementBounds& b) {
+                    if (!over && point_in_bounds(mx, my, b)) over = true;
+                });
+                if (!over) {
+                    static flecs::query<ChatPanel> chat_panels = world->query<ChatPanel>();
+                    chat_panels.each([&](flecs::entity, ChatPanel& cp) {
+                        const UIElementBounds* b = cp.input_panel.is_valid()
+                            ? cp.input_panel.try_get<UIElementBounds>() : nullptr;
+                        if (b && point_in_bounds(mx, my, *b)) over = true;
+                    });
+                }
+                g_want_ibeam = over;
+            }
+
+            if (down && !was_down) {
+                flecs::entity hit;
+                float lx = 0.0f, ly = 0.0f;
+                texts.each([&](flecs::entity e, const SelectableText&,
+                               const TextRenderable&, const UIElementBounds& b) {
+                    if (hit.is_valid() || !point_in_bounds(mx, my, b)) return;
+                    hit = e;
+                    lx = mx - b.xmin;
+                    ly = my - b.ymin;
+                });
+                if (!hit.is_valid()) {
+                    // Snap: a press anywhere near text still starts the drag
+                    // on the nearest one -- beside a sentence, or in the
+                    // empty space above/below the transcript. Vertical
+                    // distance dominates so the same row always wins, and
+                    // the out-of-range point clamps to line/text start or
+                    // end inside the hit test.
+                    float best = 1e9f;
+                    texts.each([&](flecs::entity e, const SelectableText&,
+                                   const TextRenderable&, const UIElementBounds& b) {
+                        const float vd = my < b.ymin ? b.ymin - my
+                                       : my > b.ymax ? my - b.ymax : 0.0f;
+                        const float hd = mx < b.xmin ? b.xmin - mx
+                                       : mx > b.xmax ? mx - b.xmax : 0.0f;
+                        const float score = vd * 1000.0f + hd;
+                        if (score >= best) return;
+                        best = score;
+                        hit = e;
+                        lx = mx - b.xmin;
+                        ly = my - b.ymin;
+                    });
+                }
+                if (hit.is_valid()) {
+                    text_sel_clear();
+                    const TextRenderable* tr = hit.try_get<TextRenderable>();
+                    const int idx = tr ? text_hit_index(*tr, lx, ly) : 0;
+
+                    const float now = (float)world->get_info()->world_time_total;
+                    const bool double_click = hit == last_press_el
+                        && idx >= last_press_idx - 1 && idx <= last_press_idx + 1
+                        && now - last_press_time < 0.35f;
+                    last_press_time = now;
+                    last_press_el = hit;
+                    last_press_idx = idx;
+
+                    g_text_sel.a_el = g_text_sel.c_el = hit;
+                    int ws = 0, we = 0;
+                    if (double_click && tr
+                        && word_bounds_at(tr->text, idx, &ws, &we)) {
+                        g_text_sel.a_idx = ws;
+                        g_text_sel.c_idx = we;
+                        word_s = ws;
+                        word_e = we;
+                        word_drag = true;
+                        dragging = true;   // keep dragging: extend by words
+                    } else {
+                        g_text_sel.a_idx = g_text_sel.c_idx = idx;
+                        word_drag = false;
+                        dragging = true;
+                    }
+                } else {
+                    text_sel_clear();
+                    dragging = false;
+                }
+            } else if (down && dragging && g_text_sel.a_el.is_valid()
+                       && g_text_sel.a_el.is_alive()) {
+                // Auto-scroll: holding the drag against the clipped panel's
+                // edge keeps the transcript moving underneath it -- the
+                // "just keep dragging" of every real text surface.
+                for (flecs::entity p = g_text_sel.a_el.parent();
+                     p.is_valid(); p = p.parent()) {
+                    if (!p.has<ChatScroll>()) continue;
+                    const UIElementBounds* view = p.parent().is_valid()
+                        ? p.parent().try_get<UIElementBounds>() : nullptr;
+                    ChatScroll* sc = p.try_get_mut<ChatScroll>();
+                    if (view && sc) {
+                        constexpr float kEdge = 30.0f, kSpeed = 7.0f;
+                        if (my < view->ymin + kEdge) sc->offset += kSpeed;      // older
+                        else if (my > view->ymax - kEdge) sc->offset -= kSpeed; // newer
+                    }
+                    break;
+                }
+
+                // The caret end follows the mouse through the flow: the
+                // element under the cursor if any, else the nearest one above
+                // (its end) or the flow's first (its start) -- dragging into
+                // the gaps between messages behaves like every text flow.
+                auto flow = selection_flow(g_text_sel.a_el);
+                flecs::entity target;
+                int idx = 0;
+                for (flecs::entity e : flow) {
+                    const UIElementBounds* b = e.try_get<UIElementBounds>();
+                    if (!b) continue;
+                    if (my < b->ymin) break;   // above this one: keep previous
+                    target = e;
+                    const TextRenderable* tr = e.try_get<TextRenderable>();
+                    if (!tr) continue;
+                    idx = my <= b->ymax
+                        ? text_hit_index(*tr, mx - b->xmin, my - b->ymin)
+                        : (int)tr->text.size();   // past its bottom: its end
+                }
+                if (!target.is_valid() && !flow.empty()) {
+                    target = flow.front();       // above everything: the start
+                    idx = 0;
+                }
+                if (target.is_valid()) {
+                    if (word_drag) {
+                        // Word-granular extension: the anchor word holds, the
+                        // moving end snaps to whole words -- across messages
+                        // too, using flow order to know which side we're on.
+                        const TextRenderable* ttr = target.try_get<TextRenderable>();
+                        int ts = idx, te = idx;
+                        if (ttr) word_bounds_at(ttr->text, idx, &ts, &te);
+
+                        int rel = 0;   // -1 before the anchor word, +1 after
+                        if (target == g_text_sel.a_el) {
+                            rel = idx > word_e ? 1 : idx < word_s ? -1 : 0;
+                        } else {
+                            size_t ai = flow.size(), ti = flow.size();
+                            for (size_t i = 0; i < flow.size(); i++) {
+                                if (flow[i] == g_text_sel.a_el) ai = i;
+                                if (flow[i] == target) ti = i;
+                            }
+                            rel = ti > ai ? 1 : -1;
+                        }
+                        if (rel > 0) {
+                            g_text_sel.a_idx = word_s;
+                            g_text_sel.c_el = target;
+                            g_text_sel.c_idx =
+                                target == g_text_sel.a_el && te < word_e ? word_e : te;
+                        } else if (rel < 0) {
+                            g_text_sel.a_idx = word_e;
+                            g_text_sel.c_el = target;
+                            g_text_sel.c_idx =
+                                target == g_text_sel.a_el && ts > word_s ? word_s : ts;
+                        } else {
+                            g_text_sel.c_el = g_text_sel.a_el;
+                            g_text_sel.a_idx = word_s;
+                            g_text_sel.c_idx = word_e;
+                        }
+                    } else {
+                        g_text_sel.c_el = target;
+                        g_text_sel.c_idx = idx;
+                    }
+                }
+            } else if (!down) {
+                dragging = false;
+                word_drag = false;
+            }
+            was_down = down;
+
+            // Rebuild the highlight rects when the selection changed. Rects
+            // are children of their own text elements, so once built they
+            // scroll and clip with the transcript for free.
+            if (!g_text_sel.a_el.is_valid() || !g_text_sel.a_el.is_alive()
+                || !g_text_sel.c_el.is_valid() || !g_text_sel.c_el.is_alive()) {
+                if (!g_text_sel.rects.empty()) text_sel_clear();
+                return;
+            }
+            std::string sig = std::to_string(g_text_sel.a_el.id()) + ":"
+                + std::to_string(g_text_sel.a_idx) + ">"
+                + std::to_string(g_text_sel.c_el.id()) + ":"
+                + std::to_string(g_text_sel.c_idx);
+            if (sig == g_text_sel.sig) return;
+
+            for (flecs::entity r : g_text_sel.rects)
+                if (r.is_alive()) r.destruct();
+            g_text_sel.rects.clear();
+            g_text_sel.sig = sig;
+
+            auto flow = selection_flow(g_text_sel.a_el);
+            size_t lo_i, hi_i;
+            int lo_idx, hi_idx;
+            if (!selection_normalized(flow, &lo_i, &lo_idx, &hi_i, &hi_idx)) return;
+
+            auto UIElement = world->lookup("UIElement");
+            for (size_t i = lo_i; i <= hi_i; i++) {
+                const TextRenderable* tr = flow[i].try_get<TextRenderable>();
+                if (!tr) continue;
+                const int len = (int)tr->text.size();
+                const int s = i == lo_i ? lo_idx : 0;
+                const int e = i == hi_i ? hi_idx : len;
+                for (const TextSpan& span : text_selection_spans(*tr, s, e, i < hi_i)) {
+                    g_text_sel.rects.push_back(world->entity()
+                        .is_a(UIElement)
+                        .child_of(flow[i])
+                        .set<Position, Local>({span.x, span.y})
+                        .set<RoundedRectRenderable>({span.w, span.h, 2.0f, false,
+                                                     0x4285f480})
+                        .set<ZIndex>({16}));
+                }
+            }
+        });
+
+    // In-place message editing: while an edit is in flight, the bubble's own
+    // text mirrors the draft live, carries the caret, and the transcript
+    // selection on it doubles as the edit caret/selection -- click and drag
+    // inside the bubble behave exactly like an editor.
+    world->system<>("InPlaceEditSystem")
+        .kind(flecs::PreFrame)
+        .run([](flecs::iter&) {
+            if (g_editing_message < 0) return;
+            if (!g_edit_target.is_valid() || !g_edit_target.is_alive()) return;
+            ChatState& chat = world->ensure<ChatState>();
+
+            // Live mirror.
+            TextRenderable* tr = g_edit_target.try_get_mut<TextRenderable>();
+            if (!tr) return;
+            if (tr->text != chat.draft) tr->text = chat.draft;
+
+            // A transcript selection on the edit bubble IS the edit
+            // selection: collapsed places the caret, a sweep selects.
+            if (g_text_sel.a_el == g_edit_target && g_text_sel.c_el == g_edit_target) {
+                chat.cursor = g_text_sel.c_idx;
+                chat.sel_anchor =
+                    g_text_sel.a_idx == g_text_sel.c_idx ? -1 : g_text_sel.a_idx;
+            }
+
+            // Editing dress on the bubble.
+            flecs::entity bkg = g_edit_target.parent();
+            if (bkg.is_valid()) {
+                if (auto* rr = bkg.try_get_mut<RoundedRectRenderable>())
+                    rr->color = 0x1c1c26FF;
+            }
+
+            // The caret, inside the bubble, wrap-aware.
+            if (!g_edit_caret.is_valid() || !g_edit_caret.is_alive()) {
+                g_edit_caret = world->entity()
+                    .is_a(world->lookup("UIElement"))
+                    .child_of(g_edit_target)
+                    .set<Position, Local>({0.0f, 0.0f})
+                    .set<RoundedRectRenderable>({2.0f, 18.0f, 1.0f, false, 0x00000000})
+                    .set<ZIndex>({19});
+            }
+            if (auto* bar = g_edit_caret.try_get_mut<RoundedRectRenderable>()) {
+                const bool on =
+                    fmodf((float)world->get_info()->world_time_total, 1.06f) < 0.53f;
+                bar->color = on ? 0xFFFFFFFF : 0x00000000;
+                if (on) {
+                    int cur = chat.cursor;
+                    if (cur < 0) cur = 0;
+                    if (cur > (int)chat.draft.size()) cur = (int)chat.draft.size();
+                    float cx = 0.0f, cy = 0.0f;
+                    text_caret_pos(*tr, cur, &cx, &cy);
+                    g_edit_caret.set<Position, Local>({cx, cy});
+                }
+            }
+        });
+
+    // Discord-style transcript hover: the full-width row under the cursor
+    // tints faintly -- and so does its partner, because a bubble and its
+    // interpretation stack are one utterance shown twice. Two passes: find
+    // what the cursor is on, then light it and its partner. Writes only
+    // colour into permanent zero-alpha fills; no structural change.
+    world->system<>("ChatHoverSystem")
+        .kind(flecs::PreFrame)
+        .run([](flecs::iter&) {
+            static flecs::query<const ChatHoverRow, const UIElementBounds,
+                                RoundedRectRenderable> rows =
+                world->query<const ChatHoverRow, const UIElementBounds,
+                             RoundedRectRenderable>();
+
+            const CursorState* cursor = world->lookup("GLFWState").try_get<CursorState>();
+            flecs::entity hovered, partner;
+            if (cursor) {
+                rows.each([&](flecs::entity e, const ChatHoverRow& row,
+                              const UIElementBounds& b, RoundedRectRenderable&) {
+                    if (hovered.is_valid()) return;
+                    if (!point_in_bounds((float)cursor->x, (float)cursor->y, b)) return;
+                    hovered = e;
+                    partner = row.partner;
+                });
+            }
+
+            rows.each([&](flecs::entity e, const ChatHoverRow&,
+                          const UIElementBounds&, RoundedRectRenderable& rect) {
+                rect.color = (e == hovered || e == partner) ? 0xFFFFFF0D : 0xFFFFFF00;
+            });
+
+            // The edit/delete chips light with their row.
+            static flecs::query<ChatMessageAction, RoundedRectRenderable> chips =
+                world->query<ChatMessageAction, RoundedRectRenderable>();
+            chips.each([&](flecs::entity, ChatMessageAction& action,
+                           RoundedRectRenderable& rect) {
+                const bool show = action.host == hovered || action.host == partner;
+                rect.color = show ? 0x2b2b31FF : 0x2b2b3100;
+                if (action.label.is_valid()) {
+                    if (ImageRenderable* icon = action.label.try_get_mut<ImageRenderable>())
+                        icon->tint = show ? nvgRGBA(204, 204, 204, 255)
+                                          : nvgRGBA(0, 0, 0, 0);
+                }
+            });
+        });
+
+    // The Interlocutor input's outline lights when it holds the keyboard --
+    // same register as the query bars below.
+    world->system<ChatPanel>("ChatInputFocusRingSystem")
+        .kind(flecs::PreFrame)
+        .each([](flecs::entity, ChatPanel& panel) {
+            if (!panel.input_panel.is_valid() || !panel.input_panel.is_alive()) return;
+            const ChatState* chat = world->try_get<ChatState>();
+            if (RoundedRectRenderable* rect = panel.input_panel.try_get_mut<RoundedRectRenderable>()) {
+                if (rect->stroke)
+                    rect->color = (chat && chat->input_focused) ? 0x9a9aa2FF : 0x555555FF;
+            }
+        });
+
     world->system<EntityQuery>("EntityQueryTextSystem")
         .kind(flecs::PreFrame)
         .each([](flecs::entity bar, EntityQuery& query) {
             if (!query.input_text.is_valid() || !query.input_text.is_alive()) return;
             TextRenderable* text = query.input_text.try_get_mut<TextRenderable>();
             if (!text) return;
+
+            // A focused field's outline lights up. Only stroke rects: the
+            // Entities bars are borderless fills and keep their colour.
+            if (RoundedRectRenderable* rect = bar.try_get_mut<RoundedRectRenderable>()) {
+                if (rect->stroke) rect->color = query.focused ? 0x9a9aa2FF : 0x555555FF;
+            }
 
             if (query.draft.empty() && !query.focused) {
                 text->text = query.placeholder;
@@ -10680,6 +12577,199 @@ int main(int, char *[]) {
             }
         });
 
+    // Picking up a context and dropping it on a conversation. Polled rather than
+    // event-driven for the same reason the chat's text drag is: a drag needs
+    // per-frame motion, and the press/release edges fall out of one static.
+    //
+    // The drop does not put anything in the sentence. It relates the
+    // conversation to the context -- provenance -- so that what is said next is
+    // said within it without having to name it.
+    world->system("ContextDragSystem")
+        .kind(flecs::PreFrame)
+        .run([](flecs::iter&) {
+            const Window* win = world->lookup("GLFWState").try_get<Window>();
+            const CursorState* mouse = world->lookup("GLFWState").try_get<CursorState>();
+            if (!win || !win->handle || !mouse) return;
+
+            const bool down =
+                glfwGetMouseButton(win->handle, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
+            static bool was_down = false;
+
+            ContextDrag& drag = world->ensure<ContextDrag>();
+            flecs::entity UIElement = world->lookup("UIElement");
+
+            auto end_drag = [&]() {
+                if (drag.ghost.is_valid() && drag.ghost.is_alive()) drag.ghost.destruct();
+                drag.ghost = flecs::entity::null();
+                drag.badge = flecs::entity::null();
+                drag.dragging = false;
+                drag.over_target = false;
+            };
+
+            if (down && !was_down) {
+                // Press on a context badge takes hold of it. Nothing happens yet
+                // -- the badge keeps working as a badge, and only a drag that
+                // ends somewhere else means anything.
+                world->query<ContextBadge, UIElementBounds>()
+                    .each([&](flecs::entity badge, ContextBadge&, UIElementBounds& b) {
+                        if (!drag.badge.is_valid()
+                            && point_in_bounds((float)mouse->x, (float)mouse->y, b)) {
+                            drag.badge = badge;
+                            drag.press_x = (float)mouse->x;
+                            drag.press_y = (float)mouse->y;
+                            drag.dragging = false;
+                        }
+                    });
+            }
+
+            if (!drag.badge.is_valid() || !drag.badge.is_alive()) {
+                end_drag();
+                was_down = down;
+                return;
+            }
+
+            const ContextBadge* carried = drag.badge.try_get<ContextBadge>();
+            const ContextInfo* info = (carried && carried->context.is_valid())
+                ? carried->context.try_get<ContextInfo>() : nullptr;
+
+            // Past a few pixels it is a drag, not a click, and the ghost appears.
+            if (down && !drag.dragging) {
+                const float dx = (float)mouse->x - drag.press_x;
+                const float dy = (float)mouse->y - drag.press_y;
+                if (dx * dx + dy * dy > 16.0f) {
+                    drag.dragging = true;
+                    if (UIElement.is_valid() && info) {
+                        // Parentless, so its Local IS its World: the propagation
+                        // pass adds nothing, and the ghost can be flown straight
+                        // at the cursor. Above everything, because it is over
+                        // everything.
+                        drag.ghost = world->entity()
+                            .is_a(UIElement)
+                            .set<LayoutBox>({LayoutBox::Horizontal, 2.0f})
+                            .set<Position, Local>({(float)mouse->x, (float)mouse->y})
+                            .set<ZIndex>({900});
+                        const std::string label = info->detail.empty()
+                            ? info->label : info->label + " " + info->detail;
+                        create_badge(drag.ghost, UIElement, label.c_str(), 0x0074D9FF);
+                    }
+                }
+            }
+
+            // Which conversation the cursor is over, if any.
+            flecs::entity target;
+            world->query<ContextDropTarget, UIElementBounds>()
+                .each([&](flecs::entity, ContextDropTarget& drop, UIElementBounds& b) {
+                    if (!target.is_valid()
+                        && point_in_bounds((float)mouse->x, (float)mouse->y, b))
+                        target = drop.chat_leaf;
+                });
+            drag.over_target = drag.dragging && target.is_valid();
+
+            if (drag.dragging && drag.ghost.is_valid() && drag.ghost.is_alive()) {
+                // Carried a little up and left of the cursor so the pointer is
+                // not sitting on top of the label it is carrying.
+                drag.ghost.set<Position, Local>({(float)mouse->x + 8.0f,
+                                                 (float)mouse->y - 10.0f});
+            }
+
+            if (!down) {
+                if (drag.dragging && target.is_valid() && target.is_alive()
+                    && carried && carried->context.is_valid()) {
+                    // Toggle, not replace: a conversation can be within several
+                    // contexts at once, so dropping a context it already has
+                    // withdraws that one and leaves the others alone.
+                    if (target.has<Context>(carried->context))
+                        target.remove<Context>(carried->context);
+                    else
+                        target.add<Context>(carried->context);
+                }
+                end_drag();
+            }
+
+            was_down = down;
+        });
+
+    // A drop target lights while a context is over it, so the gesture says where
+    // it would land before you commit to it.
+    world->system<ContextDropTarget, RoundedRectRenderable>("ContextDropHighlightSystem")
+        .kind(flecs::PreFrame)
+        .each([](flecs::entity e, ContextDropTarget& drop, RoundedRectRenderable& rect) {
+            const ContextDrag* drag = world->try_get<ContextDrag>();
+            const CursorState* mouse = world->lookup("GLFWState").try_get<CursorState>();
+            const UIElementBounds* b = e.try_get<UIElementBounds>();
+            const bool lit = drag && drag->dragging && mouse && b
+                && point_in_bounds((float)mouse->x, (float)mouse->y, *b);
+            rect.color = lit ? 0x11213BFF : drop.base_color;
+        });
+
+    // The conversation wears its provenance: a badge under the transcript saying
+    // what is being spoken about. Rebuilt only when the scope or its detail
+    // changes, so navigating tasks renames the badge in place.
+    world->system<ChatPanel>("ChatProvenanceSystem")
+        .kind(flecs::PreFrame)
+        .each([](flecs::entity leaf, ChatPanel& panel) {
+            if (!panel.meta_input.is_valid() || !panel.meta_input.is_alive()) return;
+
+            // Every context the conversation is within, own contexts first and
+            // what they sit inside after -- so a chain reads left to right from
+            // the specific thing being talked about out to the world it belongs
+            // to. The label carries the detail, so navigating tasks renames a
+            // badge in place instead of restaging the row.
+            const std::vector<flecs::entity> chain = context_chain(leaf);
+            std::string signature;
+            std::vector<const ContextInfo*> infos;
+            for (flecs::entity context : chain) {
+                const ContextInfo* info = context.try_get<ContextInfo>();
+                if (!info) continue;
+                signature += info->label + "|" + info->detail + "|" + info->symbol + ";";
+                infos.push_back(info);
+            }
+
+            static std::unordered_map<uint64_t, std::string> shown;
+            std::string& current = shown[leaf.id()];
+            if (current == signature) return;
+            current = signature;
+
+            std::vector<flecs::entity> old;
+            panel.meta_input.children([&](flecs::entity c) { old.push_back(c); });
+            for (flecs::entity c : old) c.destruct();
+
+            if (infos.empty()) return;
+            flecs::entity UIElement = world->lookup("UIElement");
+            if (!UIElement.is_valid()) return;
+
+            // Not a caption saying the word "Context": the row IS the
+            // relationship it asserts. The source slot is a wildcard, which is
+            // the whole point -- it says EVERYTHING here, not some named
+            // subject -- the predicate is Context, and the context itself is
+            // bound into the target slot. Drawn with the same widget the
+            // annotator draws any triple with, because it is one.
+            for (const ContextInfo* info : infos) {
+                SentenceToken relation{};
+                relation.text = "Context";
+                relation.type = TokenType::Relationship;
+                relation.source_symbol = "";              // wildcard source
+                relation.target_symbol = info->symbol;
+
+                SentenceToken bound_target{};
+                bound_target.text = info->detail.empty()
+                    ? info->label : info->label + " " + info->detail;
+                bound_target.binding_symbol = info->symbol;
+                bound_target.type = TokenType::Entity;
+
+                // Seeded so drawing this row can never reach for the colour
+                // server: a cache miss there spawns a process and stalls the
+                // frame for two seconds. Never clobbers an existing assignment,
+                // since that is what the symbol already means on screen.
+                if (!info->symbol.empty()
+                    && entity_color_cache.find(info->symbol) == entity_color_cache.end())
+                    entity_color_cache[info->symbol] = 0x0074D9FF;
+
+                create_triple_block(panel.meta_input, relation, nullptr,
+                                    nullptr, &bound_target);
+            }
+        });
+
     // Update Language Game chat UI each frame
     world->system<ChatPanel, EditorNodeArea>()
         .kind(flecs::PreFrame)
@@ -10695,13 +12785,218 @@ int main(int, char *[]) {
             // root, the history panel flex-grows, the input bar is fixed
             // height) -- this system only keeps the draft text in sync.
             ChatState& chat = world->ensure<ChatState>();
-            std::string caret = chat.input_focused ? "|" : "";
+            // While an in-place edit is in flight the bubble is the editor;
+            // the bottom box goes inert -- empty, caretless, deaf to clicks.
+            const bool inplace = g_editing_message >= 0;
             if (auto* input_tr = panel.input_text.try_get_mut<TextRenderable>())
             {
-                input_tr->text = chat.draft + caret;
+                input_tr->text = inplace ? "" : chat.draft;
                 // Wrap within the input panel, allowing for its padding.
                 if (const UIElementSize* input_size = panel.input_panel.try_get<UIElementSize>())
                     input_tr->wrapWidth = std::max(0.0f, input_size->width - 16.0f);
+            }
+
+            // The caret is an overlay bar positioned by measurement, never a
+            // glyph in the string -- inserting one displaces everything after
+            // it and makes the text breathe as the caret moves.
+            if (!panel.caret.is_valid() || !panel.caret.is_alive()) {
+                // Positioned through Position,Local like the scrollbar thumb:
+                // World on a child is recomputed from parent+Local by the
+                // propagation pass, so writing World directly gets stomped.
+                panel.caret = world->entity()
+                    .is_a(world->lookup("UIElement"))
+                    .child_of(panel.input_panel)
+                    .set<Position, Local>({8.0f, 8.0f})
+                    .set<RoundedRectRenderable>({2.0f, 18.0f, 1.0f, false, 0x00000000})
+                    .set<ZIndex>({18});
+            }
+            // Mouse: press inside the box places the caret, dragging selects.
+            // Polled rather than event-driven -- drag needs per-frame motion
+            // anyway, and press/release edges fall out of one static.
+            {
+                const Window* win = world->lookup("GLFWState").try_get<Window>();
+                const CursorState* mouse = world->lookup("GLFWState").try_get<CursorState>();
+                const UIElementBounds* tbounds = panel.input_text.try_get<UIElementBounds>();
+                const UIElementBounds* pbounds = panel.input_panel.try_get<UIElementBounds>();
+                static bool was_down = false;
+                static bool dragging = false;
+                static bool word_drag = false;   // double-click then keep dragging
+                static int word_s = 0, word_e = 0;
+                static float last_press_time = -10.0f;
+                static int last_press_idx = -1;
+                const bool down = win && win->handle
+                    && glfwGetMouseButton(win->handle, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
+
+                if (win && mouse && tbounds && pbounds && !inplace) {
+                    const float lx = (float)mouse->x - tbounds->xmin;
+                    const float ly = (float)mouse->y - tbounds->ymin;
+                    if (down && !was_down
+                        && point_in_bounds((float)mouse->x, (float)mouse->y, *pbounds)) {
+                        const int idx = chat_draft_index_at(chat.draft, lx, ly);
+                        chat.input_focused = true;
+
+                        const float now = (float)world->get_info()->world_time_total;
+                        const bool double_click =
+                            now - last_press_time < 0.35f && idx == last_press_idx;
+                        last_press_time = now;
+                        last_press_idx = idx;
+
+                        int ws = 0, we = 0;
+                        if (double_click
+                            && word_bounds_at(chat.draft, idx, &ws, &we)) {
+                            // Double-click selects the word -- never the gap;
+                            // whitespace snaps to the nearest word. Keeping
+                            // the button down extends by whole words.
+                            chat.sel_anchor = ws;
+                            chat.cursor = we;
+                            word_s = ws;
+                            word_e = we;
+                            word_drag = true;
+                            dragging = true;
+                        } else {
+                            chat.cursor = idx;
+                            chat.sel_anchor = idx;
+                            word_drag = false;
+                            dragging = true;
+                        }
+                    } else if (down && dragging) {
+                        const int idx = chat_draft_index_at(chat.draft, lx, ly);
+                        if (word_drag) {
+                            // The anchor word never shrinks; the moving end
+                            // grows word by word past it.
+                            int ts = idx, te = idx;
+                            word_bounds_at(chat.draft, idx, &ts, &te);
+                            if (idx > word_e) {
+                                chat.sel_anchor = word_s;
+                                chat.cursor = te > word_e ? te : word_e;
+                            } else if (idx < word_s) {
+                                chat.sel_anchor = word_e;
+                                chat.cursor = ts < word_s ? ts : word_s;
+                            } else {
+                                chat.sel_anchor = word_s;
+                                chat.cursor = word_e;
+                            }
+                        } else {
+                            chat.cursor = idx;
+                        }
+                    } else if (!down && dragging) {
+                        dragging = false;
+                        word_drag = false;
+                        if (chat.sel_anchor == chat.cursor) chat.sel_anchor = -1;
+                    }
+                }
+                was_down = down;
+            }
+
+            if (RoundedRectRenderable* bar = panel.caret.try_get_mut<RoundedRectRenderable>()) {
+                const bool on = chat.input_focused && !inplace
+                    && fmodf((float)world->get_info()->world_time_total, 1.06f) < 0.53f;
+                bar->color = on ? 0xFFFFFFFF : 0x00000000;
+
+                const UIElementBounds* tb = panel.input_text.try_get<UIElementBounds>();
+                const UIElementBounds* pb = panel.input_panel.try_get<UIElementBounds>();
+                // Positioned every frame, not only while the blink is showing:
+                // the caret would otherwise sit at the corner it was created in
+                // until the first blink lands, and a caret hidden mid-blink
+                // would lag the layout it belongs to.
+                if (g_yoga_vg) {
+                    int cur = chat.cursor;
+                    if (cur < 0) cur = 0;
+                    if (cur > (int)chat.draft.size()) cur = (int)chat.draft.size();
+                    const std::string before = chat.draft.substr(0, (size_t)cur);
+                    const size_t nl = before.rfind('\n');
+                    const int line = (int)std::count(before.begin(), before.end(), '\n');
+                    const std::string seg =
+                        nl == std::string::npos ? before : before.substr(nl + 1);
+
+                    nvgFontSize(g_yoga_vg, 16.0f);
+                    nvgFontFace(g_yoga_vg, "JetBrainsMono");
+                    const float x = text_advance(g_yoga_vg, seg);
+
+                    // Where the text begins, relative to the panel. With
+                    // nothing typed there is no text box worth measuring -- an
+                    // empty string measures to nothing, and a zero-size node's
+                    // corner is not where the first glyph will appear -- so the
+                    // origin comes from the panel's own content edge, its
+                    // padding. That IS where the first character lands, so the
+                    // caret does not move when you type it.
+                    const UIPadding* pad = panel.input_panel.try_get<UIPadding>();
+                    float base_x = pad ? pad->left : 8.0f;
+                    float base_y = pad ? pad->top : 8.0f;
+                    if (!chat.draft.empty() && tb && pb) {
+                        base_x = tb->xmin - pb->xmin;
+                        base_y = tb->ymin - pb->ymin;
+                    }
+                    panel.caret.set<Position, Local>({base_x + x,
+                                                      base_y + line * 18.0f});
+
+                }
+            }
+
+            // Selection highlight: one rect per hard line of the selected
+            // range, from a small recycled pool. Unused rects park at alpha 0.
+            {
+                const int len = (int)chat.draft.size();
+                int cur = chat.cursor;
+                if (cur < 0) cur = 0;
+                if (cur > len) cur = len;
+                const int anc = chat.sel_anchor;
+                const bool has_sel = anc >= 0 && anc <= len && anc != cur && !inplace;
+
+                while (panel.sel_rects.size() < 6) {
+                    panel.sel_rects.push_back(world->entity()
+                        .is_a(world->lookup("UIElement"))
+                        .child_of(panel.input_panel)
+                        .set<Position, Local>({8.0f, 8.0f})
+                        .set<RoundedRectRenderable>({0.0f, 18.0f, 2.0f, false, 0x00000000})
+                        .set<ZIndex>({11}));
+                }
+
+                size_t used = 0;
+                if (has_sel && g_yoga_vg) {
+                    const UIElementBounds* tb = panel.input_text.try_get<UIElementBounds>();
+                    const UIElementBounds* pb = panel.input_panel.try_get<UIElementBounds>();
+                    const float base_x = (tb && pb) ? tb->xmin - pb->xmin : 8.0f;
+                    const float base_y = (tb && pb) ? tb->ymin - pb->ymin : 8.0f;
+
+                    const int lo = anc < cur ? anc : cur;
+                    const int hi = anc < cur ? cur : anc;
+
+                    nvgFontSize(g_yoga_vg, 16.0f);
+                    nvgFontFace(g_yoga_vg, "JetBrainsMono");
+
+                    // Walk hard lines, intersecting each with [lo, hi).
+                    int line_start = 0, line_no = 0;
+                    while (line_start <= len && used < panel.sel_rects.size()) {
+                        size_t nl = chat.draft.find('\n', (size_t)line_start);
+                        const int line_end = nl == std::string::npos ? len : (int)nl;
+                        const int s = lo > line_start ? lo : line_start;
+                        const int e = hi < line_end ? hi : line_end;
+                        if (s < e) {
+                            const std::string seg =
+                                chat.draft.substr((size_t)line_start,
+                                                  (size_t)(line_end - line_start));
+                            const int c0 = s - line_start, c1 = e - line_start;
+                            // Advances, like the caret: a selection that ends on
+                            // a space must cover the space.
+                            const float x0 = text_advance(g_yoga_vg, seg.substr(0, (size_t)c0));
+                            const float x1 = text_advance(g_yoga_vg, seg.substr(0, (size_t)c1));
+                            flecs::entity r = panel.sel_rects[used++];
+                            r.set<Position, Local>({base_x + x0,
+                                                    base_y + line_no * 18.0f});
+                            if (auto* rr = r.try_get_mut<RoundedRectRenderable>()) {
+                                rr->width = x1 - x0;
+                                rr->color = 0x4285f480;
+                            }
+                        }
+                        if (nl == std::string::npos) break;
+                        line_start = line_end + 1;
+                        line_no++;
+                    }
+                }
+                for (size_t i = used; i < panel.sel_rects.size(); i++)
+                    if (auto* rr = panel.sel_rects[i].try_get_mut<RoundedRectRenderable>())
+                        rr->color = 0x00000000;
             }
 
             const int kMaxMessages = 30;
@@ -11531,7 +13826,9 @@ int main(int, char *[]) {
         if (screen3d::pointer_captured()) return;
         glfwSetInputMode(window->handle, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
 
-        glfwSetCursor(window->handle, NULL);
+        // Baseline: the I-beam when over selectable text, arrow otherwise;
+        // the region cursors below override either.
+        glfwSetCursor(window->handle, g_want_ibeam ? ibeam_cursor() : NULL);
 
         bool in_modify_region = false;
         for (EditorModifyPartitionRegion& partition_region : editor_root->modify_partition_regions)

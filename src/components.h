@@ -488,16 +488,54 @@ struct CheckBox {};
 struct ChatMessage {
     std::string author;
     std::string text;
+    // Index into g_annotatable_messages when this message has an annotation
+    // row, -1 otherwise (command lines). What lets the saved transcript carry
+    // each message's annotation template alongside its raw text.
+    int annotatable = -1;
 };
 
 struct ChatState {
     std::vector<ChatMessage> messages;
     std::string draft;
     bool input_focused;
+    // Caret position in the draft, in bytes (input is ASCII-filtered).
+    // Everything that mutates the draft clamps against its current size, so a
+    // stale value after clear/replace degrades to "caret at the end".
+    int cursor = 0;
+    // Selection anchor: the fixed end of a drag or shift-extend, with the
+    // caret as the moving end. -1 (or equal to the caret, or out of range)
+    // means no selection -- so stale values self-degrade to none.
+    int sel_anchor = -1;
 };
 
 struct ChatMessageView {
     int index;
+};
+
+// Discord-style row hover: a transcript row carrying this tints faintly while
+// the mouse is over it. The row keeps a permanent zero-alpha fill and the
+// hover system only writes the colour, so hovering never churns archetypes.
+// `partner` couples a message bubble to its interpretation stack (and back):
+// hovering either lights both, because they are one utterance shown twice --
+// once as said, once as understood.
+struct ChatHoverRow {
+    flecs::entity partner;
+};
+
+// Marks a rendered text as sweep-selectable, Discord-style: mouse drag over
+// it selects a substring (hit-tested against the renderer's own wrapping) and
+// Ctrl+C copies it. One selection exists at a time, app-wide.
+struct SelectableText {};
+
+// One hover action chip (edit / delete) on a transcript message. Chips exist
+// permanently at zero alpha and light only while their host row is hovered --
+// the hover system writes colours, the click handler guards on actual hover
+// so an invisible chip can never be clicked.
+struct ChatMessageAction {
+    int index = -1;           // into ChatState.messages
+    bool erase = false;       // delete rather than edit
+    flecs::entity host;       // the hover row this chip belongs to
+    flecs::entity label;      // the chip's text, for visibility toggling
 };
 
 struct FocusChatInput {};
@@ -519,6 +557,15 @@ bool entity_screen_style(const std::string& name, std::string* symbol, uint32_t*
 // "source\trelation\ttarget", or empty when the cursor is elsewhere. Defined
 // in main.cpp beside the annotator state it reads.
 std::string annotator_selected_triple();
+
+// The comprehension the annotation cursor is on -- the [[Q ]] frame the Q
+// gesture wraps a span in -- as its member words, tab separated. Empty when
+// the cursor is not inside a frame. The frame is an intension: it carries its
+// own id and a second id for the extension it denotes, so this is how a panel
+// reads "the query this sentence just declared". Only the surface words are
+// published, because what a term MEANS is the executing context's business --
+// an ARC tag here, a world type elsewhere. Defined in main.cpp.
+std::string annotator_selected_comprehension();
 
 // Which role of an annotated relationship the MOUSE is over: 0 source, 1 the
 // relation, 2 target, -1 none. Joined badges count as the slot they fuse
@@ -729,6 +776,101 @@ struct SubtypeSubmit {
 };
 struct InstanceSubmit {
     std::string name;
+};
+
+// A cell query the chat's `arc` verb submitted to an ArcTask panel, parked
+// until the module sends it to the solver bridge. The panel has no input of
+// its own: queries are said in the Interlocutor.
+struct ArcQuerySubmit {
+    std::string query;
+};
+
+// ---------------------------------------------------------------- context
+
+// What a context IS, as an entity: a thing statements can be made with regard
+// to. `evaluator` names the registered query_contexts entry that knows how to
+// answer for it, so the entity carries its own dispatch rather than the chat
+// having to know what kinds of context exist.
+struct ContextInfo {
+    std::string evaluator;   // query_contexts id, e.g. "arc"
+    std::string label;       // "ArcTask"
+    std::string detail;      // what it is scoped to right now, e.g. the task id
+    // The shorthand glyph the context wears when it is bound into a slot, same
+    // register as any other entity's identity chip. A letter or digit; empty
+    // would draw the wildcard, which is what an UNbound slot means.
+    std::string symbol;
+};
+
+// A string some context recognises, declared by whatever owns that context's
+// meaning rather than mirrored here: the ARC solver says it knows "Sun", that it
+// is a colour, and that its own index for it is 4. One entity per term, related
+// Context to the context that declared it, so a term is a thing in the world --
+// bindable by the annotator, placeable in the type lattice, and scoped, so two
+// tasks that spell things differently cannot collide.
+//
+// `color` is the one field the DECLARER does not decide: how a term looks is
+// Thornfield's business, resolved at import from whatever the declarer's index
+// means (an ARC colour value maps to the palette the cells are drawn with, so a
+// Sun badge is the same yellow as a Sun cell). Zero means no opinion.
+struct VocabTerm {
+    std::string text;
+    std::string kind;        // "color" | "state" | "abstraction" | ...
+    int index = -1;          // the declarer's own numbering, -1 when it has none
+    uint32_t color = 0;
+};
+
+// Provenance: `X --Context--> context entity`. What a conversation is scoped to,
+// and what everything the conversation produces was produced within.
+//
+// Never spoken. You do not say "Rose Poly in ArcTask" -- you establish that what
+// you are doing happens within the ArcTask, and then you just say "Rose Poly".
+// So this is ambient rather than an argument: a relationship on the
+// conversation, read by a comprehension when it needs to know where it is being
+// asked.
+//
+// Deliberately NOT exclusive, and registered transitive:
+//
+//   * Multiple -- a conversation can carry several contexts at once, and a
+//     comprehension declared in it is asked of each. Nothing here caps the
+//     count; the drop gesture toggles one context without disturbing the rest.
+//   * Hierarchical -- a context entity wears Context itself, pointing at the
+//     broader one it sits within (a task within a dataset, a dataset within a
+//     project). Because the relation composes, the effective scope of a
+//     conversation is the transitive closure, most specific first, and a context
+//     in the middle of a chain need not know how to evaluate anything: it can be
+//     pure containment with evaluators only at the leaves.
+struct Context {};
+
+// A badge that carries a context and can be dragged onto a conversation to
+// scope it. Worn by a panel's identity badge, so the thing you drag is the
+// thing that names the panel.
+struct ContextBadge {
+    flecs::entity context;   // the ContextInfo entity this badge stands for
+};
+
+// Somewhere a context badge can be dropped: a conversation, named by its leaf.
+// `base_color` is the target's own resting fill, so the lit state while a drag
+// hovers it can be handed back afterwards without the drag code knowing what
+// colour the panel chose.
+struct ContextDropTarget {
+    flecs::entity chat_leaf;
+    uint32_t base_color = 0x050505FF;
+};
+
+// A context badge held by the cursor. Singleton; an invalid badge means nothing
+// is being dragged.
+//
+// `ghost` is the copy that follows the cursor -- without it a drag is invisible
+// and you are asked to believe the editor is tracking something. It appears only
+// once the cursor has moved past a small threshold, so a plain click on the
+// badge is still a plain click.
+struct ContextDrag {
+    flecs::entity badge;
+    flecs::entity ghost;
+    float press_x = 0.0f;
+    float press_y = 0.0f;
+    bool dragging = false;
+    bool over_target = false;
 };
 
 // Display order for an Entities panel: row position -> index into the backing
@@ -978,6 +1120,10 @@ enum class EditorType
     // Triple generalization: the seven adornments of a triple (Ego, Alter,
     // Bridge, ...) and their extensions -- see type_generalization.png.
     TypeGen,
+    // An ARC-AGI task: train/test IO grid pairs rendered as a two-column
+    // table, cells selected by click or by nlp_query against the Jane Eyre
+    // solver bridge.
+    ArcTask,
     // SystemNavigator,
 
     // Bookshelf,

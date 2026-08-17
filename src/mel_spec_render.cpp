@@ -131,6 +131,9 @@ struct IPCAudioState {
 static IPCAudioState g_micState = {};
 static IPCAudioState g_sysAudioState = {};
 
+// Off until a panel that shows audio asks for it -- see MelSpecSetCaptureEnabled.
+static bool g_captureEnabled = false;
+
 // Create listening socket
 static int create_listen_socket(const char* socket_path) {
     unlink(socket_path);  // Remove old socket if exists
@@ -188,6 +191,36 @@ static pid_t spawn_audio_client(const char* socket_path, int use_system_audio) {
     }
 
     return pid;
+}
+
+// Releases the device: kills the client and drops the accepted connection,
+// leaving the listen socket bound so a later restart only needs a new child.
+// The texture is blanked rather than left holding the last frame, so a panel
+// reopening never shows stale audio.
+static void stop_audio_client(IPCAudioState* state) {
+    if (state->child_pid > 0) {
+        kill(state->child_pid, SIGTERM);
+        waitpid(state->child_pid, NULL, 0);
+        printf("MelSpecRender: stopped audio client (PID %d) for %s\n",
+               state->child_pid, state->socket_path.c_str());
+    }
+    state->child_pid = -1;
+
+    if (state->socket_fd >= 0) {
+        close(state->socket_fd);
+        state->socket_fd = -1;
+    }
+
+    state->recvBufferUsed = 0;
+    state->columnsFilled = 0;
+    state->isFullyFilled = false;
+    state->scrollStartTime = 0.0;
+    state->totalScrollCommands = 0;
+
+    if (state->imageBuffer && state->imageBufferSize > 0) {
+        memset(state->imageBuffer, 0, state->imageBufferSize);
+        state->needsUpload = true;
+    }
 }
 
 // Try to accept connection (non-blocking)
@@ -407,13 +440,18 @@ static void melSpecUpdateSystem(flecs::entity e, MelSpecRender& melSpec) {
     static int update_count = 0;
     update_count++;
 
-    // Try to accept connections if not yet connected
-    try_accept_connection(&g_micState);
-    try_accept_connection(&g_sysAudioState);
+    // Only touch the sockets while capture is on; with it off there is no
+    // child to connect and nothing to read. The uploads still run so the
+    // blanking done by stop_audio_client reaches the texture.
+    if (g_captureEnabled) {
+        // Try to accept connections if not yet connected
+        try_accept_connection(&g_micState);
+        try_accept_connection(&g_sysAudioState);
 
-    // Process all pending IPC messages (may batch multiple scroll updates)
-    update_from_ipc(&g_micState);
-    update_from_ipc(&g_sysAudioState);
+        // Process all pending IPC messages (may batch multiple scroll updates)
+        update_from_ipc(&g_micState);
+        update_from_ipc(&g_sysAudioState);
+    }
 
     // Upload batched changes once per frame
     upload_if_needed(&g_micState);
@@ -558,17 +596,13 @@ void MelSpecRenderModule(flecs::world& world) {
         fprintf(stderr, "MelSpecRender: Failed to create sys audio listen socket\n");
     }
 
-    // Spawn child processes
-    printf("MelSpecRender: Spawning audio client processes...\n");
-    g_micState.child_pid = spawn_audio_client(g_micState.socket_path.c_str(), 0);
-    g_sysAudioState.child_pid = spawn_audio_client(g_sysAudioState.socket_path.c_str(), 1);
-
-    if (g_micState.child_pid < 0 || g_sysAudioState.child_pid < 0) {
-        fprintf(stderr, "MelSpecRender: Failed to spawn child processes\n");
-    } else {
-        printf("MelSpecRender: Spawned mic client (PID %d) and sys audio client (PID %d)\n",
-               g_micState.child_pid, g_sysAudioState.child_pid);
-    }
+    // No capture children here: the microphone stays closed until a panel
+    // that shows audio is actually open (MelSpecSetCaptureEnabled). Holding
+    // the mic from boot re-profiles the system's audio and degrades playback
+    // for everything else.
+    g_micState.child_pid = -1;
+    g_sysAudioState.child_pid = -1;
+    printf("MelSpecRender: audio capture idle (starts with a Hearing/Episodic panel)\n");
 
     // Create config entity
     auto configEntity = world.entity("MelSpecConfig")
@@ -668,6 +702,35 @@ void MelSpecRenderModule(flecs::world& world) {
 
             }
         });
+}
+
+bool MelSpecCaptureEnabled() {
+    return g_captureEnabled;
+}
+
+// Starts or releases the capture children. Idempotent, so the per-frame gate
+// in main.cpp can call it every frame with whatever the panels currently want.
+void MelSpecSetCaptureEnabled(bool enabled) {
+    if (enabled == g_captureEnabled) return;
+    g_captureEnabled = enabled;
+
+    if (!enabled) {
+        stop_audio_client(&g_micState);
+        stop_audio_client(&g_sysAudioState);
+        return;
+    }
+
+    if (g_micState.child_pid <= 0)
+        g_micState.child_pid = spawn_audio_client(g_micState.socket_path.c_str(), 0);
+    if (g_sysAudioState.child_pid <= 0)
+        g_sysAudioState.child_pid = spawn_audio_client(g_sysAudioState.socket_path.c_str(), 1);
+
+    if (g_micState.child_pid < 0 || g_sysAudioState.child_pid < 0) {
+        fprintf(stderr, "MelSpecRender: Failed to spawn child processes\n");
+    } else {
+        printf("MelSpecRender: Spawned mic client (PID %d) and sys audio client (PID %d)\n",
+               g_micState.child_pid, g_sysAudioState.child_pid);
+    }
 }
 
 void CleanupMelSpec() {
