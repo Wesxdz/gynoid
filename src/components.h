@@ -388,6 +388,19 @@ struct ImageRenderable
 // to sit; scrolling up reveals history. Lives on the message list.
 struct ChatScroll { float offset = 0.0f; };
 
+// Vertical scroll for a top-anchored list: the same shape as ChatScroll, minus
+// the transcript's bottom anchoring. Put it on a content container that carries
+// UIAbsoluteEdges and lives inside a clipped parent -- the container overflows
+// its parent by design, PanelScrollSystem slides it and clamps to the overflow,
+// and the parent's scissor hides what runs past. Any panel with more rows than
+// room gets scrolling by adding these two components.
+struct PanelScroll { float offset = 0.0f; };
+
+// The slider of a top-anchored list's scrollbar, pointing at the PanelScroll it
+// reports -- the counterpart to ChatScrollbarOf, so the system that sizes it
+// needs no fixed hierarchy between the two.
+struct PanelScrollbarOf {};
+
 // The slider of a transcript's scrollbar. Points at the ChatScroll it reports,
 // so the system that sizes it needs no fixed hierarchy between the two.
 struct ChatScrollbarOf {};
@@ -817,6 +830,12 @@ struct VocabTerm {
     std::string kind;        // "color" | "state" | "abstraction" | ...
     int index = -1;          // the declarer's own numbering, -1 when it has none
     uint32_t color = 0;
+
+    // The shorthand this term has been wearing. Remembered so a term keeps one
+    // chip across sentences instead of taking whatever digit happened to be
+    // free -- a symbol is per-sentence, but the thing it stands for is not.
+    // Given up when another term in the same sentence already holds it.
+    std::string symbol;
 };
 
 // Provenance: `X --Context--> context entity`. What a conversation is scoped to,
@@ -1124,6 +1143,8 @@ enum class EditorType
     // table, cells selected by click or by nlp_query against the Jane Eyre
     // solver bridge.
     ArcTask,
+    // The solver's scene graph for the task in context, as an indented tree.
+    VarRegistry,
     // SystemNavigator,
 
     // Bookshelf,

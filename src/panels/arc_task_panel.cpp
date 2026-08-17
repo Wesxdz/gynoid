@@ -120,6 +120,23 @@ struct ArcTaskView {
     std::string status;                      // "" | progress | error text
     std::string structured;                  // the query as the server parsed it
 
+    // What the query enumerates. Pixels answer every query, but they are rarely
+    // what is being counted: "Sun polyominoes" asks about polyominoes, and each
+    // matrix yields a set of them whose quantity is the answer. One set per
+    // matrix, so the number sits with the grid it is true of.
+    std::string enumerate_type = "Cell";
+    struct MatrixSet {
+        int pair_idx = 0;
+        bool is_test = false;
+        bool is_output = false;
+        int count = 0;
+        // Each member's own cells. Kept per member, not merged, because an
+        // object is one thing: it wears a single outline around its boundary
+        // rather than a box around each of its pixels.
+        std::vector<std::vector<std::pair<int, int>>> members;
+    };
+    std::vector<MatrixSet> sets;
+
     // Resolving a comprehension's words into terms. Words that name a tag
     // outright are resolved immediately; the rest queue here for the
     // morphology transducer, which is what turns "polyominoes" into
@@ -200,6 +217,46 @@ std::string lowered(const std::string& s)
 // nothing to the solver. Case-insensitive because annotation badges carry the
 // word as it was said ("zen", "above") while the vocabulary is canonical
 // ("Zen", "Above"); punctuation is stripped for the same reason.
+// What a query is counted in, read from the query itself: a word naming a type
+// says what is being enumerated, and anything else leaves it at cells.
+//
+// Derived here, at the point of sending, rather than during term resolution --
+// a query can arrive from a comprehension OR straight from the chat verb, and a
+// type named in one path but not the other is how "Rose RectPolygon" ends up
+// counting pixels.
+std::string enumerate_type_of(const std::string& query);
+
+// The kind a context declared for a term ("color", "state", "type", ...), or
+// empty when nothing declares the word.
+std::string vocab_kind(const std::string& term_text)
+{
+    if (!g_world) return {};
+    std::string found;
+    g_world->query<VocabTerm>().each([&](flecs::entity, VocabTerm& term) {
+        if (found.empty() && term.text == term_text) found = term.kind;
+    });
+    return found;
+}
+
+std::string vocab_term(const std::string& word);
+
+std::string enumerate_type_of(const std::string& query)
+{
+    std::string type = "Cell";
+    std::string word;
+    auto consider = [&](const std::string& w) {
+        if (w.empty()) return;
+        const std::string term = vocab_term(w);
+        if (!term.empty() && vocab_kind(term) == "type") type = term;
+    };
+    for (char c : query) {
+        if (std::isspace((unsigned char)c)) { consider(word); word.clear(); }
+        else word += c;
+    }
+    consider(word);
+    return type;
+}
+
 std::string vocab_term(const std::string& word)
 {
     std::string cleaned;
@@ -276,9 +333,21 @@ bool load_task(ArcTaskView& view, const std::string& task_id)
 
     view.task = std::move(t);
     view.task_id = task_id;
+
+    // An answer belongs to the task it was asked of. Everything the last query
+    // left on screen goes with it -- the highlighted cells, the outlines and
+    // counts drawn from the sets, and the terms in the query row -- rather than
+    // lingering over a grid it says nothing about. Terms in flight are dropped
+    // too, so a reply that lands after the task moved cannot start a query
+    // against the wrong one.
     view.selection.clear();
     view.server_selection = false;
     view.structured.clear();
+    view.sets.clear();
+    view.resolved_terms.clear();
+    view.unresolved_words.clear();
+    view.pending_words.clear();
+    view.inductive = false;
 
     // Position in the dataset, so the status line reads as a place you can
     // navigate from rather than a bare id.
@@ -473,24 +542,89 @@ void draw_task(NVGcontext* vg, const RenderCommand*, const CustomRenderable&)
             if (has_sel) emit_batch(false, true);
         }
 
-        // One stroked path over this grid's selected cells: the "these ones"
-        // outline from the deductive_integration mock.
-        if (has_sel) {
-            bool any = false;
+        // The outline says what was SELECTED, so it is drawn per member of the
+        // set rather than per pixel: an object is one thing and wears one
+        // outline around its boundary. Only the edges a member does not share
+        // with itself are stroked, so a domino reads as a 1x2 box and a
+        // concave shape keeps its notch. With cells as the enumerated type each
+        // member is a single pixel, and the same code draws exactly the box it
+        // used to.
+        const ArcTaskView::MatrixSet* set = nullptr;
+        for (const ArcTaskView::MatrixSet& candidate : view->sets) {
+            if (candidate.pair_idx != place.pair_idx) continue;
+            if (candidate.is_test != place.is_test) continue;
+            if (candidate.is_output != place.is_output) continue;
+            set = &candidate;
+            break;
+        }
+
+        bool any = false;
+        auto begin_outline = [&]() { if (!any) { nvgBeginPath(vg); any = true; } };
+
+        if (set && !set->members.empty()) {
+            for (const std::vector<std::pair<int, int>>& member : set->members) {
+                auto holds = [&](int x, int y) {
+                    for (const auto& [mx, my] : member)
+                        if (mx == x && my == y) return true;
+                    return false;
+                };
+                for (const auto& [x, y] : member) {
+                    // Whole cells, not the padded fill: the outline surrounds
+                    // the object rather than tracing inside it.
+                    const float x0 = place.x + x * cs;
+                    const float y0 = place.y + y * cs;
+                    const float x1 = x0 + cs;
+                    const float y1 = y0 + cs;
+                    if (!holds(x, y - 1)) { begin_outline();
+                        nvgMoveTo(vg, x0, y0); nvgLineTo(vg, x1, y0); }
+                    if (!holds(x, y + 1)) { begin_outline();
+                        nvgMoveTo(vg, x0, y1); nvgLineTo(vg, x1, y1); }
+                    if (!holds(x - 1, y)) { begin_outline();
+                        nvgMoveTo(vg, x0, y0); nvgLineTo(vg, x0, y1); }
+                    if (!holds(x + 1, y)) { begin_outline();
+                        nvgMoveTo(vg, x1, y0); nvgLineTo(vg, x1, y1); }
+                }
+            }
+        } else if (has_sel) {
+            // No set to group by -- a click selection, or a reply that carried
+            // only cells -- so each selected cell speaks for itself.
             for (int y = 0; y < g.height; y++) {
                 for (int x = 0; x < g.width; x++) {
                     if (!mask[(size_t)y * g.width + x]) continue;
-                    if (!any) { nvgBeginPath(vg); any = true; }
+                    begin_outline();
                     nvgRect(vg,
                             place.x + x * cs + lay.cell_pad * 0.5f,
                             place.y + y * cs + lay.cell_pad * 0.5f,
                             cell_draw, cell_draw);
                 }
             }
-            if (any) {
-                nvgStrokeColor(vg, nvgRGB(255, 255, 0));
-                nvgStrokeWidth(vg, 1.5f);
-                nvgStroke(vg);
+        }
+
+        if (any) {
+            // White: it has to read against all ten palette colours, and it is
+            // the one colour the palette does not use.
+            nvgStrokeColor(vg, nvgRGB(255, 255, 255));
+            nvgStrokeWidth(vg, 1.5f);
+            nvgStroke(vg);
+        }
+    }
+
+    // The quantity of the set this matrix yielded, sitting with the grid it is
+    // true of -- the count is a property of that set, not a caption for the
+    // whole answer. Same face and size as every other label in the editor.
+    if (!view->sets.empty()) {
+        nvgFontFace(vg, "CharisSIL");
+        nvgFontSize(vg, 16.0f);
+        nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_BOTTOM);
+        nvgFillColor(vg, nvgRGBA(0xC8, 0xC8, 0xC8, 0xFF));
+        for (const GridPlace& place : lay.grids) {
+            for (const ArcTaskView::MatrixSet& set : view->sets) {
+                if (set.pair_idx != place.pair_idx) continue;
+                if (set.is_test != place.is_test) continue;
+                if (set.is_output != place.is_output) continue;
+                const std::string label = std::to_string(set.count);
+                nvgText(vg, place.x, place.y - 2.0f, label.c_str(), nullptr);
+                break;
             }
         }
     }
@@ -621,11 +755,61 @@ void nlp_query_response(std::map<std::string, msgpack::object>& res)
             view.status = std::string("unreadable cells: ") + exc.what();
             return;
         }
+        // One set per matrix, each with its own quantity: what was counted, and
+        // where. Parsed after the cells because the cells are what gets
+        // highlighted and the sets are what gets reported.
+        view.sets.clear();
+        try {
+            auto sets_it = res.find("sets");
+            if (sets_it != res.end()) {
+                for (const msgpack::object& row :
+                         sets_it->second.as<std::vector<msgpack::object>>()) {
+                    auto entry = row.as<std::map<std::string, msgpack::object>>();
+                    auto state_it = entry.find("state");
+                    auto count_it = entry.find("count");
+                    if (state_it == entry.end()) continue;
+                    const auto state = state_it->second.as<std::vector<msgpack::object>>();
+                    if (state.size() < 3) continue;
+
+                    ArcTaskView::MatrixSet set;
+                    set.pair_idx = msg_int(state[0]);
+                    set.is_test = msg_int(state[1]) != 0;
+                    set.is_output = msg_int(state[2]) != 0;
+                    set.count = count_it == entry.end() ? 0 : msg_int(count_it->second);
+
+                    auto items_it = entry.find("items");
+                    if (items_it != entry.end()) {
+                        for (const msgpack::object& item :
+                                 items_it->second.as<std::vector<msgpack::object>>()) {
+                            auto member = item.as<std::map<std::string, msgpack::object>>();
+                            auto cells_it = member.find("cells");
+                            if (cells_it == member.end()) continue;
+                            std::vector<std::pair<int, int>> footprint;
+                            for (const msgpack::object& cell :
+                                     cells_it->second.as<std::vector<msgpack::object>>()) {
+                                const auto xy = cell.as<std::vector<msgpack::object>>();
+                                if (xy.size() < 2) continue;
+                                footprint.push_back({msg_int(xy[0]), msg_int(xy[1])});
+                            }
+                            if (!footprint.empty()) set.members.push_back(std::move(footprint));
+                        }
+                    }
+                    view.sets.push_back(std::move(set));
+                }
+            }
+        } catch (const std::exception&) { /* the highlight still stands */ }
+
+        const std::string enumerated = field_str(res, "enumerate");
+        int total = 0;
+        for (const ArcTaskView::MatrixSet& set : view.sets) total += set.count;
+
         // "every such thing" is the plural doing semantic work: the annotation
-        // said polyominoes, so the selection is the whole extension rather than
-        // one instance of it.
-        view.status = std::to_string(view.selection.size()) + " cells"
-                    + (view.inductive ? " -- every such thing" : "");
+        // said polyominoes, so the answer is the whole extension rather than one
+        // instance of it.
+        view.status = std::to_string(total) + " " +
+                      (enumerated.empty() ? view.enumerate_type : enumerated) +
+                      " in " + std::to_string(view.sets.size()) + " matrices" +
+                      (view.inductive ? " -- every such thing" : "");
         return;
     }
 
@@ -1000,9 +1184,14 @@ ArcTask::ArcTask(flecs::world& world)
             panel.remove<ArcQuerySubmit>();
             return;
         }
+        // Read from the query being sent, so it holds however the query got
+        // here -- annotated comprehension or typed verb.
+        view.enumerate_type = enumerate_type_of(submit.query);
+
         if (!send_solver({{"command", "nlp_query"},
                           {"task_id", view.task_id},
-                          {"query", submit.query}}, nlp_query_response))
+                          {"query", submit.query},
+                          {"enumerate", view.enumerate_type}}, nlp_query_response))
             return;   // client busy; the submit stays parked and retries
         view.status = "querying...";
         view.dirty = true;

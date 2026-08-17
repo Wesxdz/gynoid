@@ -94,6 +94,7 @@ using json = nlohmann::json;
 #include "panels/lattice_panel.h"
 #include "panels/typegen_panel.h"
 #include "panels/arc_task_panel.h"
+#include "panels/var_registry_panel.h"
 
 #include "tradewinds.h"
 
@@ -620,7 +621,18 @@ std::unordered_map<std::string, uint32_t> entity_color_cache = {
 
 // TODO: Refactor this to Tradewinds...
 // Get color via Unix socket to persistent Python server (fast after first call)
+// The colour a context declared for a word, or 0 when no context declares it.
+// Looked up by TEXT, because that is the entity's identity; a binding symbol is
+// per-sentence shorthand and is handed out again in the next sentence. Defined
+// below, beside the world it reads.
+static uint32_t declared_term_color(const std::string& entity_text);
+
 uint32_t get_entity_color(std::string binding_symbol, const std::string& entity_text) {
+    // A declared term is coloured by what it IS. Deliberately ahead of the cache
+    // and never written into it: the cache is keyed by symbol, so storing Tang's
+    // orange under "0" would hand it to whatever wears 0 in the next sentence.
+    if (uint32_t declared = declared_term_color(entity_text)) return declared;
+
     // Check cache first
     auto it = entity_color_cache.find(binding_symbol);
     if (it != entity_color_cache.end()) {
@@ -1013,6 +1025,24 @@ public:
 };
 
 flecs::world* world = nullptr;
+
+static uint32_t declared_term_color(const std::string& entity_text)
+{
+    if (!world || entity_text.empty()) return 0;
+
+    std::string wanted = entity_text;
+    for (char& c : wanted) c = (char)std::tolower((unsigned char)c);
+
+    uint32_t found = 0;
+    static flecs::query<VocabTerm> terms = world->query<VocabTerm>();
+    terms.each([&](flecs::entity, VocabTerm& term) {
+        if (found || term.color == 0) return;
+        std::string text = term.text;
+        for (char& c : text) c = (char)std::tolower((unsigned char)c);
+        if (text == wanted) found = term.color;
+    });
+    return found;
+}
 
 // The badge under the Interlocutor's annotation cursor: what the selected stop
 // literally displays. An entity stop is its entity's label, a relationship's
@@ -2562,6 +2592,25 @@ static GLFWcursor* ibeam_cursor()
     return c;
 }
 
+// Standard cursors, made once and kept. glfwCreateStandardCursor allocates a
+// new cursor object every call, so building one per frame while the pointer
+// rests on a panel edge leaks one per frame and makes the pointer flicker as
+// each freshly made object is applied.
+static GLFWcursor* standard_cursor(int shape)
+{
+    static std::unordered_map<int, GLFWcursor*> cache;
+    auto it = cache.find(shape);
+    if (it != cache.end()) return it->second;
+    GLFWcursor* made = glfwCreateStandardCursor(shape);
+    cache[shape] = made;
+    return made;
+}
+
+// What the pointer is currently wearing. Setting the same cursor every frame is
+// the other half of the flicker; -1 means "unknown", which forces the next
+// frame to apply whatever it wants.
+static GLFWcursor* g_applied_cursor = (GLFWcursor*)-1;
+
 static void text_sel_clear()
 {
     for (flecs::entity r : g_text_sel.rects)
@@ -3850,7 +3899,8 @@ std::vector<std::string> editor_types =
     "Holodeck",
     "Lattice",
     "TypeGen",
-    "ArcTask"
+    "ArcTask",
+    "VarRegistry"
 };
 
 // VNCData lives in capabilities/vnc_sources.h now; the pool implementation
@@ -6394,6 +6444,21 @@ static void scroll_callback(GLFWwindow* window, double xoffset, double yoffset)
         consumed = true;
     });
 
+    // Top-anchored lists: wheel up moves the content back toward its start, so
+    // the offset falls. Clamped by PanelScrollSystem, the only place that knows
+    // how far the content overflows.
+    static flecs::query<PanelScroll> panels = world->query<PanelScroll>();
+    panels.each([&](flecs::entity list, PanelScroll& scroll) {
+        if (consumed) return;
+        // The parent's bounds, not the list's: the list overflows it on purpose,
+        // so its own bounds would claim the wheel outside the visible area.
+        const UIElementBounds* view = list.parent().try_get<UIElementBounds>();
+        if (!view || !point_in_bounds(cursor.x, cursor.y, *view)) return;
+
+        scroll.offset -= (float)yoffset * 54.0f;
+        consumed = true;
+    });
+
     if (!consumed) panel3d::add_scroll(yoffset);
 }
 
@@ -6491,6 +6556,10 @@ static int ui_hierarchy_depth(flecs::entity e)
     return depth;
 }
 
+// Defined with the annotation state it moves; declared here because the click
+// dispatcher is the only caller.
+static bool annotation_click_select(double x, double y, bool shift);
+
 void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
 {
     // Clicks while the Holodeck walk owns the pointer are part of the walk
@@ -6577,6 +6646,16 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
                 }
 
                 if (world->ensure<UIInputDispatch>().consumed) break;
+            }
+
+            // A word or badge in a transcript takes the annotation cursor.
+            // Tested after the UI dispatch above so a control drawn over a
+            // sentence still wins, and consuming, so the click does not also
+            // land on whatever sits behind the transcript.
+            if (!world->ensure<UIInputDispatch>().consumed
+                && annotation_click_select(cursor_state->x, cursor_state->y,
+                                           (mods & GLFW_MOD_SHIFT) != 0)) {
+                world->ensure<UIInputDispatch>().consumed = true;
             }
 
             // A click that lands on nothing which wants the keyboard releases
@@ -7283,9 +7362,7 @@ static std::string recognize_draft(flecs::entity chat_leaf, const std::string& d
         return draft;
     }
 
-    // Terms in scope, longest text first so a multi-word term would win over a
-    // shorter one once such terms exist.
-    struct Recognized { std::string lower; const VocabTerm* term; };
+    struct Recognized { std::string lower; flecs::entity entity; };
     std::vector<Recognized> in_scope;
     static flecs::query<VocabTerm> terms = world->query<VocabTerm>();
     terms.each([&](flecs::entity term_entity, VocabTerm& term) {
@@ -7293,7 +7370,7 @@ static std::string recognize_draft(flecs::entity chat_leaf, const std::string& d
             if (!term_entity.has<Context>(context)) continue;
             std::string lower = term.text;
             for (char& c : lower) c = (char)std::tolower((unsigned char)c);
-            in_scope.push_back({lower, &term});
+            in_scope.push_back({lower, term_entity});
             break;
         }
     });
@@ -7305,8 +7382,8 @@ static std::string recognize_draft(flecs::entity chat_leaf, const std::string& d
     }
 
     std::string out;
-    std::map<std::string, std::string> symbol_for;   // term text -> digit
-    int next_digit = 0;
+    std::map<std::string, std::string> symbol_for;   // term text -> its shorthand
+    int next_symbol = 0;
     size_t at = 0;
 
     while (at <= draft.size()) {
@@ -7322,20 +7399,45 @@ static std::string recognize_draft(flecs::entity chat_leaf, const std::string& d
             if (c != ',' && c != '.' && c != '?' && c != '!' && c != ';' && c != ':')
                 bare += (char)std::tolower((unsigned char)c);
 
-        const VocabTerm* matched = nullptr;
+        flecs::entity matched;
         for (const Recognized& candidate : in_scope)
-            if (candidate.lower == bare) { matched = candidate.term; break; }
+            if (candidate.lower == bare) { matched = candidate.entity; break; }
 
-        if (matched && !word.empty()) {
-            std::string& symbol = symbol_for[matched->text];
-            if (symbol.empty() && next_digit <= 9) {
-                symbol = std::to_string(next_digit++);
-                // The declarer's colour, put where the badge renderer reads it.
-                // Only when the term has an opinion: a term with none keeps
-                // whatever colour the editor would have given any new entity.
-                if (matched->color != 0)
-                    entity_color_cache[symbol] = matched->color;
+        if (matched.is_valid() && !word.empty()) {
+            VocabTerm& term = matched.ensure<VocabTerm>();
+            std::string& symbol = symbol_for[term.text];
+
+            if (symbol.empty()) {
+                // The shorthand this term already wears, unless another term in
+                // THIS sentence has it -- two entities sharing a symbol in one
+                // sentence is what the annotator's own gestures would produce
+                // and what its lookups cannot untangle.
+                bool taken = false;
+                for (const auto& [text, used] : symbol_for)
+                    if (used == term.symbol) { taken = true; break; }
+
+                if (!term.symbol.empty() && !taken) {
+                    symbol = term.symbol;
+                } else {
+                    // Digits first, then letters: both draw as glyphs, and 36
+                    // is far more than one sentence needs.
+                    for (int slot = next_symbol; slot < 36 && symbol.empty(); slot++) {
+                        std::string candidate = slot < 10
+                            ? std::to_string(slot)
+                            : std::string(1, (char)('a' + slot - 10));
+                        bool in_use = false;
+                        for (const auto& [text, used] : symbol_for)
+                            if (used == candidate) { in_use = true; break; }
+                        if (in_use) continue;
+                        symbol = candidate;
+                        next_symbol = slot + 1;
+                    }
+                }
+                // Remembered, so the next sentence gives this term the same
+                // chip rather than whatever is free then.
+                if (!symbol.empty()) term.symbol = symbol;
             }
+
             if (!symbol.empty()) out += "{{" + word + ", " + symbol + "}}";
             else out += word;
         } else {
@@ -7350,6 +7452,81 @@ static std::string recognize_draft(flecs::entity chat_leaf, const std::string& d
     std::cout << "[recognize] " << in_scope.size() << " terms in scope, bound "
               << symbol_for.size() << std::endl;
     return out;
+}
+
+// Click a word or badge to put the annotation cursor on it.
+//
+// selection_entities is index-aligned with the expanded selection positions --
+// the same indices the arrow keys walk -- so a hit test over it maps a pixel
+// straight onto a stop, badges and plain words alike, with a relationship's
+// three parts landing on their own slots because each is its own entity.
+//
+// Clicking into a different message moves the annotator there first, saving the
+// current one exactly the way Up/Down does; the mouse is not a second way of
+// storing state, only a second way of reaching it. Shift extends from wherever
+// the cursor already is, matching the keyboard.
+static bool annotation_click_select(double x, double y, bool shift)
+{
+    if (!world) return false;
+
+    int hit_msg = -1, hit_index = -1;
+    for (size_t m = 0; m < g_annotatable_messages.size() && hit_msg < 0; m++) {
+        const std::vector<flecs::entity>& stops =
+            g_annotatable_messages[m].selection_entities;
+        for (size_t i = 0; i < stops.size(); i++) {
+            if (!stops[i].is_valid() || !stops[i].is_alive()) continue;
+            const UIElementBounds* b = stops[i].try_get<UIElementBounds>();
+            if (!b || b->xmax <= b->xmin) continue;
+            // click_reaches, not a bare bounds test: a word scrolled out of the
+            // transcript is still an entity with bounds, and must not be
+            // clickable through the panel that clips it.
+            if (!click_reaches(stops[i], *b, (float)x, (float)y)) continue;
+            hit_msg = (int)m;
+            hit_index = (int)i;
+            break;
+        }
+    }
+    if (hit_msg < 0) return false;
+
+    bool handled = false;
+    static flecs::query<WordAnnotationSelector> selectors =
+        world->query<WordAnnotationSelector>();
+    selectors.each([&](flecs::entity, WordAnnotationSelector& selector) {
+        if (handled) return;
+
+        if (hit_msg != g_current_message_idx) {
+            if (g_current_message_idx >= 0
+                && g_current_message_idx < (int)g_annotatable_messages.size()) {
+                StoredMessage& previous = g_annotatable_messages[g_current_message_idx];
+                previous.sentence_template = selector.sentence_template;
+                previous.ui_entities = selector.ui_entities;
+                previous.selection_entities = selector.selection_entities;
+                previous.token_count = selector.token_count;
+            }
+
+            g_current_message_idx = hit_msg;
+            StoredMessage& target = g_annotatable_messages[hit_msg];
+            selector.sentence_template = target.sentence_template;
+            selector.parent_entity = target.parent_entity;
+            selector.ui_entities = target.ui_entities;
+            selector.selection_entities = target.selection_entities;
+            selector.token_count = target.token_count;
+        }
+
+        // Clicking a word IS entering annotation: the alternative is a click
+        // that silently moves a cursor nobody can see yet.
+        selector.active = true;
+        world->ensure<ChatState>().input_focused = false;
+
+        if (shift) {
+            selector.end_index = hit_index;
+        } else {
+            selector.start_index = hit_index;
+            selector.end_index = hit_index;
+        }
+        handled = true;
+    });
+    return handled;
 }
 
 void save_chat_history()
@@ -11320,6 +11497,7 @@ int main(int, char *[]) {
     world->import<panels::Lattice>();
     world->import<panels::TypeGen>();
     world->import<panels::ArcTask>();
+    world->import<panels::VarRegistry>();
 
     // Turns ChatScroll into the list's bottom inset, clamped so the transcript
     // can never be dragged past either end. PreFrame, so the offset it writes
@@ -11351,6 +11529,48 @@ int main(int, char *[]) {
         const float slack = std::max(1.0f, content->height - track->height);
         const float t = std::clamp(scroll->offset / slack, 0.0f, 1.0f);
         pos.y = (track->height - bar.height) * (1.0f - t);
+    });
+
+    // Same as ChatScrollbarSystem, read the other way up: offset counts down
+    // from the top, so a zero offset puts the thumb at the top of the track.
+    world->system<RoundedRectRenderable, Position>("PanelScrollbarSystem")
+    .term_at(1).second<Local>()
+    .with<PanelScrollbarOf>(flecs::Wildcard)
+    .kind(flecs::PreFrame)
+    .each([](flecs::entity slider, RoundedRectRenderable& bar, Position& pos)
+    {
+        flecs::entity list = slider.target<PanelScrollbarOf>();
+        const PanelScroll* scroll = list.is_valid() ? list.try_get<PanelScroll>() : nullptr;
+        const UIElementSize* content = list.is_valid() ? list.try_get<UIElementSize>() : nullptr;
+        const UIElementSize* track = slider.parent().try_get<UIElementSize>();
+        if (!scroll || !content || !track || track->height <= 0.0f) return;
+
+        // Nothing to scroll, nothing to draw: a zero-height rect is the way a
+        // scrollbar says the list already fits.
+        if (content->height <= track->height) { bar.height = 0.0f; return; }
+
+        const float ratio = track->height / content->height;
+        bar.height = std::max(24.0f, track->height * ratio);
+
+        const float slack = std::max(1.0f, content->height - track->height);
+        const float t = std::clamp(scroll->offset / slack, 0.0f, 1.0f);
+        pos.y = (track->height - bar.height) * t;
+    });
+
+    // The top-anchored counterpart: same clamp, opposite edge. A list scrolled
+    // to the top sits at offset 0, and the slack is whatever it overflows its
+    // parent by.
+    world->system<PanelScroll, UIAbsoluteEdges, const UIElementSize>("PanelScrollSystem")
+    .kind(flecs::PreFrame)
+    .each([](flecs::entity list, PanelScroll& scroll, UIAbsoluteEdges& edges,
+             const UIElementSize& content)
+    {
+        const UIElementSize* view = list.parent().try_get<UIElementSize>();
+        if (!view) return;
+
+        const float slack = std::max(0.0f, content.height - view->height);
+        scroll.offset = std::clamp(scroll.offset, 0.0f, slack);
+        edges.top = -scroll.offset;
     });
 
     world->system<ChatScroll, UIAbsoluteEdges, const UIElementSize>("ChatScrollSystem")
@@ -13818,38 +14038,46 @@ int main(int, char *[]) {
         const Graphics* graphics = world->lookup("Graphics").try_get<Graphics>();
         if (graphics && graphics->useGridMode) {
             glfwSetInputMode(window->handle, GLFW_CURSOR, GLFW_CURSOR_HIDDEN);
+            g_applied_cursor = (GLFWcursor*)-1;   // re-apply once it is visible again
             return;
         }
         // The Holodeck walk disabled the cursor; forcing NORMAL here every
         // frame would snap it visible and end the mouselook a frame after it
         // began.
-        if (screen3d::pointer_captured()) return;
+        if (screen3d::pointer_captured()) { g_applied_cursor = (GLFWcursor*)-1; return; }
         glfwSetInputMode(window->handle, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
 
-        // Baseline: the I-beam when over selectable text, arrow otherwise;
-        // the region cursors below override either.
-        glfwSetCursor(window->handle, g_want_ibeam ? ibeam_cursor() : NULL);
+        // Decide first, apply once. The regions overlap at a corner -- a
+        // vertical split's band crosses a horizontal one's -- so a frame can
+        // match more than one, and applying each in turn is what made the
+        // pointer stutter between shapes on an edge.
+        //
+        // Baseline: the I-beam over selectable text, arrow otherwise.
+        GLFWcursor* want = g_want_ibeam ? ibeam_cursor() : nullptr;
 
-        bool in_modify_region = false;
         for (EditorModifyPartitionRegion& partition_region : editor_root->modify_partition_regions)
         {
             if (point_in_bounds((float)cursor_state->x, (float)cursor_state->y, partition_region.bounds))
             {
-                GLFWcursor* cursor = glfwCreateStandardCursor(GLFW_CROSSHAIR_CURSOR);
-                glfwSetCursor(window->handle, cursor);
-                in_modify_region = true;
+                want = standard_cursor(GLFW_CROSSHAIR_CURSOR);
+                break;
             }
         }
-        if (!in_modify_region)
+        if (want != standard_cursor(GLFW_CROSSHAIR_CURSOR))
         {
             for (EditorShiftRegion& shift_region : editor_root->shift_regions)
             {
                 if (point_in_bounds((float)cursor_state->x, (float)cursor_state->y, shift_region.bounds))
                 {
-                    GLFWcursor* cursor = glfwCreateStandardCursor(shift_region.cursor_type);
-                    glfwSetCursor(window->handle, cursor);
+                    want = standard_cursor(shift_region.cursor_type);
+                    break;
                 }
             }
+        }
+
+        if (want != g_applied_cursor) {
+            glfwSetCursor(window->handle, want);
+            g_applied_cursor = want;
         }
         
         // TODO: If the cursor location is within one of those rectangles, then create a tag indicating the scale target node
